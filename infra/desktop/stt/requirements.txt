@@ -1,0 +1,11 @@
+# faster-whisper pulls ctranslate2 + nvidia-cublas-cu12 + nvidia-cudnn-cu12.
+# CTranslate2 4.5+ uses CUDA 12 / cuDNN 9 wheels — runs on the CUDA 13.2 driver
+# via forward compatibility. No system CUDA toolkit needed.
+faster-whisper
+fastapi
+uvicorn[standard]
+numpy
+python-dotenv
+# dev / smoke-test
+pytest
+websockets
