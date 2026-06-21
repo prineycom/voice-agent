@@ -90,33 +90,39 @@ async def stt_ws(ws: WebSocket):
             msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
                 break
-            if msg.get("bytes") is not None:
-                buffer.extend(msg["bytes"])
-                bytes_since_partial += len(msg["bytes"])
-                if bytes_since_partial >= partial_threshold:
-                    bytes_since_partial = 0
-                    samples = pcm16_to_float32(bytes(buffer))
-                    text = await asyncio.to_thread(_transcribe, samples, False)
-                    await ws.send_json({"text": text, "is_final": False, "partial": text})
-            elif msg.get("text") is not None:
-                event = json.loads(msg["text"]).get("event")
-                if event == "end":
-                    samples = pcm16_to_float32(bytes(buffer))
-                    text = await asyncio.to_thread(_transcribe, samples, True)
-                    await ws.send_json({"text": text, "is_final": True, "partial": ""})
-                    buffer = bytearray()
-                    bytes_since_partial = 0
-                elif event == "reset":
-                    buffer = bytearray()
-                    bytes_since_partial = 0
+            try:
+                if msg.get("bytes") is not None:
+                    buffer.extend(msg["bytes"])
+                    bytes_since_partial += len(msg["bytes"])
+                    if bytes_since_partial >= partial_threshold:
+                        bytes_since_partial = 0
+                        samples = pcm16_to_float32(bytes(buffer))
+                        text = await asyncio.to_thread(_transcribe, samples, False)
+                        # TODO: this re-transcribes the entire growing buffer on
+                        # every partial interval (buffer only clears on end/reset),
+                        # so GPU work is ~O(n²) over a long utterance. A sliding-
+                        # window / committed-prefix scheme would bound the cost.
+                        await ws.send_json({"text": text, "is_final": False, "partial": text})
+                elif msg.get("text") is not None:
+                    event = json.loads(msg["text"]).get("event")
+                    if event == "end":
+                        samples = pcm16_to_float32(bytes(buffer))
+                        text = await asyncio.to_thread(_transcribe, samples, True)
+                        await ws.send_json({"text": text, "is_final": True, "partial": ""})
+                        buffer = bytearray()
+                        bytes_since_partial = 0
+                    elif event == "reset":
+                        buffer = bytearray()
+                        bytes_since_partial = 0
+            except Exception as e:  # noqa: BLE001 — report and keep serving
+                log.exception("STT message handling error")
+                try:
+                    await ws.send_json({"error": str(e)})
+                except Exception:
+                    pass
+                continue
     except WebSocketDisconnect:
         pass
-    except Exception as e:  # noqa: BLE001 — report and keep serving
-        log.exception("STT websocket error")
-        try:
-            await ws.send_json({"error": str(e)})
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
