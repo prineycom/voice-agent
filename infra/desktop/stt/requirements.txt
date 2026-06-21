@@ -1,7 +1,11 @@
-# faster-whisper pulls ctranslate2 + nvidia-cublas-cu12 + nvidia-cudnn-cu12.
-# CTranslate2 4.5+ uses CUDA 12 / cuDNN 9 wheels — runs on the CUDA 13.2 driver
+# CTranslate2 4.5+ uses CUDA 12 / cuDNN 9 wheels — runs on the CUDA 13.x driver
 # via forward compatibility. No system CUDA toolkit needed.
+# On Linux ctranslate2 pulls the nvidia-*-cu12 wheels transitively; on Windows it
+# does NOT, so we pin them explicitly here. server.py adds their bin dirs to the
+# Windows DLL search path (otherwise: "cublas64_12.dll is not found").
 faster-whisper
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
 fastapi
 uvicorn[standard]
 numpy

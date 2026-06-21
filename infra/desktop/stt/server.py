@@ -10,7 +10,36 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
+
+
+def _register_cuda_dll_dirs() -> None:
+    """On Windows, add the nvidia-*-cu12 wheels' bin dirs to the DLL search path.
+
+    CTranslate2 (faster-whisper backend) links cuBLAS/cuDNN at runtime. The pip
+    wheels ship the DLLs under site-packages/nvidia/<lib>/bin, but Windows does
+    not search there automatically, so ctranslate2 fails with
+    "cublas64_12.dll is not found". No-op on Linux (RPATH handles it).
+    """
+    if sys.platform != "win32":
+        return
+    import importlib.util
+
+    spec = importlib.util.find_spec("nvidia")
+    if not spec or not spec.submodule_search_locations:
+        return
+    nvidia_root = spec.submodule_search_locations[0]
+    for sub in os.listdir(nvidia_root):
+        bin_dir = os.path.join(nvidia_root, sub, "bin")
+        if os.path.isdir(bin_dir):
+            os.add_dll_directory(bin_dir)
+            # CTranslate2 resolves cuBLAS/cuDNN via the default loader, which
+            # searches PATH (not add_dll_directory dirs), so prepend it too.
+            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+
+
+_register_cuda_dll_dirs()
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
