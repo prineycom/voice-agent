@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+dist/
+
+# Models
+*.onnx
+*.gguf
+*.bin
+*.safetensors
+models/
+checkpoints/
+
+# Environment
+.env
+.env.local
+*.secret
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Audio
+*.wav
+*.mp3
+*.ogg
+*.flac
