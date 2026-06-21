@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -81,26 +82,40 @@ async def tts_ws(ws: WebSocket):
             queue: asyncio.Queue = asyncio.Queue()
             loop = asyncio.get_running_loop()
 
+            cancel = threading.Event()
+
             def produce():
                 try:
                     for chunk in synthesize.stream_pcm(text, voice):
+                        if cancel.is_set():
+                            break
                         loop.call_soon_threadsafe(queue.put_nowait, chunk)
                 except Exception as e:  # noqa: BLE001
                     loop.call_soon_threadsafe(queue.put_nowait, e)
                 finally:
                     loop.call_soon_threadsafe(queue.put_nowait, None)
 
-            asyncio.create_task(asyncio.to_thread(produce))
+            producer_task = asyncio.create_task(asyncio.to_thread(produce))
 
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                if isinstance(item, Exception):
-                    await ws.send_json({"error": str(item)})
-                    break
-                await ws.send_bytes(item)
-            await ws.send_json({"done": True})
+            try:
+                completed = False
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        completed = True
+                        break
+                    if isinstance(item, Exception):
+                        await ws.send_json({"error": str(item)})
+                        break
+                    await ws.send_bytes(item)
+                if completed:
+                    try:
+                        await ws.send_json({"done": True})
+                    except Exception:  # noqa: BLE001
+                        pass
+            finally:
+                cancel.set()
+                await asyncio.gather(producer_task, return_exceptions=True)
     except WebSocketDisconnect:
         pass
     except Exception as e:  # noqa: BLE001
