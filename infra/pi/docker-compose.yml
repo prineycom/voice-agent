@@ -19,4 +19,8 @@ services:
       # LiveKit reads keys from LIVEKIT_KEYS ("<key>: <secret>"). We keep the
       # canonical pair in .env (reused by the Agent Worker and frontend token
       # server in later epics) and compose them here.
+      # Exposure boundary: .env is gitignored (no git leak), but the pair is
+      # readable via `docker inspect` by any OS user in the docker group on the
+      # Pi. Acceptable for a single-purpose private edge node; revisit (mounted
+      # secret file) if the Pi gains other tenants.
       LIVEKIT_KEYS: "${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}"

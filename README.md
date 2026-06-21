@@ -60,18 +60,29 @@ Tailscale. `restart: unless-stopped` brings it back after a reboot.
 
 ### Smoke test (two participants, audio)
 
-```bash
-# install the LiveKit CLI once
-curl -sSL https://get.livekit.io/cli | bash
+Prerequisites: `ffmpeg` (`sudo apt install -y ffmpeg`) and the LiveKit CLI. Pin the CLI to
+the version validated against server v1.13.1 rather than piping the latest installer:
 
-cd infra/pi && set -a && . ./.env && set +a
-export LIVEKIT_URL="ws://localhost:7880"   # or ws://<tailscale-ip>:7880
+```bash
+# install the LiveKit CLI once — pinned (tested with lk v2.16.6)
+curl -sSL "https://github.com/livekit/livekit-cli/releases/download/v2.16.6/lk_2.16.6_linux_arm64.tar.gz" \
+  | tar xz -C /tmp && sudo mv /tmp/lk /usr/local/bin/lk
 
 # generate a test tone
 ffmpeg -y -f lavfi -i "sine=frequency=440:duration=8" -c:a libopus -b:a 48k /tmp/tone.ogg
+```
 
-# subscriber in one shell, publisher in another (same room)
+Open **two shells**. In each, load the credentials and target URL before running `lk`
+(both `lk` invocations need `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`):
+
+```bash
+# run this in BOTH shells
+cd infra/pi && set -a && . ./.env && set +a
+export LIVEKIT_URL="ws://localhost:7880"   # or ws://<tailscale-ip>:7880
+
+# shell 1 — subscriber
 lk room join --identity sub --auto-subscribe smoke-room
+# shell 2 — publisher
 lk room join --identity pub --publish /tmp/tone.ogg --exit-after-publish smoke-room
 ```
 
