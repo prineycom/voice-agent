@@ -1,0 +1,13 @@
+# Install torch FIRST with the CUDA 12 wheel index (see README), then this file:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+# faster-qwen3-tts requires torch >= 2.5.1 with CUDA.
+faster-qwen3-tts
+fastapi
+uvicorn[standard]
+soundfile
+soxr
+numpy
+python-dotenv
+# dev / smoke-test
+pytest
+websockets
