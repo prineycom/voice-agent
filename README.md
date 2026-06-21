@@ -31,9 +31,58 @@ Audio flows through a cascaded pipeline: STT → LLM → TTS, connected via Live
 - User ↔ Pi 5: LiveKit WebRTC
 - Pi 5 ↔ Cloud LLM: HTTPS via LiteLLM
 
+## Running the LiveKit SFU (Pi 5)
+
+The SFU runs via Docker Compose from `infra/pi/`. First-time setup generates an API
+key/secret pair into a gitignored `.env`:
+
+```bash
+cd infra/pi
+cp .env.example .env
+# generate a key/secret pair into .env
+sed -i "s|^LIVEKIT_API_KEY=.*|LIVEKIT_API_KEY=API$(openssl rand -hex 6)|" .env
+sed -i "s|^LIVEKIT_API_SECRET=.*|LIVEKIT_API_SECRET=$(openssl rand -base64 36 | tr -d '\n')|" .env
+```
+
+Lifecycle:
+
+```bash
+cd infra/pi
+docker compose up -d        # start
+docker compose logs -f      # follow logs
+docker compose ps           # status
+docker compose down         # stop
+```
+
+Health check: `curl http://localhost:7880/` returns `OK`. The SFU listens on 7880
+(signaling), 7881 (RTC/TCP), and 50000-60000/udp (RTC media), reachable over LAN and
+Tailscale. `restart: unless-stopped` brings it back after a reboot.
+
+### Smoke test (two participants, audio)
+
+```bash
+# install the LiveKit CLI once
+curl -sSL https://get.livekit.io/cli | bash
+
+cd infra/pi && set -a && . ./.env && set +a
+export LIVEKIT_URL="ws://localhost:7880"   # or ws://<tailscale-ip>:7880
+
+# generate a test tone
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=8" -c:a libopus -b:a 48k /tmp/tone.ogg
+
+# subscriber in one shell, publisher in another (same room)
+lk room join --identity sub --auto-subscribe smoke-room
+lk room join --identity pub --publish /tmp/tone.ogg --exit-after-publish smoke-room
+```
+
+The subscriber logs `track subscribed {kind: audio, ...}` when it receives the publisher's
+audio — confirming end-to-end publish/subscribe through the SFU.
+
 ## Status
 
 Architecture defined. See [epics overview](epics-overview.md) for implementation plan.
+
+Epic 1 (LiveKit SFU) — server running on Pi 5; browser TLS path tracked in #9.
 
 ## Documentation
 

@@ -1,0 +1,22 @@
+# LiveKit SFU — Pi 5 edge node (Epic 1, issue #8).
+# Caddy TLS edge proxy is added in issue #9.
+#
+# Compose auto-loads ./.env (gitignored) for ${VAR} interpolation below.
+# Copy .env.example -> .env and fill in the generated key/secret first.
+
+services:
+  livekit:
+    image: livekit/livekit-server:v1.13.1
+    container_name: voice-agent-livekit
+    restart: unless-stopped
+    # Host networking is required so the RTC UDP port range (50000-60000) works
+    # without Docker NAT mangling ICE candidates. Pi 5 is a single-purpose edge node.
+    network_mode: host
+    command: --config /etc/livekit/livekit.yaml
+    volumes:
+      - ./livekit.yaml:/etc/livekit/livekit.yaml:ro
+    environment:
+      # LiveKit reads keys from LIVEKIT_KEYS ("<key>: <secret>"). We keep the
+      # canonical pair in .env (reused by the Agent Worker and frontend token
+      # server in later epics) and compose them here.
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}"
