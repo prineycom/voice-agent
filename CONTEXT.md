@@ -55,10 +55,23 @@ _Avoid_: pipeline, chain, waterfall
 Time from user finishing speech to agent starting to speak. Target: ≤1500ms. Composed of STT + LLM TTFT + LLM streaming + TTS first chunk.
 _Avoid_: response time, round-trip time
 
+**Edge Proxy**:
+The single TLS-terminating entry point on Pi 5 (Caddy). Holds the Tailscale certificate, fronts LiveKit signaling (WSS), and later serves the static frontend. "Edge" = closest hop to the user, not a CDN edge.
+_Avoid_: gateway, load balancer, ingress
+
+**Tailnet Domain**:
+The `*.ts.net` hostname for Pi 5 (e.g. `priney-pi.<tailnet>.ts.net`) for which Tailscale provisions a real Let's Encrypt certificate. Distinct from the LAN hostname/IP, which has no valid public cert.
+_Avoid_: domain, hostname, URL
+
+**Secure Context**:
+The browser requirement (HTTPS or `localhost`) without which `getUserMedia` — microphone access — is blocked. Both the frontend origin and the LiveKit WSS endpoint must be served over a trusted certificate.
+_Avoid_: HTTPS, SSL
+
 ## Decisions
 
 - **Architecture**: Hybrid — Pi 5 (SFU + Agent Worker + LiteLLM + Hermes + web/kiosk), Desktop (GPU Worker), cloud LLM. → [[0001-hybrid-architecture]]
 - **Transport**: LiveKit WebRTC for audio between user and Agent Worker. → [[0002-livekit-transport]]
+- **Access & TLS**: Private network only (LAN + Tailscale), no public exposure. TLS via Tailscale cert on the [[Tailnet Domain]], terminated at a Caddy [[Edge Proxy]]. → [[0005-edge-tls-caddy]]
 - **STT/TTS transport**: WebSocket binary frames between Pi 5 and Desktop. → [[0003-websocket-stt-tts]]
 - **LLM**: Start with nemotron-3-super:cloud (Ollama Cloud), experiment later. Fastest available (~1.6s TTFT), tool calling supported.
 - **Tool calling**: Through [[Hermes MCP]] — SOUL.md, memory, skills.
