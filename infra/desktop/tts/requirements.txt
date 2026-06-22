@@ -1,0 +1,17 @@
+# Install torch + torchaudio FIRST with the CUDA 12 wheel index (see README), then
+# this file. torchaudio MUST come from the same index as torch — faster-qwen3-tts
+# pulls it transitively, and the PyPI build is ABI-incompatible with torch+cu124
+# (fails at runtime with "OSError: [WinError 127] The specified procedure could not
+# be found"). Pre-installing it from the cu124 index satisfies the dep here:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+# faster-qwen3-tts requires torch >= 2.5.1 with CUDA.
+faster-qwen3-tts
+fastapi
+uvicorn[standard]
+soundfile
+soxr
+numpy
+python-dotenv
+# dev / smoke-test
+pytest
+websockets
