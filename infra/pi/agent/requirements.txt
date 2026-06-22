@@ -1,0 +1,11 @@
+# LiveKit Agent Worker — Pi 5 (aarch64, Python 3.13).
+# Base livekit-agents only; no plugin extras needed (STT/TTS are custom WebSocket plugins).
+# aiohttp arrives transitively via livekit-agents and is used for the /health GET.
+# Versions pinned from a verified aarch64 install (Risk-7 go: all wheels resolved).
+livekit-agents==1.6.2
+python-dotenv==1.2.2
+websockets==16.0
+
+# dev
+pytest
+pytest-asyncio
