@@ -8,7 +8,7 @@ RTX 4070 12GB). Reached from the Pi over Tailscale at `100.75.88.35`.
 | STT | 8001 | `WS /stt`, `GET /health` | faster-whisper `large-v3-turbo` (int8_float16) |
 | TTS | 8002 | `WS /tts`, `GET /health` | Qwen3-TTS-12Hz-1.7B-CustomVoice (Russian) |
 
-Each service has its own venv. Deploy target: `C:\Users\Pavel\voice-agent\desktop\`.
+Each service has its own venv. Deploy target: `E:\voice-agent\desktop\`.
 
 ## Prerequisites (verified 2026-06-21)
 - Windows 11, NVIDIA driver 596.49 (CUDA 13.2), RTX 4070 12GB.
@@ -18,7 +18,7 @@ Each service has its own venv. Deploy target: `C:\Users\Pavel\voice-agent\deskto
 
 ### STT
 ```bat
-cd C:\Users\Pavel\voice-agent\desktop\stt
+cd E:\voice-agent\desktop\stt
 py -3.12 -m venv .venv
 .venv\Scripts\python -m pip install -U pip
 .venv\Scripts\pip install -r requirements.txt
@@ -27,10 +27,10 @@ copy .env.example .env
 
 ### TTS
 ```bat
-cd C:\Users\Pavel\voice-agent\desktop\tts
+cd E:\voice-agent\desktop\tts
 py -3.12 -m venv .venv
 .venv\Scripts\python -m pip install -U pip
-.venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu124
+.venv\Scripts\pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 .venv\Scripts\pip install -r requirements.txt
 copy .env.example .env
 ```
@@ -44,10 +44,10 @@ netsh advfirewall firewall add rule name=voiceagent-tts dir=in action=allow prot
 ## Start the services
 ```bat
 :: STT  (downloads large-v3-turbo on first run)
-C:\Users\Pavel\voice-agent\desktop\stt\start-stt.bat
+E:\voice-agent\desktop\stt\start-stt.bat
 
 :: TTS  (downloads Qwen3-TTS-1.7B on first run)
-C:\Users\Pavel\voice-agent\desktop\tts\start-tts.bat
+E:\voice-agent\desktop\tts\start-tts.bat
 ```
 Each loads its model into VRAM at startup and keeps it warm. Combined VRAM ≈ 6.5GB.
 
@@ -71,7 +71,7 @@ curl http://100.75.88.35:8002/health
 ## Smoke tests
 ```bat
 :: TTS: text -> WAV
-cd C:\Users\Pavel\voice-agent\desktop\scripts
+cd E:\voice-agent\desktop\scripts
 ..\tts\.venv\Scripts\python smoke_tts.py "Привет! Это тест." tts_out.wav
 
 :: STT: WAV -> transcript (16kHz mono input)
