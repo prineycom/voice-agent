@@ -1,16 +1,24 @@
-"""Agent Worker entrypoint — joins a LiveKit room and speaks a fixed greeting.
+"""Agent Worker entrypoint — STT → echo → TTS loop (NO LLM).
 
-This is the Risk-1 go/no-go scaffold: a TTS-only `AgentSession` (NO STT, NO LLM).
-On verified livekit-agents 1.6.2, `AgentSession(tts=...)` constructs with only a
-TTS provider and `await session.say(text)` performs TTS-only playback without an
-LLM — so the direct `rtc.AudioSource` fallback is NOT needed (see SELF_REVIEW).
+This wires both audio paths through the Desktop GPU boxes: the Desktop STT
+plugin transcribes each user turn, and the Desktop TTS plugin speaks it back
+verbatim. There is NO LLM in the loop — the echo handler simply repeats the
+final transcript, which exercises input + output end to end before reasoning
+lands in a later task.
+
+Turn-taking uses a LOCAL Silero VAD (`silero.VAD.load()`, ONNX run on the Pi)
+with `turn_detection="vad"`. This is deliberate: the framework's default VAD is
+cloud-backed and 401s on a self-hosted Pi (the very failure that forced
+`turn_detection="manual"` in #11). A DeprecationWarning from
+livekit-plugins-silero is expected on the pinned 1.6.2 and is harmless.
 
 Flow:
-    1. Load config + run the Desktop TTS health gate (abort loudly if down).
+    1. Load config + run the Desktop STT and TTS health gates (abort loudly if
+       either is down — a deaf or mute agent must never join a room).
     2. Connect to the room.
-    3. Start a TTS-only AgentSession with a minimal placeholder Agent.
-    4. Wait for a remote participant to join (avoids first-audio clipping),
-       then speak the greeting and wait for playout to finish.
+    3. Start an AgentSession with STT + TTS + local VAD (no LLM).
+    4. Greet once when a remote participant joins, then echo every final
+       user transcript back via TTS.
 
 Dispatch: this worker registers with an empty `agent_name`, so it is dispatched
 automatically to every room (LiveKit default room dispatch). Run it with:
@@ -24,42 +32,75 @@ from __future__ import annotations
 import logging
 
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit.plugins import silero
 
 from config import load_config
-from health import TTSHealthError, check_tts_health
+from health import (
+    STTHealthError,
+    TTSHealthError,
+    check_stt_health,
+    check_tts_health,
+)
+from stt_plugin import DesktopSTT
 from tts_plugin import DesktopTTS
 
 log = logging.getLogger("agent")
 
-# Placeholder instructions — no LLM is invoked for the fixed greeting, but Agent
-# requires an instructions string. Kept short until STT/LLM land in a later task.
-AGENT_INSTRUCTIONS = "You are a voice assistant. (Greeting-only scaffold.)"
+# Placeholder instructions — no LLM is invoked in the echo loop, but Agent
+# requires an instructions string. Kept short until the LLM lands in a later task.
+AGENT_INSTRUCTIONS = "You are a voice assistant. (STT echo-loop scaffold, no LLM.)"
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    """Health-gate, join the room, and speak the fixed greeting via Desktop TTS."""
+    """Health-gate, join the room, and echo each user turn via STT → TTS."""
     cfg = load_config()
 
-    # Health gate (Risk: a mute agent). Abort before joining if TTS is not ready.
+    # Health gates (Risk: a deaf or mute agent). Abort before joining if either
+    # Desktop service is not ready. Run both with the same loud-abort discipline.
+    try:
+        await check_stt_health(cfg.stt_health_url)
+    except STTHealthError:
+        log.error("Aborting: Desktop STT health gate failed; not joining the room.")
+        raise
     try:
         await check_tts_health(cfg.tts_health_url)
     except TTSHealthError:
         log.error("Aborting: Desktop TTS health gate failed; not joining the room.")
         raise
 
+    # Load the LOCAL Silero VAD once before constructing the session. This runs
+    # the ONNX model on the Pi (no cloud), so turn detection never hits LiveKit
+    # Cloud inference and never 401s. A DeprecationWarning here is expected.
+    vad = silero.VAD.load()
+
     await ctx.connect()  # type: ignore[call-arg]
 
-    # TTS-only session — no STT, no LLM. say() drives TTS directly.
-    # turn_detection="manual": there is no user turn to detect (no STT yet), and
-    # the default mode probes LiveKit Cloud inference (401 on a self-hosted Pi).
+    # STT + TTS session with local VAD; turn_detection="vad" uses the loaded
+    # Silero VAD to bound user turns. No LLM — the echo handler drives say().
     session = AgentSession(
+        stt=DesktopSTT(
+            ws_url=cfg.stt_ws_url,
+            language=cfg.stt_language,
+            sample_rate=cfg.stt_sample_rate,
+        ),
         tts=DesktopTTS(
             ws_url=cfg.tts_ws_url,
             voice=cfg.tts_voice,
             sample_rate=cfg.tts_sample_rate,
         ),
-        turn_detection="manual",
+        vad=vad,
+        turn_detection="vad",
     )
+
+    # Echo handler (NO LLM): repeat each final, non-empty transcript back via TTS.
+    # `say()` is sync in 1.6.2 and returns a SpeechHandle; calling it from this
+    # sync event callback is the intended pattern.
+    @session.on("user_input_transcribed")
+    def _on_transcript(ev) -> None:
+        if ev.is_final and ev.transcript.strip():
+            log.info("Echoing transcript: %s", ev.transcript)
+            session.say(ev.transcript)
+
     await session.start(
         agent=Agent(instructions=AGENT_INSTRUCTIONS),
         room=ctx.room,
@@ -70,8 +111,8 @@ async def entrypoint(ctx: JobContext) -> None:
     participant = await ctx.wait_for_participant()
     log.info("Participant %s joined; speaking greeting.", participant.identity)
 
-    await session.say(cfg.agent_greeting)
-    log.info("Greeting playout complete.")
+    session.say(cfg.agent_greeting)
+    log.info("Greeting spoken; entering STT echo loop.")
 
 
 # Dispatch is automatic (empty agent_name => room dispatch). The entrypoint runs
