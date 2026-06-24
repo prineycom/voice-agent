@@ -51,7 +51,7 @@ Copy `.env.example` to `.env` and fill in the keys. Every key:
 | `TTS_WS_URL` | Desktop TTS WebSocket (over Tailscale) | `ws://100.75.88.35:8002/tts` |
 | `TTS_HEALTH_URL` | Desktop TTS health endpoint (startup gate) | `http://100.75.88.35:8002/health` |
 | `TTS_VOICE` | Voice id → server speaker `aiden` (Russian) | `default` |
-| `TTS_SAMPLE_RATE` | Server PCM16 rate; do not change | `24000` |
+| `TTS_SAMPLE_RATE` | Rate the plugin labels published frames with; must match the server's output rate | `24000` |
 | `AGENT_GREETING` | Literal greeting string spoken on join | `Привет! Я голосовой ассистент. Чем могу помочь?` |
 
 - **Reuse the LiveKit keys from `infra/pi/.env`** — the worker MUST use the same
@@ -59,8 +59,11 @@ Copy `.env.example` to `.env` and fill in the keys. Every key:
   registration with an **auth error** (Risk 6).
 - The greeting is a **literal `AGENT_GREETING` string**. There is no `SOUL.md` and
   no LLM in this slice — those arrive in a later slice (#13).
-- `TTS_SAMPLE_RATE` is fixed at `24000` to match the server; the plugin declares
-  this so LiveKit resamples to the WebRTC rate downstream.
+- `TTS_SAMPLE_RATE` is the rate the plugin **labels its published audio frames**
+  with, and LiveKit resamples from it to the WebRTC rate downstream. It MUST match
+  the Desktop TTS server's actual output rate (`24000` Hz, the server contract);
+  changing it without the server's output rate also changing produces pitch/speed
+  artifacts. Keep it at `24000` unless the server's output rate changes.
 
 ## Run
 Foreground, dev mode (verbose logs):

@@ -14,6 +14,7 @@ unambiguously isolates the real audio from the framework marker.
 """
 
 import pytest
+import websockets
 from livekit.agents import APIError
 
 from tts_plugin import NUM_CHANNELS, SAMPLE_RATE, DesktopTTS
@@ -86,6 +87,22 @@ async def test_error_frame_raises_api_error(tts_server_factory):
 
     with pytest.raises(APIError):
         await _collect(stream)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_midstream_raises(tts_server_factory):
+    # The server drops the socket mid-stream (no terminal {"done": true}); the
+    # plugin's `await ws.recv()` loop then surfaces the dropped connection.
+    srv = await tts_server_factory([b"\x01\x02", b"\x03\x04"], mode="disconnect")
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    stream = tts_impl.synthesize("drop me")
+
+    with pytest.raises(websockets.ConnectionClosed):
+        await _collect(stream)
+
+    # The server accepted exactly one connection (and then closed it itself).
+    assert srv.connections == 1
 
 
 @pytest.mark.asyncio

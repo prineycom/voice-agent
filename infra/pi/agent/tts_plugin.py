@@ -35,10 +35,12 @@ class DesktopTTS(tts.TTS):
     A fresh WebSocket is opened per utterance; `ws_url` is injectable for tests.
     """
 
-    def __init__(self, *, ws_url: str, voice: str = "default") -> None:
+    def __init__(
+        self, *, ws_url: str, voice: str = "default", sample_rate: int = SAMPLE_RATE
+    ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
-            sample_rate=SAMPLE_RATE,
+            sample_rate=sample_rate,
             num_channels=NUM_CHANNELS,
         )
         self._ws_url = ws_url
@@ -70,7 +72,7 @@ class ChunkedStream(tts.ChunkedStream):
         request_id = utils.shortuuid("tts_")
         output_emitter.initialize(
             request_id=request_id,
-            sample_rate=SAMPLE_RATE,
+            sample_rate=self._tts._sample_rate,
             num_channels=NUM_CHANNELS,
             mime_type=MIME_TYPE,
         )

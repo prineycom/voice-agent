@@ -47,11 +47,15 @@ async def entrypoint(ctx: JobContext) -> None:
         log.error("Aborting: Desktop TTS health gate failed; not joining the room.")
         raise
 
-    await ctx.connect()
+    await ctx.connect()  # type: ignore[call-arg]
 
     # TTS-only session — no STT, no LLM. say() drives TTS directly.
     session = AgentSession(
-        tts=DesktopTTS(ws_url=cfg.tts_ws_url, voice=cfg.tts_voice),
+        tts=DesktopTTS(
+            ws_url=cfg.tts_ws_url,
+            voice=cfg.tts_voice,
+            sample_rate=cfg.tts_sample_rate,
+        ),
     )
     await session.start(
         agent=Agent(instructions=AGENT_INSTRUCTIONS),
@@ -63,12 +67,20 @@ async def entrypoint(ctx: JobContext) -> None:
     participant = await ctx.wait_for_participant()
     log.info("Participant %s joined; speaking greeting.", participant.identity)
 
-    handle = await session.say(cfg.agent_greeting)
-    await handle.wait_for_playout()
+    await session.say(cfg.agent_greeting)
     log.info("Greeting playout complete.")
 
 
 # Dispatch is automatic (empty agent_name => room dispatch). The entrypoint runs
 # once per assigned room.
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    # Pass credentials explicitly from the loaded .env: the livekit CLI does not
+    # read .env itself, so a manual foreground run would otherwise miss the keys
+    # (under systemd they arrive via EnvironmentFile).
+    cfg = load_config()
+    cli.run_app(WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        ws_url=cfg.livekit_url,
+        api_key=cfg.livekit_api_key,
+        api_secret=cfg.livekit_api_secret,
+    ))
