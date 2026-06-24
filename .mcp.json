@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "npx",
+      "args": ["-y", "mcp-ssh-manager"],
+      "timeout": 120
+    }
+  }
+}
