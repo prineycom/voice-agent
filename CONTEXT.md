@@ -12,8 +12,20 @@ Realtime voice communication platform with visual presence. Hybrid architecture:
 ## Language
 
 **Agent Worker**:
-The process on Pi 5 that orchestrates the voice pipeline — receives audio from LiveKit, sends it to Desktop STT, routes the transcript to the LLM, streams LLM output to Desktop TTS, and publishes audio back through LiveKit. Not the LLM itself.
+The process on Pi 5 that orchestrates the voice pipeline — receives audio from LiveKit, sends it to Desktop STT, routes the transcript to the LLM, streams LLM output to Desktop TTS, and publishes audio back through LiveKit. Not the LLM itself. Built on LiveKit's [[AgentSession]], not a hand-rolled loop.
 _Avoid_: agent, assistant, voice bot
+
+**AgentSession**:
+LiveKit Agents' high-level voice pipeline primitive. Owns VAD, [[Endpointing]], [[Interruption]], and STT→LLM→TTS wiring. The Agent Worker uses it rather than reimplementing the loop; the custom STT/TTS plugins are thin adapters over the Desktop WebSocket protocols.
+_Avoid_: pipeline agent, voice pipeline, runner
+
+**Endpointing**:
+Deciding the user has stopped speaking and the turn is over. Owned by LiveKit (Silero VAD + turn-detector on Pi). When LiveKit declares the turn ended, the STT plugin sends `{"event":"end"}` to flush the final transcript. The GPU Worker's own `vad_filter` only cleans audio — it does not own turn boundaries.
+_Avoid_: turn detection, VAD, silence detection
+
+**Interruption** (barge-in):
+The user speaks while the agent is responding. LiveKit detects it via VAD; the Agent Worker aborts TTS by **closing the TTS WebSocket** (the GPU Worker cancels its producer on disconnect — there is no in-band stop message).
+_Avoid_: barge-in (use as parenthetical only), cancel, cutoff
 
 **SFU (Selective Forwarding Unit)**:
 The LiveKit server component that routes WebRTC audio/video streams between participants. Runs on Pi 5.
@@ -52,7 +64,7 @@ The architecture where audio flows through discrete stages: STT → LLM → TTS.
 _Avoid_: pipeline, chain, waterfall
 
 **Voice-to-Voice Latency**:
-Time from user finishing speech to agent starting to speak. Target: ≤1500ms. Composed of STT + LLM TTFT + LLM streaming + TTS first chunk.
+Time from user finishing speech to agent starting to speak. Composed of STT + LLM TTFT + TTS first chunk. **≤1500ms is the north-star target the LLM upgrade (GPT-4.1/Gemini Flash) must hit, not an MVP acceptance gate.** The nemotron MVP runs ~2.2–2.5s ("walkie-talkie"), see [[0004-llm-model]]. Sentence chunking (speak after sentence #1) is what makes the target reachable post-upgrade.
 _Avoid_: response time, round-trip time
 
 **Edge Proxy**:
@@ -74,7 +86,8 @@ _Avoid_: HTTPS, SSL
 - **Access & TLS**: Private network only (LAN + Tailscale), no public exposure. TLS via Tailscale cert on the [[Tailnet Domain]], terminated at a Caddy [[Edge Proxy]]. → [[0005-edge-tls-caddy]]
 - **STT/TTS transport**: WebSocket binary frames between Pi 5 and Desktop. → [[0003-websocket-stt-tts]]
 - **LLM**: Start with nemotron-3-super:cloud (Ollama Cloud), experiment later. Fastest available (~1.6s TTFT), tool calling supported.
-- **Tool calling**: Through [[Hermes MCP]] — SOUL.md, memory, skills.
+- **Turn control**: LiveKit owns endpointing + interruption; STT/TTS protocols driven by end/reset events and socket-close. → [[0006-agent-turn-control]]
+- **Tool calling**: Through [[Hermes MCP]] (HTTP, standalone service) — SOUL.md, memory, skills. Deferred to Agent Worker slice 2; slice 1 is the bare voice loop.
 - **Client**: Kiosk (physical display on Pi 5) + web access in local network.
 - **Animation**: Live2D free sample, motion states only, no lip-sync.
 - **Sound**: Via LiveKit WebRTC in browser (Pi 5 kiosk browser fullscreen).

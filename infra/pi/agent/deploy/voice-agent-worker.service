@@ -1,0 +1,49 @@
+# Voice Agent Worker — systemd unit (Pi 5).
+#
+# Runs the LiveKit Agent Worker from its venv in production ("start") mode:
+#   <venv>/bin/python -m agent start
+#
+# ---------------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------------
+#   1. Adjust the paths below to the real checkout location and set User/Group.
+#      The placeholder deploy path is /opt/voice-agent/infra/pi/agent — replace
+#      every occurrence if your checkout lives elsewhere (e.g. /home/<user>/...).
+#   2. Ensure the .env file exists at <WorkingDirectory>/.env and contains the
+#      LiveKit keys (LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET, copied
+#      from infra/pi/.env) plus the TTS settings the worker reads.
+#   3. Install and start:
+#        sudo cp voice-agent-worker.service /etc/systemd/system/
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now voice-agent-worker
+#   4. Follow the logs:
+#        journalctl -u voice-agent-worker -f
+# ---------------------------------------------------------------------------
+
+[Unit]
+Description=Voice Agent Worker (LiveKit Agents, Pi 5)
+# Needs the network (Tailscale to the Desktop STT/TTS, localhost SFU) up first.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Operator MUST set a non-root service account that owns the checkout and venv.
+# Example: a dedicated `voice-agent` user, or the deploy user.
+#User=voice-agent
+#Group=voice-agent
+
+WorkingDirectory=/opt/voice-agent/infra/pi/agent
+EnvironmentFile=/opt/voice-agent/infra/pi/agent/.env
+ExecStart=/opt/voice-agent/infra/pi/agent/.venv/bin/python -m agent start
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice-agent-worker
+
+[Install]
+WantedBy=multi-user.target
