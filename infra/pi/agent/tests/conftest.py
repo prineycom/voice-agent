@@ -17,6 +17,7 @@ Puts the service dir on sys.path (so `import tts_plugin`/`import health`/
   routes; connection-refused is exercised by pointing at an unused port.
 """
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -43,15 +44,16 @@ class FakeTTSServer:
     """
 
     def __init__(self, chunks, *, mode="done", error="boom"):
-        import asyncio
 
         self.chunks = chunks
         self.mode = mode
         self.error = error
         self.received = []  # request JSON dicts, one per client connection
         self.connections = 0
-        # Set to True and signalled when the client-side socket closes.  Barge-in
-        # abort tests can await disconnected_event to confirm the socket closed.
+        # Set to True and signalled when the connection ends (either side closes;
+        # in practice a mid-stream client cancel reaches this via ConnectionClosed
+        # before the normal `done`/`error` paths do). Barge-in abort tests await
+        # disconnected_event to confirm the socket closed.
         self.disconnected = False
         self.disconnected_event = asyncio.Event()
         self._server = None
