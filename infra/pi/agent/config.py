@@ -17,6 +17,10 @@ class AgentConfig:
     livekit_url: str
     livekit_api_key: str
     livekit_api_secret: str
+    stt_ws_url: str
+    stt_health_url: str
+    stt_sample_rate: int
+    stt_language: str
     tts_ws_url: str
     tts_health_url: str
     tts_voice: str
@@ -41,6 +45,14 @@ def load_config() -> AgentConfig:
             "(infra/pi/agent/.env)."
         )
 
+    raw_stt_sample_rate = os.environ.get("STT_SAMPLE_RATE", "16000")
+    try:
+        stt_sample_rate = int(raw_stt_sample_rate)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid STT_SAMPLE_RATE={raw_stt_sample_rate!r}: expected an integer."
+        ) from exc
+
     raw_sample_rate = os.environ.get("TTS_SAMPLE_RATE", "24000")
     try:
         tts_sample_rate = int(raw_sample_rate)
@@ -61,6 +73,12 @@ def load_config() -> AgentConfig:
         livekit_url=os.environ.get("LIVEKIT_URL", "ws://localhost:7880"),
         livekit_api_key=os.environ["LIVEKIT_API_KEY"],
         livekit_api_secret=os.environ["LIVEKIT_API_SECRET"],
+        stt_ws_url=os.environ.get("STT_WS_URL", "ws://100.75.88.35:8001/stt"),
+        stt_health_url=os.environ.get(
+            "STT_HEALTH_URL", "http://100.75.88.35:8001/health"
+        ),
+        stt_sample_rate=stt_sample_rate,
+        stt_language=os.environ.get("STT_LANGUAGE", "ru"),
         tts_ws_url=os.environ.get("TTS_WS_URL", "ws://100.75.88.35:8002/tts"),
         tts_health_url=os.environ.get(
             "TTS_HEALTH_URL", "http://100.75.88.35:8002/health"
