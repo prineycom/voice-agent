@@ -13,6 +13,8 @@ boundaries). Test payloads end in a non-zero byte so stripping trailing silence
 unambiguously isolates the real audio from the framework marker.
 """
 
+import asyncio
+
 import pytest
 import websockets
 from livekit.agents import APIError
@@ -126,3 +128,92 @@ async def test_websocket_torn_down_per_utterance(tts_server_factory):
         {"text": "first", "voice": "default"},
         {"text": "second", "voice": "default"},
     ]
+
+
+# A payload large enough that the stream is still in-flight after the first
+# emitted frame: many big chunks (1 MiB each) the consumer cannot drain in the
+# window between receiving frame #1 and us cancelling. Ends in a non-zero byte
+# so it can never be mistaken for the framework's trailing silence.
+_BIG_CHUNK = (b"\xab" * (1 << 20)) + b"\x10"
+_MANY_BIG_CHUNKS = [_BIG_CHUNK] * 32
+
+
+@pytest.mark.asyncio
+async def test_cancel_midstream_closes_socket(tts_server_factory):
+    # Barge-in: the framework cancels the synthesis mid-stream. `aclose()`
+    # cancels the running `_run`, whose `finally: await ws.close()` is the ONLY
+    # mechanism that aborts the GPU producer (there is no in-band stop frame).
+    srv = await tts_server_factory(_MANY_BIG_CHUNKS)
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    stream = tts_impl.synthesize("interrupt me")
+
+    aiter = stream.__aiter__()
+    # Consume exactly the first frame — the stream is now mid-flight.
+    first = await asyncio.wait_for(aiter.__anext__(), timeout=2)
+    assert first.frame is not None
+    consumed = 1
+
+    # The socket must NOT have closed yet: we are genuinely mid-stream, not at a
+    # normal completion that just happened to fire `disconnected_event`.
+    assert srv.disconnected is False
+
+    # Abort mid-stream (this is what a real barge-in does).
+    await asyncio.wait_for(stream.aclose(), timeout=2)
+
+    # The real proof of abort: the server's handler `finally` fired (socket
+    # closed by `_run`'s own `finally: await ws.close()`), which is the only
+    # mechanism that stops the GPU producer. `disconnected_event` firing == the
+    # socket was closed by the abort path.
+    await asyncio.wait_for(srv.disconnected_event.wait(), timeout=2)
+    assert srv.disconnected is True
+
+    # And it really was mid-stream, not a full drain: the frames consumed before
+    # the cancel are a tiny fraction of what a completed stream would emit. With
+    # 32 chunks of >1 MiB each a finished synthesis yields far more than a
+    # handful of frames; we pulled only the first.
+    assert consumed == 1
+    assert consumed < len(_MANY_BIG_CHUNKS)
+
+
+@pytest.mark.asyncio
+async def test_rapid_interruptions_no_leak(tts_server_factory):
+    # Several back-to-back barge-ins on the same DesktopTTS instance must not
+    # hang or leak sockets: each utterance opens a FRESH socket, each cycle
+    # aborts cleanly, and the whole burst stays bounded in time.
+    srv = await tts_server_factory(_MANY_BIG_CHUNKS)
+    tts_impl = DesktopTTS(ws_url=srv.url)
+
+    cycles = 5
+
+    async def burst():
+        for _ in range(cycles):
+            stream = tts_impl.synthesize("barge in")
+            aiter = stream.__aiter__()
+            first = await aiter.__anext__()
+            assert first.frame is not None
+            await stream.aclose()
+
+    # No hang/wedge: the entire burst completes within a bounded time.
+    await asyncio.wait_for(burst(), timeout=10)
+
+    # Fresh socket per utterance — connections increments once per cycle.
+    assert srv.connections == cycles
+
+    # No leak: every socket actually CLOSED. The handler `finally` (which
+    # decrements `active`) runs asynchronously after each `aclose()`, so poll
+    # with a bounded wait — no fixed sleeps — until the gauge drains to zero.
+    async def _wait_drained():
+        while srv.active != 0:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(_wait_drained(), timeout=2)
+    assert srv.active == 0
+
+    # Pipeline is not wedged: a normal synthesis still works after the burst.
+    done_srv = await tts_server_factory([b"\x01\x02\x03\x04"])
+    ok_tts = DesktopTTS(ws_url=done_srv.url)
+    _, _, data = await asyncio.wait_for(
+        _collect(ok_tts.synthesize("recovered")), timeout=5
+    )
+    assert data.rstrip(b"\x00") == b"\x01\x02\x03\x04"

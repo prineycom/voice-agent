@@ -22,6 +22,9 @@ Flow:
        SOUL.md, and register a first-audio latency log hook.
     4. Greet once when a remote participant joins, then run the full
        STT → LLM → TTS conversation loop.
+    5. Interruption (barge-in): if the user speaks over the agent, the
+       framework stops TTS → DesktopTTS closes the /tts socket → Desktop
+       server cancels its producer; a new turn begins (see ADR-0006).
 
 Dispatch: this worker registers with an empty `agent_name`, so it is dispatched
 automatically to every room (LiveKit default room dispatch). Run it with:
@@ -105,6 +108,19 @@ async def entrypoint(ctx: JobContext) -> None:
     # loaded Silero VAD to bound user turns. The LLM is the local LiteLLM proxy
     # spoken to via the OpenAI-compatible plugin (base_url must carry the /v1
     # suffix, supplied by config).
+    #
+    # Barge-in (interruption): handled entirely by livekit-agents defaults —
+    # there is NO explicit barge-in code here by design (ADR-0006).
+    # In 1.6.2 the defaults are: InterruptionOptions(enabled=True,
+    # min_duration=0.5 s, false_interruption_timeout=2.0 s).
+    # On a committed interruption the framework cancels the active TTS task;
+    # DesktopTTS._run's finally-block closes the /tts WebSocket; the Desktop
+    # TTS server cancels its producer on disconnect (no in-band stop message,
+    # per ADR-0006); locally-buffered audio is dropped via the framework's
+    # clear_buffer.  To tune, pass:
+    #   turn_handling=TurnHandlingOptions(interruption=InterruptionOptions(...))
+    # Do NOT use the deprecated flat kwargs allow_interruptions= /
+    # min_interruption_* — they were removed in 1.6.x.
     session = AgentSession(
         stt=DesktopSTT(
             ws_url=cfg.stt_ws_url,
