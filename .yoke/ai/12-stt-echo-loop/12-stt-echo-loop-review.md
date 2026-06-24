@@ -108,5 +108,16 @@ The #12 slice extends the #11 TTS-only scaffold into a full **STT → echo → T
 
 ## Recommendations
 
-- Run the live on-Pi e2e (speak Russian → hear echo, hands-free) once the Desktop STT/TTS services are up — the only acceptance criterion not covered by unit tests.
 - The drop-socket-on-cancel fix is directly relevant to the next slice (#14 barge-in); verify it under real interruption there.
+
+## Live verification (on-Pi e2e)
+
+Ran the full echo loop on the Pi against the live SFU + Desktop STT + Desktop TTS. The test client synthesizes a known Russian phrase via the Desktop TTS, publishes it into the room as its "microphone" track, and records whatever the agent publishes back.
+
+- **Dependencies up:** Desktop STT `/health` 200 `model_loaded:true` (large-v3-turbo, CUDA); Desktop TTS `/health` 200 (Qwen3, Russian); SFU on :7880; worker registered (`AW_…`), Silero plugin loaded locally.
+- **Transcription:** STT returned the spoken phrase verbatim (`user_transcript: "Один, два, три. Как слышно?"`, `language: ru`) — accurate, no rate-mismatch garble (confirms the 16 kHz resample, DD-5).
+- **Echo playout:** the agent spoke the transcript back — captured audio shows two distinct speech bursts (greeting at ~1–5 s, echo at ~10.5–14 s); log shows the assistant `conversation_item_added` for the echoed text. Clean teardown (`session closed error=null`).
+
+### Bug found and fixed live (`4984967`)
+
+The first run transcribed perfectly but **the echo never played** — `session.say()` called from a `user_input_transcribed` event callback races the turn commit and is dropped (with no LLM the turn pipeline returns early). Fixed by moving the echo into `EchoAgent.on_user_turn_completed`, which the framework awaits inside the turn pipeline *before* the `llm is None` short-circuit, so the scheduled `say()` plays. Re-verified live: echo audible. The unit suite (19 passing) did not catch this because it tests the plugin in isolation, not the full `AgentSession` echo wiring — a coverage gap noted for follow-up.
