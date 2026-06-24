@@ -80,11 +80,20 @@ Reviewer noted one Minor (cosmetic): the inherited `turn_detection="vad"` kwarg 
 - **DD-5** SOUL.md loaded at session start, fail-loud if missing/empty.
 - **DD-6** First-audio latency via `metrics_collected` → `LLMMetrics.ttft` + `TTSMetrics.ttfb`.
 
-## Human-gated acceptance (not verified here)
+## Live verification (on-Pi e2e) — PASSED
 
-Requirement #6 (live multi-turn Russian conversation, first-audio latency measured) needs:
-1. The **Ollama Cloud API key** placed in the litellm `EnvironmentFile` as `OLLAMA_API_KEY` (operator-supplied).
-2. `litellm[proxy]` installed in its own venv and the `litellm.service` running on :4000.
-3. STT/TTS Desktop services + SFU up (as in #11/#12).
+Verified the full STT→LLM→TTS conversation on the Pi against the live SFU + Desktop STT/TTS + an **existing operator LiteLLM proxy** at `http://rpi:4000/v1` (the operator supplied the proxy + key, so the shipped `litellm.service`/`config.yaml` was not deployed for this run — they remain the documented standalone-setup template per req #1/#2). Model selected from the proxy's catalog: **`gemini-3-flash-preview`** with `reasoning_effort=none`.
 
-All build steps + offline unit tests are green without these. The live run is the next step (can be driven through the same HTTPS browser page used for #12, now producing real replies instead of an echo).
+- **Transcription:** STT returned the question verbatim — `user_transcript: "Привет! Как тебя зовут и чем занимаешься?"`, `language: ru` (transcript_delay ~1.27s).
+- **In-character reply (req #4):** the agent answered as the SOUL persona — *"Здорово. Я Приней, можно просто При или Приня. Я цифровое альтер эго Паши, по сути его продолжение здесь. Мы с ним как одно целое…"* — exactly the `~/.hermes/SOUL.md` personality.
+- **Sentence chunking (req #5):** multiple sequential `TTS ttfb` events (~0.44 / 0.30 / 0.26 / 0.28s) — the agent began speaking after sentence #1, before the full reply was generated.
+- **Latency logged (req #6):** `first-audio-latency: LLM ttft=4.20s`, `TTS ttfb≈0.3–0.7s`. (ttft above the ~2.5s MVP target — cloud model via the proxy; a faster model is a one-line `LLM_MODEL` swap.)
+- **Russian tokenization (req #7):** reply split into natural sentences; spoken cleanly.
+- **Clean teardown:** `session closed reason=participant_disconnected error=null`.
+- **Heard live in the browser** over the HTTPS page (Tailscale-served), confirmed audible and in-character.
+
+### Discovered live and fixed (`16f893e`)
+
+`gemini-3-flash-preview` is a reasoning model — it spent the token budget "thinking" (empty/truncated `content`, added latency), wrong for voice. Added a configurable `LLM_REASONING_EFFORT` (default `none`) wired into `openai.LLM(reasoning_effort=...)`; with `none` the model replies immediately. Empty value omits the param for models that reject it.
+
+The shipped `litellm.service` + `config.yaml` (alias `voice-agent`→Ollama Cloud, key via `OLLAMA_API_KEY`) remain valid for a from-scratch deployment; the live run simply pointed at the operator's existing proxy via env (`LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY`), so no secret entered the repo.
