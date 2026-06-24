@@ -25,6 +25,10 @@ Description=Voice Agent Worker (LiveKit Agents, Pi 5)
 # Needs the network (Tailscale to the Desktop STT/TTS, localhost SFU) up first.
 After=network-online.target
 Wants=network-online.target
+# Ordering only — ensures litellm starts before the worker.  LiteLLM/LLM
+# failures surface as runtime LLM errors, not a startup gate for the worker.
+After=litellm.service
+Wants=litellm.service
 
 [Service]
 Type=simple

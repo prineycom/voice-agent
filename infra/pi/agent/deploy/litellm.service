@@ -1,0 +1,59 @@
+# LiteLLM Proxy — systemd unit (Pi 5).
+#
+# Runs the LiteLLM proxy from its own dedicated venv.  The proxy exposes an
+# OpenAI-compatible endpoint on port 4000 that the Agent Worker routes LLM
+# calls through.
+#
+# ---------------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------------
+#   1. Create a dedicated venv for LiteLLM (separate from the agent venv):
+#        python3 -m venv /opt/voice-agent-litellm/.venv
+#        /opt/voice-agent-litellm/.venv/bin/pip install 'litellm[proxy]'
+#   2. Create the EnvironmentFile with secrets (never commit this file):
+#        sudo mkdir -p /etc/voice-agent
+#        sudo tee /etc/voice-agent/litellm.env > /dev/null <<EOF
+#        OLLAMA_API_KEY=<your-ollama-key>
+#        LITELLM_MASTER_KEY=<your-litellm-master-key>
+#        EOF
+#        sudo chmod 600 /etc/voice-agent/litellm.env
+#   3. Ensure the config exists at the path referenced in ExecStart, e.g.:
+#        /opt/voice-agent/infra/pi/litellm/config.yaml
+#   4. Adjust User/Group below to the service account that owns the venv.
+#   5. Install and start:
+#        sudo cp litellm.service /etc/systemd/system/
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now litellm
+#   6. Follow the logs:
+#        journalctl -u litellm -f
+# ---------------------------------------------------------------------------
+
+[Unit]
+Description=LiteLLM Proxy (OpenAI-compatible LLM gateway, Pi 5)
+# Needs the network (Tailscale to Cloud LLM backends) up first.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Operator MUST set a non-root service account that owns the venv.
+# Example: a dedicated `voice-agent` user, or the deploy user.
+#User=voice-agent
+#Group=voice-agent
+
+# Secrets file (out of repo — never commit).  Must contain:
+#   OLLAMA_API_KEY=...
+#   LITELLM_MASTER_KEY=...
+EnvironmentFile=/etc/voice-agent/litellm.env
+ExecStart=/opt/voice-agent-litellm/.venv/bin/litellm --config /opt/voice-agent/infra/pi/litellm/config.yaml --port 4000
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=litellm
+
+[Install]
+WantedBy=multi-user.target
