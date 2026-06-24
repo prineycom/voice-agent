@@ -22,6 +22,7 @@ class AgentConfig:
     tts_voice: str
     tts_sample_rate: int
     agent_greeting: str
+    worker_port: int
 
 
 def load_config() -> AgentConfig:
@@ -48,6 +49,14 @@ def load_config() -> AgentConfig:
             f"Invalid TTS_SAMPLE_RATE={raw_sample_rate!r}: expected an integer."
         ) from exc
 
+    raw_worker_port = os.environ.get("AGENT_WORKER_PORT", "8090")
+    try:
+        worker_port = int(raw_worker_port)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid AGENT_WORKER_PORT={raw_worker_port!r}: expected an integer."
+        ) from exc
+
     return AgentConfig(
         livekit_url=os.environ.get("LIVEKIT_URL", "ws://localhost:7880"),
         livekit_api_key=os.environ["LIVEKIT_API_KEY"],
@@ -59,4 +68,5 @@ def load_config() -> AgentConfig:
         tts_voice=os.environ.get("TTS_VOICE", "default"),
         tts_sample_rate=tts_sample_rate,
         agent_greeting=os.environ.get("AGENT_GREETING", DEFAULT_GREETING),
+        worker_port=worker_port,
     )

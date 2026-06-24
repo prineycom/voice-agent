@@ -53,6 +53,7 @@ Copy `.env.example` to `.env` and fill in the keys. Every key:
 | `TTS_VOICE` | Voice id → server speaker `aiden` (Russian) | `default` |
 | `TTS_SAMPLE_RATE` | Rate the plugin labels published frames with; must match the server's output rate | `24000` |
 | `AGENT_GREETING` | Literal greeting string spoken on join | `Привет! Я голосовой ассистент. Чем могу помочь?` |
+| `AGENT_WORKER_PORT` | Worker's own HTTP server port (the framework default `8081` is taken on the Pi) | `8090` |
 
 - **Reuse the LiveKit keys from `infra/pi/.env`** — the worker MUST use the same
   `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` the SFU loads. A mismatch fails SFU

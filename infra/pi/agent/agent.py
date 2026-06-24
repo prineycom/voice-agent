@@ -50,12 +50,15 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()  # type: ignore[call-arg]
 
     # TTS-only session — no STT, no LLM. say() drives TTS directly.
+    # turn_detection="manual": there is no user turn to detect (no STT yet), and
+    # the default mode probes LiveKit Cloud inference (401 on a self-hosted Pi).
     session = AgentSession(
         tts=DesktopTTS(
             ws_url=cfg.tts_ws_url,
             voice=cfg.tts_voice,
             sample_rate=cfg.tts_sample_rate,
         ),
+        turn_detection="manual",
     )
     await session.start(
         agent=Agent(instructions=AGENT_INSTRUCTIONS),
@@ -83,4 +86,7 @@ if __name__ == "__main__":
         ws_url=cfg.livekit_url,
         api_key=cfg.livekit_api_key,
         api_secret=cfg.livekit_api_secret,
+        # The worker's own HTTP server port. The framework prod default (8081) is
+        # already taken on the Pi; AGENT_WORKER_PORT (default 8090) avoids the clash.
+        port=cfg.worker_port,
     ))
