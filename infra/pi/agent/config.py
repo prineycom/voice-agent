@@ -31,6 +31,11 @@ class AgentConfig:
     llm_base_url: str  # the /v1 suffix is mandatory for the openai plugin
     llm_model: str  # LiteLLM alias defined in litellm config
     llm_api_key: str  # must equal the LiteLLM master key when one is set
+    # Reasoning effort passed to the LLM. Default "none" keeps replies snappy for
+    # voice (reasoning models otherwise spend latency "thinking" before the first
+    # token). Set empty to omit the param for models/providers that reject it;
+    # "low"/"minimal" are alternatives.
+    llm_reasoning_effort: str
     soul_path: Path
 
 
@@ -95,6 +100,7 @@ def load_config() -> AgentConfig:
         llm_base_url=os.environ.get("LLM_BASE_URL", "http://localhost:4000/v1"),
         llm_model=os.environ.get("LLM_MODEL", "voice-agent"),
         llm_api_key=os.environ.get("LLM_API_KEY", "litellm-local"),
+        llm_reasoning_effort=os.environ.get("LLM_REASONING_EFFORT", "none"),
         soul_path=Path(
             os.environ.get(
                 "SOUL_PATH",

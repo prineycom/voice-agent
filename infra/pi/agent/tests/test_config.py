@@ -22,6 +22,7 @@ def test_llm_defaults(monkeypatch):
     assert cfg.llm_base_url == "http://localhost:4000/v1"
     assert cfg.llm_model == "voice-agent"
     assert cfg.llm_api_key == "litellm-local"
+    assert cfg.llm_reasoning_effort == "none"
     assert str(cfg.soul_path).endswith("SOUL.md")
 
 
@@ -32,6 +33,7 @@ def test_env_overrides(monkeypatch):
     monkeypatch.setenv("LLM_BASE_URL", "http://example.test:9999/v1")
     monkeypatch.setenv("LLM_MODEL", "custom-model")
     monkeypatch.setenv("LLM_API_KEY", "custom-key")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "low")
     monkeypatch.setenv("SOUL_PATH", "/tmp/custom-soul.md")
 
     cfg = load_config()
@@ -39,6 +41,7 @@ def test_env_overrides(monkeypatch):
     assert cfg.llm_base_url == "http://example.test:9999/v1"
     assert cfg.llm_model == "custom-model"
     assert cfg.llm_api_key == "custom-key"
+    assert cfg.llm_reasoning_effort == "low"
     assert isinstance(cfg.soul_path, Path)
     assert cfg.soul_path == Path("/tmp/custom-soul.md")
 

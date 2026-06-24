@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit.agents import NOT_GIVEN, Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.agents import metrics as agent_metrics
 from livekit.agents.voice.events import MetricsCollectedEvent
 from livekit.plugins import openai, silero
@@ -115,6 +115,10 @@ async def entrypoint(ctx: JobContext) -> None:
             model=cfg.llm_model,
             base_url=cfg.llm_base_url,
             api_key=cfg.llm_api_key,
+            # Disable model "thinking" for voice latency. Passed only when set;
+            # the plugin auto-detects effort only for known OpenAI models, so a
+            # custom LiteLLM alias needs it explicit. NOT_GIVEN omits it.
+            reasoning_effort=cfg.llm_reasoning_effort or NOT_GIVEN,
         ),
         tts=DesktopTTS(
             ws_url=cfg.tts_ws_url,
