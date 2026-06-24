@@ -1,10 +1,11 @@
-"""Agent Worker entrypoint — STT → echo → TTS loop (NO LLM).
+"""Agent Worker entrypoint — STT → LLM → TTS pipeline with a SOUL personality.
 
-This wires both audio paths through the Desktop GPU boxes: the Desktop STT
-plugin transcribes each user turn, and the Desktop TTS plugin speaks it back
-verbatim. There is NO LLM in the loop — the echo handler simply repeats the
-final transcript, which exercises input + output end to end before reasoning
-lands in a later task.
+This wires a full conversational loop through the Desktop GPU boxes and the
+local LiteLLM proxy: the Desktop STT plugin transcribes each user turn, the
+`openai.LLM` plugin (pointed at the on-Pi LiteLLM `/v1` endpoint) reasons over
+it under the SOUL.md system prompt, and the Desktop TTS plugin speaks the
+reply. SOUL.md is the agent's personality (Russian by design) and is loaded
+verbatim as the system prompt at startup.
 
 Turn-taking uses a LOCAL Silero VAD (`silero.VAD.load()`, ONNX run on the Pi)
 with `turn_detection="vad"`. This is deliberate: the framework's default VAD is
@@ -13,12 +14,14 @@ cloud-backed and 401s on a self-hosted Pi (the very failure that forced
 livekit-plugins-silero is expected on the pinned 1.6.2 and is harmless.
 
 Flow:
-    1. Load config + run the Desktop STT and TTS health gates (abort loudly if
-       either is down — a deaf or mute agent must never join a room).
+    1. Load config + the SOUL personality, then run the Desktop STT and TTS
+       health gates (abort loudly if either is down — a deaf or mute agent must
+       never join a room).
     2. Connect to the room.
-    3. Start an AgentSession with STT + TTS + local VAD (no LLM).
-    4. Greet once when a remote participant joins, then echo every final
-       user transcript back via TTS.
+    3. Start an AgentSession with STT + LLM + TTS + local VAD, instructed by
+       SOUL.md, and register a first-audio latency log hook.
+    4. Greet once when a remote participant joins, then run the full
+       STT → LLM → TTS conversation loop.
 
 Dispatch: this worker registers with an empty `agent_name`, so it is dispatched
 automatically to every room (LiveKit default room dispatch). Run it with:
@@ -30,9 +33,12 @@ See the README (Task 8) for the on-Pi smoke test.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli, llm
-from livekit.plugins import silero
+from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit.agents import metrics as agent_metrics
+from livekit.agents.voice.events import MetricsCollectedEvent
+from livekit.plugins import openai, silero
 
 from config import load_config
 from health import (
@@ -46,37 +52,34 @@ from tts_plugin import DesktopTTS
 
 log = logging.getLogger("agent")
 
-# Placeholder instructions — no LLM is invoked in the echo loop, but Agent
-# requires an instructions string. Kept short until the LLM lands in a later task.
-AGENT_INSTRUCTIONS = "You are a voice assistant. (STT echo-loop scaffold, no LLM.)"
 
+def _load_soul(path: Path) -> str:
+    """Read the SOUL personality file (UTF-8) for use as the LLM system prompt.
 
-class EchoAgent(Agent):
-    """Echoes each completed user turn back through TTS — no LLM.
-
-    `on_user_turn_completed` is the correct extension point: the framework
-    awaits it inside the turn pipeline *before* its `if llm is None: return`
-    short-circuit (see livekit.agents.voice.agent_activity), so a `say()`
-    scheduled here is played as the turn's response. Calling `say()` from a
-    `user_input_transcribed` event callback instead races the turn commit and
-    the speech is dropped.
+    Fail loud (same discipline as load_config's missing-key error): a blank or
+    missing SOUL means the agent has no personality, so abort with an
+    actionable message rather than joining the room with empty instructions.
     """
-
-    def __init__(self) -> None:
-        super().__init__(instructions=AGENT_INSTRUCTIONS)
-
-    async def on_user_turn_completed(
-        self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
-    ) -> None:
-        text = new_message.text_content
-        if text and text.strip():
-            log.info("Echoing transcript: %s", text)
-            self.session.say(text)
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"SOUL file not found at {path}. Create infra/pi/agent/SOUL.md "
+            "or set SOUL_PATH to a readable file — it is loaded as the agent's "
+            "system prompt."
+        ) from exc
+    if not text:
+        raise RuntimeError(
+            f"SOUL file at {path} is empty. It is loaded verbatim as the agent's "
+            "system prompt; populate it with the personality before starting."
+        )
+    return text
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    """Health-gate, join the room, and echo each user turn via STT → TTS."""
+    """Health-gate, join the room, and run the STT → LLM → TTS pipeline."""
     cfg = load_config()
+    soul_text = _load_soul(cfg.soul_path)
 
     # Health gates (Risk: a deaf or mute agent). Abort before joining if either
     # Desktop service is not ready. Run both with the same loud-abort discipline.
@@ -98,13 +101,20 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await ctx.connect()  # type: ignore[call-arg]
 
-    # STT + TTS session with local VAD; turn_detection="vad" uses the loaded
-    # Silero VAD to bound user turns. No LLM — the echo handler drives say().
+    # Full STT → LLM → TTS session with local VAD; turn_detection="vad" uses the
+    # loaded Silero VAD to bound user turns. The LLM is the local LiteLLM proxy
+    # spoken to via the OpenAI-compatible plugin (base_url must carry the /v1
+    # suffix, supplied by config).
     session = AgentSession(
         stt=DesktopSTT(
             ws_url=cfg.stt_ws_url,
             language=cfg.stt_language,
             sample_rate=cfg.stt_sample_rate,
+        ),
+        llm=openai.LLM(
+            model=cfg.llm_model,
+            base_url=cfg.llm_base_url,
+            api_key=cfg.llm_api_key,
         ),
         tts=DesktopTTS(
             ws_url=cfg.tts_ws_url,
@@ -115,10 +125,21 @@ async def entrypoint(ctx: JobContext) -> None:
         turn_detection="vad",
     )
 
-    # The echo (NO LLM) is driven by EchoAgent.on_user_turn_completed, which runs
-    # inside the turn pipeline at the correct point (see EchoAgent docstring).
+    # First-audio latency (req #6): log LLM time-to-first-token and TTS
+    # time-to-first-byte as turns complete. `metrics_collected` is deprecated in
+    # 1.6.2 (forward path: ChatMessage.metrics) but is the simplest reliable
+    # latency hook for this slice. The event carries an AgentMetrics union on
+    # `.metrics`; we isinstance-discriminate the LLM vs TTS variants.
+    @session.on("metrics_collected")
+    def _on_metrics(ev: MetricsCollectedEvent) -> None:
+        m = ev.metrics
+        if isinstance(m, agent_metrics.LLMMetrics):
+            log.info("first-audio-latency: LLM ttft=%.3fs", m.ttft)
+        elif isinstance(m, agent_metrics.TTSMetrics):
+            log.info("first-audio-latency: TTS ttfb=%.3fs", m.ttfb)
+
     await session.start(
-        agent=EchoAgent(),
+        agent=Agent(instructions=soul_text),
         room=ctx.room,
     )
 
@@ -128,7 +149,7 @@ async def entrypoint(ctx: JobContext) -> None:
     log.info("Participant %s joined; speaking greeting.", participant.identity)
 
     session.say(cfg.agent_greeting)
-    log.info("Greeting spoken; entering STT echo loop.")
+    log.info("Greeting spoken; entering STT → LLM → TTS loop.")
 
 
 # Dispatch is automatic (empty agent_name => room dispatch). The entrypoint runs
