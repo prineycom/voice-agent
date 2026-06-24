@@ -1,0 +1,33 @@
+model_list:
+  - model_name: voice-agent
+    litellm_params:
+      # ONE-LINE MODEL-SWAP POINT (issue #13 req #3):
+      # To switch providers or models, change only this line.
+      # Format: "<transport_prefix>/<model_id>"
+      # Examples:
+      #   openai/gpt-4.1                          — GPT-4.1 via direct OpenAI API
+      #   openai/gemini-2.5-flash-preview         — Gemini via direct Google API
+      #   openai/nemotron-3-super:cloud           — Ollama Cloud (current)
+      model: openai/nemotron-3-super:cloud
+
+      # Ollama Cloud is reached via its OpenAI-compatible REST endpoint.
+      # The ":cloud" suffix in the model id selects the hosted (cloud-run)
+      # variant of the model rather than a locally-running Ollama daemon.
+      # The "openai/" prefix tells LiteLLM to use the OpenAI-compatible
+      # transport — do NOT use "ollama_chat/" here, which targets a native
+      # local Ollama daemon and uses a different wire protocol.
+      api_base: https://ollama.com/v1
+
+      # Reads the Ollama Cloud API key from the environment.
+      # The actual key is set in the litellm systemd unit's EnvironmentFile
+      # (e.g. /etc/litellm/litellm.env) and is NOT committed to this repo.
+      # os.environ/VAR_NAME is LiteLLM's syntax for environment variable
+      # interpolation — it resolves at startup, not at config-parse time.
+      api_key: os.environ/OLLAMA_API_KEY
+
+general_settings:
+  # Authenticates clients (the Agent Worker) to this LiteLLM proxy.
+  # The Agent Worker's LLM_API_KEY env var must equal this master key.
+  # The actual secret is set in the litellm systemd unit's EnvironmentFile
+  # and is NOT committed to this repo.
+  master_key: os.environ/LITELLM_MASTER_KEY

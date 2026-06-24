@@ -6,8 +6,15 @@ livekit-agents==1.6.2
 # Silero VAD plugin for LiveKit turn detection/endpointing (aarch64/py3.13 wheel, onnxruntime backend).
 # Note: Silero downloads model weights (~1–2 MB) on first load — requires internet access at boot.
 livekit-plugins-silero==1.6.2
+# OpenAI-compatible HTTP client plugin for LiveKit, used ONLY to talk to the LOCAL LiteLLM proxy.
+# No OpenAI API key is set and no traffic goes to OpenAI — LiteLLM rewrites requests to the configured model.
+# Note: LiteLLM itself is NOT installed in this venv; it runs in its own venv as a separate systemd service
+# (pip install 'litellm[proxy]') — see infra/pi/litellm/README.md for setup details.
+livekit-plugins-openai==1.6.2
 python-dotenv==1.2.2
-websockets==16.0
+# websockets pinned <16 to satisfy livekit-plugins-openai==1.6.2 (it requires websockets<16);
+# 15.0.1 keeps the new asyncio client API (ClientConnection, max_size) the STT/TTS plugins rely on.
+websockets==15.0.1
 
 # dev
 pytest
