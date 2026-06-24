@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli, llm
 from livekit.plugins import silero
 
 from config import load_config
@@ -49,6 +49,29 @@ log = logging.getLogger("agent")
 # Placeholder instructions — no LLM is invoked in the echo loop, but Agent
 # requires an instructions string. Kept short until the LLM lands in a later task.
 AGENT_INSTRUCTIONS = "You are a voice assistant. (STT echo-loop scaffold, no LLM.)"
+
+
+class EchoAgent(Agent):
+    """Echoes each completed user turn back through TTS — no LLM.
+
+    `on_user_turn_completed` is the correct extension point: the framework
+    awaits it inside the turn pipeline *before* its `if llm is None: return`
+    short-circuit (see livekit.agents.voice.agent_activity), so a `say()`
+    scheduled here is played as the turn's response. Calling `say()` from a
+    `user_input_transcribed` event callback instead races the turn commit and
+    the speech is dropped.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(instructions=AGENT_INSTRUCTIONS)
+
+    async def on_user_turn_completed(
+        self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
+    ) -> None:
+        text = new_message.text_content
+        if text and text.strip():
+            log.info("Echoing transcript: %s", text)
+            self.session.say(text)
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -92,17 +115,10 @@ async def entrypoint(ctx: JobContext) -> None:
         turn_detection="vad",
     )
 
-    # Echo handler (NO LLM): repeat each final, non-empty transcript back via TTS.
-    # `say()` is sync in 1.6.2 and returns a SpeechHandle; calling it from this
-    # sync event callback is the intended pattern.
-    @session.on("user_input_transcribed")
-    def _on_transcript(ev) -> None:
-        if ev.is_final and ev.transcript.strip():
-            log.info("Echoing transcript: %s", ev.transcript)
-            session.say(ev.transcript)
-
+    # The echo (NO LLM) is driven by EchoAgent.on_user_turn_completed, which runs
+    # inside the turn pipeline at the correct point (see EchoAgent docstring).
     await session.start(
-        agent=Agent(instructions=AGENT_INSTRUCTIONS),
+        agent=EchoAgent(),
         room=ctx.room,
     )
 
