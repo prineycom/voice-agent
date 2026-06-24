@@ -48,7 +48,7 @@ cp .env.example .env      # then fill in LIVEKIT_API_KEY/SECRET from infra/pi/.e
 `python-dotenv==1.2.2`, `websockets==16.0`, and pytest for dev). ARM64 wheels
 resolve cleanly on the Pi — no torch/GPU deps, since all heavy inference is remote.
 
-`livekit-plugins-silero` downloads its ONNX VAD model weights on first run (~1 MB,
+`livekit-plugins-silero` downloads its ONNX VAD model weights on first run (~1–2 MB,
 cached locally). A `DeprecationWarning` from this package is expected on the pinned
 `1.6.2` and is harmless — the local VAD is deliberate (the framework's cloud-backed
 default 401s on a self-hosted Pi; see `agent.py` for details).
@@ -64,7 +64,7 @@ Copy `.env.example` to `.env` and fill in the keys. Every key:
 | `STT_WS_URL` | Desktop STT WebSocket (over Tailscale) | `ws://100.75.88.35:8001/stt` |
 | `STT_HEALTH_URL` | Desktop STT health endpoint (startup gate) | `http://100.75.88.35:8001/health` |
 | `STT_SAMPLE_RATE` | Sample rate the plugin sends audio at; must match the Desktop STT server's expected input rate | `16000` |
-| `STT_LANGUAGE` | Language hint passed to the STT server (BCP-47 code) | `ru` |
+| `STT_LANGUAGE` | BCP-47 tag attached to the returned `SpeechData.language` metadata only — **not** sent to the Desktop STT server. To change the actual recognition language, set `STT_LANGUAGE` on the Desktop STT server (`infra/desktop/stt/.env`) | `ru` |
 | `TTS_WS_URL` | Desktop TTS WebSocket (over Tailscale) | `ws://100.75.88.35:8002/tts` |
 | `TTS_HEALTH_URL` | Desktop TTS health endpoint (startup gate) | `http://100.75.88.35:8002/health` |
 | `TTS_VOICE` | Voice id → server speaker `aiden` (Russian) | `default` |

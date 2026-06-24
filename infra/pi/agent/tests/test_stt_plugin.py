@@ -130,6 +130,52 @@ async def test_one_socket_across_two_turns(stt_server_factory):
 
 
 @pytest.mark.asyncio
+async def test_disconnect_raises_then_recovers(stt_server_factory):
+    # Mid-turn server disconnect: the server closes the socket after {"event":
+    # "end"}, so the plugin's recv() raises ConnectionClosed → generic-exception
+    # path → best-effort reset (which fails on the dead socket and drops it) →
+    # re-raised as APIError. A subsequent turn on the SAME instance reconnects
+    # cleanly and succeeds.
+    srv = await stt_server_factory(mode="disconnect", transcript="привет мир")
+    frame = _make_frame(160)
+
+    stt_impl = DesktopSTT(ws_url=srv.url)
+
+    with pytest.raises(APIError):
+        await stt_impl.recognize(buffer=frame, conn_options=NO_RETRY)
+
+    # The dead socket was dropped, so the next turn is forced to reconnect.
+    assert stt_impl._ws is None
+
+    # The server then switches to a normal final-transcript turn for the recovery.
+    srv.mode = "final"
+    event = await stt_impl.recognize(buffer=frame)
+
+    assert event.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+    assert event.alternatives[0].text == "привет мир"
+    # Clean recovery means a fresh connection was opened for the second turn.
+    assert srv.connections == 2
+
+    await stt_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_interim_partials_skipped(stt_server_factory):
+    # The server emits interim {"is_final": false, "partial": ...} frames before
+    # the final transcript; the plugin must skip them and return only the final.
+    srv = await stt_server_factory(transcript="привет", partials=["при", "приве"])
+    frame = _make_frame(160)
+
+    stt_impl = DesktopSTT(ws_url=srv.url)
+    event = await stt_impl.recognize(buffer=frame)
+
+    assert event.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+    assert event.alternatives[0].text == "привет"
+
+    await stt_impl.aclose()
+
+
+@pytest.mark.asyncio
 async def test_aclose_closes_socket(stt_server_factory):
     srv = await stt_server_factory()
     frame = _make_frame(160)

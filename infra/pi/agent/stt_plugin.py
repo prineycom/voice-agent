@@ -69,6 +69,21 @@ class DesktopSTT(stt.STT):
             # The socket is likely dead; drop it so the next turn reconnects.
             self._ws = None
 
+    async def _drop_ws(self) -> None:
+        """Close and forget the persistent socket (best-effort). Never raises.
+
+        Used on the cancellation path: dropping the socket forces a fresh reconnect
+        next turn, which the /stt server serves from an empty per-connection buffer.
+        """
+        ws = self._ws
+        self._ws = None
+        if ws is None:
+            return
+        try:
+            await ws.close()
+        except Exception:  # noqa: BLE001 — best-effort teardown, ignore
+            pass
+
     async def _recognize_impl(
         self,
         buffer: utils.AudioBuffer,
@@ -82,6 +97,17 @@ class DesktopSTT(stt.STT):
 
                 # Merge the buffer (handles both a single frame and a list).
                 frame = utils.merge_frames(buffer)
+
+                # This pipeline is mono end to end: the LiveKit mic input is mono
+                # and the /stt server expects mono PCM16. Both the resample and the
+                # raw-passthrough branch below assume one channel, so a multi-channel
+                # frame would be mis-resampled/garbled. Surface the misconfiguration
+                # loudly rather than send corrupt audio to the server.
+                if frame.num_channels != NUM_CHANNELS:
+                    raise APIError(
+                        f"STT expects mono audio (got {frame.num_channels} channels); "
+                        "the LiveKit mic input in this pipeline is mono"
+                    )
 
                 # Resample to 16 kHz mono if needed.
                 if frame.sample_rate != self._sample_rate:
@@ -97,7 +123,11 @@ class DesktopSTT(stt.STT):
                 else:
                     pcm = frame.data.cast("b").tobytes()
 
-                # Send the audio, then flush with an end event.
+                # Send the audio, then flush with an end event. Note: the
+                # StreamAdapter retries recognize() (max_retry=3 in production), so a
+                # transient failure re-uploads the whole buffer plus a fresh `end`
+                # after the prior `reset`. This is functionally correct (reset clears
+                # the server buffer first) but re-sends the full utterance per retry.
                 await ws.send(pcm)
                 await ws.send(json.dumps({"event": "end"}))
 
@@ -116,7 +146,13 @@ class DesktopSTT(stt.STT):
                     # Interim partial result — ignore.
                     log.debug("STT partial: %s", data.get("partial", ""))
             except asyncio.CancelledError:
-                await self._reset_buffer()
+                # Normal barge-in/interruption (ADR-0006). Do NOT rely on an in-band
+                # `reset` send here: it may itself be cancelled before reaching the
+                # server, leaving a half-buffer for the next turn. Instead drop the
+                # socket entirely (best-effort close). The /stt server keeps a
+                # per-connection buffer, so the next turn's fresh reconnect starts
+                # with a clean, empty server buffer — the robust guarantee we want.
+                await self._drop_ws()
                 raise
             except APIError:
                 await self._reset_buffer()
