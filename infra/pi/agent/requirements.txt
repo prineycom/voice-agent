@@ -12,7 +12,9 @@ livekit-plugins-silero==1.6.2
 # (pip install 'litellm[proxy]') — see infra/pi/litellm/README.md for setup details.
 livekit-plugins-openai==1.6.2
 python-dotenv==1.2.2
-websockets==16.0
+# websockets pinned <16 to satisfy livekit-plugins-openai==1.6.2 (it requires websockets<16);
+# 15.0.1 keeps the new asyncio client API (ClientConnection, max_size) the STT/TTS plugins rely on.
+websockets==15.0.1
 
 # dev
 pytest
