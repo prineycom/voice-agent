@@ -230,6 +230,74 @@ first-audio-latency: TTS ttfb=0.213s
 `ttfb` is TTS time-to-first-byte (LLM output starts → first audio frame arrives
 from the Desktop TTS service).
 
+## Barge-in / interruption
+
+### What it does
+
+The user can speak over the agent while it is talking. The agent stops mid-sentence
+and handles the new turn — the interrupted speech is not finished and no audio tail
+is played.
+
+### How it works (verified behavior)
+
+Interruptions are **enabled by default** in `livekit-agents 1.6.2` — there is no
+explicit barge-in code in `agent.py` (see `AgentSession` constructor comment and
+ADR-0006). The framework defaults are:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `True` | interruption is on |
+| `min_duration` | `0.5 s` | minimum speech before an interruption registers |
+| `false_interruption_timeout` | `2.0 s` | silence window before a tentative interruption is committed |
+
+**Sequence on a committed interruption:**
+
+1. The local Silero VAD detects the user speaking over the agent — TTS playout is
+   **paused** immediately.
+2. The framework waits for the user's final transcript. If the user falls silent
+   within `false_interruption_timeout` (2 s) without a transcript, playout **resumes**
+   — this guards against a cough or brief noise triggering a false barge-in.
+3. Once a transcript commits the interruption, the framework **cancels the active
+   TTS task** → `DesktopTTS._run`'s `finally` block closes the `/tts` WebSocket →
+   the Desktop TTS server cancels its producer on disconnect (no in-band stop
+   message; see ADR-0006) → any locally-buffered or queued audio is dropped via the
+   framework's `clear_buffer`. There is no audio tail.
+4. Each agent turn opens a **fresh `/tts` socket**, so closing it aborts only that
+   turn — the next reply opens a new socket cleanly.
+
+### Tuning
+
+To change `min_duration`, `false_interruption_timeout`, or disable interruptions
+entirely, pass `turn_handling` to `AgentSession`:
+
+```python
+from livekit.agents.voice import TurnHandlingOptions, InterruptionOptions
+
+session = AgentSession(
+    ...,
+    turn_handling=TurnHandlingOptions(
+        interruption=InterruptionOptions(
+            min_duration=0.8,               # seconds of speech required
+            false_interruption_timeout=1.5, # seconds of silence before commit
+            # enabled=False to disable barge-in entirely
+        )
+    ),
+)
+```
+
+Do **not** use the deprecated flat kwargs `allow_interruptions=` /
+`min_interruption_*` — they were removed in `livekit-agents 1.6.x`.
+
+### Headphones caveat
+
+Because the agent now responds to heard speech, playing TTS audio through
+**speakers** lets the agent hear its own voice and self-interrupt — barge-in makes
+this more pronounced than the earlier echo / conversation-loop issues. **Use
+headphones** (or mute your mic while the agent speaks). This is already required by
+the smoke-test below; the caveat is worth keeping in mind when tuning
+`min_duration` (a higher threshold reduces sensitivity to self-echo if headphones
+are not available in a particular setup).
+
 ## Run
 Foreground, dev mode (verbose logs):
 ```bash
@@ -326,7 +394,18 @@ This is the **MANUAL on-Pi step** (the acceptance check) — not yet run in CI.
    - Latency is reasonable: check `first-audio-latency:` lines in the worker log
      (`journalctl -u voice-agent-worker -f | grep first-audio-latency`).
    - Personality is consistent with `SOUL.md` (direct, Russian, brief).
-8. **Restart via systemd** (`sudo systemctl restart voice-agent-worker`) and
+8. **Barge-in smoke test.** While the agent is speaking a reply (a long one works
+   best — ask it to explain something), start talking over it:
+   - Confirm the agent's speech **stops promptly** (within ~0.5 s of your voice
+     starting) — no audio tail after you cut in.
+   - Confirm your new turn is **transcribed and answered** (the agent processes the
+     new utterance and speaks a fresh reply).
+   - Ask a very short yes/no question, then stay silent immediately after — confirm
+     the agent does **not** interrupt itself (the 2 s `false_interruption_timeout`
+     should absorb a brief noise and resume the original reply).
+   Check the worker log for a `user_input_transcribed` event on your barge-in turn;
+   no error lines should appear around the interruption.
+9. **Restart via systemd** (`sudo systemctl restart voice-agent-worker`) and
    confirm it recovers, re-greets on join, and continues the conversation correctly.
 
 Record the smoke result, greeting latency, and LLM+TTS first-audio latency in the
