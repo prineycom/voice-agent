@@ -27,6 +27,11 @@ class AgentConfig:
     tts_sample_rate: int
     agent_greeting: str
     worker_port: int
+    # LLM (via local LiteLLM proxy)
+    llm_base_url: str  # the /v1 suffix is mandatory for the openai plugin
+    llm_model: str  # LiteLLM alias defined in litellm config
+    llm_api_key: str  # must equal the LiteLLM master key when one is set
+    soul_path: Path
 
 
 def load_config() -> AgentConfig:
@@ -87,4 +92,13 @@ def load_config() -> AgentConfig:
         tts_sample_rate=tts_sample_rate,
         agent_greeting=os.environ.get("AGENT_GREETING", DEFAULT_GREETING),
         worker_port=worker_port,
+        llm_base_url=os.environ.get("LLM_BASE_URL", "http://localhost:4000/v1"),
+        llm_model=os.environ.get("LLM_MODEL", "voice-agent"),
+        llm_api_key=os.environ.get("LLM_API_KEY", "litellm-local"),
+        soul_path=Path(
+            os.environ.get(
+                "SOUL_PATH",
+                str(Path(__file__).resolve().parent / "SOUL.md"),
+            )
+        ),
     )
