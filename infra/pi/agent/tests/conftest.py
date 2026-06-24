@@ -49,7 +49,8 @@ class FakeTTSServer:
         self.mode = mode
         self.error = error
         self.received = []  # request JSON dicts, one per client connection
-        self.connections = 0
+        self.connections = 0  # cumulative count of accepted connections
+        self.active = 0  # currently-open connections (drains to 0 on no leak)
         # Set to True and signalled when the connection ends (either side closes;
         # in practice a mid-stream client cancel reaches this via ConnectionClosed
         # before the normal `done`/`error` paths do). Barge-in abort tests await
@@ -61,6 +62,7 @@ class FakeTTSServer:
 
     async def _handler(self, ws):
         self.connections += 1
+        self.active += 1
         try:
             req = await ws.recv()
             self.received.append(json.loads(req))
@@ -83,6 +85,8 @@ class FakeTTSServer:
             # Client closed mid-stream (e.g. barge-in abort).
             pass
         finally:
+            # This socket is now fully torn down; drop it from the active gauge.
+            self.active -= 1
             # Always mark the disconnect so tests can assert the socket closed.
             self.disconnected = True
             self.disconnected_event.set()
