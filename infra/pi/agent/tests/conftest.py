@@ -43,33 +43,47 @@ class FakeTTSServer:
     """
 
     def __init__(self, chunks, *, mode="done", error="boom"):
+        import asyncio
+
         self.chunks = chunks
         self.mode = mode
         self.error = error
         self.received = []  # request JSON dicts, one per client connection
         self.connections = 0
+        # Set to True and signalled when the client-side socket closes.  Barge-in
+        # abort tests can await disconnected_event to confirm the socket closed.
+        self.disconnected = False
+        self.disconnected_event = asyncio.Event()
         self._server = None
         self.url = None
 
     async def _handler(self, ws):
         self.connections += 1
-        req = await ws.recv()
-        self.received.append(json.loads(req))
-        for chunk in self.chunks:
-            await ws.send(chunk)
-        if self.mode == "error":
-            await ws.send(json.dumps({"error": self.error}))
-        elif self.mode == "disconnect":
-            await ws.close()
-            return
-        else:
-            await ws.send(json.dumps({"done": True}))
-        # Keep the handler alive so the client controls teardown; this lets the
-        # test assert per-utterance client-side disconnect.
         try:
-            await ws.wait_closed()
-        except Exception:
+            req = await ws.recv()
+            self.received.append(json.loads(req))
+            for chunk in self.chunks:
+                await ws.send(chunk)
+            if self.mode == "error":
+                await ws.send(json.dumps({"error": self.error}))
+            elif self.mode == "disconnect":
+                await ws.close()
+                return
+            else:
+                await ws.send(json.dumps({"done": True}))
+            # Keep the handler alive so the client controls teardown; this lets
+            # the test assert per-utterance client-side disconnect.
+            try:
+                await ws.wait_closed()
+            except Exception:
+                pass
+        except websockets.exceptions.ConnectionClosed:
+            # Client closed mid-stream (e.g. barge-in abort).
             pass
+        finally:
+            # Always mark the disconnect so tests can assert the socket closed.
+            self.disconnected = True
+            self.disconnected_event.set()
 
     async def start(self):
         self._server = await websockets.serve(self._handler, "127.0.0.1", 0)
