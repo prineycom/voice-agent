@@ -37,6 +37,9 @@ class AgentConfig:
     # "low"/"minimal" are alternatives.
     llm_reasoning_effort: str
     soul_path: Path
+    # Worker skill (Hermes CLI patterns) appended to instructions. Optional —
+    # missing file is warned, not fatal (unlike SOUL).
+    worker_skill_path: Path
 
 
 def load_config() -> AgentConfig:
@@ -105,6 +108,12 @@ def load_config() -> AgentConfig:
             os.environ.get(
                 "SOUL_PATH",
                 str(Path(__file__).resolve().parent / "SOUL.md"),
+            )
+        ),
+        worker_skill_path=Path(
+            os.environ.get(
+                "WORKER_SKILL_PATH",
+                str(Path(__file__).resolve().parent / "skills" / "hermes.md"),
             )
         ),
     )

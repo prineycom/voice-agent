@@ -52,8 +52,45 @@ from health import (
 )
 from stt_plugin import DesktopSTT
 from tts_plugin import DesktopTTS
+from worker_tools import run_command
 
 log = logging.getLogger("agent")
+
+
+def _load_text_file(path: Path, *, what: str, required: bool = True) -> str | None:
+    """Read a UTF-8 text file used in the Agent instructions (SOUL, worker skill).
+
+    `required=True` fails loud on missing/empty (SOUL.md — no personality, abort).
+    `required=False` warns and returns None so the worker still boots (the skill
+    is an enhancement, not a startup gate).
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        if required:
+            raise RuntimeError(
+                f"{what} file not found at {path}. It is loaded as part of the "
+                "agent's system prompt; create it or set the *_PATH env var."
+            )
+        log.warning("%s file not found at %s; continuing without it.", what, path)
+        return None
+    except (PermissionError, IsADirectoryError, OSError) as exc:
+        # Same actionable fail-loud discipline as a missing SOUL: a path that
+        # exists but can't be read (wrong perms, a directory, I/O error) is a
+        # startup-fatal misconfiguration, not a silent skip.
+        raise RuntimeError(
+            f"{what} file at {path} could not be read ({exc.__class__.__name__}: {exc}). "
+            "Check the *_PATH env var points to a readable file."
+        ) from exc
+    if not text:
+        if required:
+            raise RuntimeError(
+                f"{what} file at {path} is empty. It is loaded verbatim as part of "
+                "the agent's system prompt; populate it before starting."
+            )
+        log.warning("%s file at %s is empty; continuing without it.", what, path)
+        return None
+    return text
 
 
 def _load_soul(path: Path) -> str:
@@ -63,26 +100,18 @@ def _load_soul(path: Path) -> str:
     missing SOUL means the agent has no personality, so abort with an
     actionable message rather than joining the room with empty instructions.
     """
-    try:
-        text = Path(path).read_text(encoding="utf-8").strip()
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            f"SOUL file not found at {path}. Create infra/pi/agent/SOUL.md "
-            "or set SOUL_PATH to a readable file — it is loaded as the agent's "
-            "system prompt."
-        ) from exc
-    if not text:
-        raise RuntimeError(
-            f"SOUL file at {path} is empty. It is loaded verbatim as the agent's "
-            "system prompt; populate it with the personality before starting."
-        )
-    return text
+    return _load_text_file(path, what="SOUL", required=True) or ""
 
 
 async def entrypoint(ctx: JobContext) -> None:
     """Health-gate, join the room, and run the STT → LLM → TTS pipeline."""
     cfg = load_config()
     soul_text = _load_soul(cfg.soul_path)
+    # Worker skill (Hermes CLI patterns): optional, appended to the instructions.
+    # Not a startup gate — a missing skill just means the LLM lacks the run_command
+    # pattern docs (run_command itself is still registered; the LLM may still try).
+    skill_text = _load_text_file(cfg.worker_skill_path, what="Worker skill", required=False)
+    instructions = soul_text if not skill_text else f"{soul_text}\n\n{skill_text}"
 
     # Health gates (Risk: a deaf or mute agent). Abort before joining if either
     # Desktop service is not ready. Run both with the same loud-abort discipline.
@@ -159,7 +188,7 @@ async def entrypoint(ctx: JobContext) -> None:
             log.info("first-audio-latency: TTS ttfb=%.3fs", m.ttfb)
 
     await session.start(
-        agent=Agent(instructions=soul_text),
+        agent=Agent(instructions=instructions, tools=[run_command]),
         room=ctx.room,
     )
 

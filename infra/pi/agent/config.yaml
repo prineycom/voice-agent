@@ -1,0 +1,11 @@
+# Agent Worker tool config — whitelist of CLI commands the LLM may run via run_command().
+#
+# run_command() parses its `args` string with shlex and checks the FIRST token
+# against this list. Only commands listed here may be executed; anything else
+# is rejected before exec. Add a command here + a pattern in skills/hermes.md,
+# then restart the worker — no code change required.
+worker_tools:
+  allowed_commands:
+    - hermes
+    # - git      # add later if needed
+    # - docker   # add later
