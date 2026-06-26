@@ -9,6 +9,7 @@ queueing / progress / cancellation logic.
 
 import asyncio
 import json
+import logging
 
 import pytest
 
@@ -412,3 +413,101 @@ async def test_no_publisher_is_safe(monkeypatch):
     mgr.attach_session(FakeSession())
     await mgr.delegate("задача")
     await mgr.join()  # must not raise
+
+
+class IdlePrimitiveSession(FakeSession):
+    """FakeSession that exposes the framework's async ``wait_for_idle()`` primitive.
+
+    Records the relative order of idle-await vs reply so a test can assert the
+    worker awaits the primitive *before* speaking.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.idle_awaited = False
+        self.order: list[str] = []
+
+    async def wait_for_idle(self):
+        self.idle_awaited = True
+        self.order.append("idle")
+
+    def generate_reply(self, *, instructions=None, allow_interruptions=None, **kwargs):
+        self.order.append("reply")
+        return super().generate_reply(
+            instructions=instructions, allow_interruptions=allow_interruptions, **kwargs
+        )
+
+
+@pytest.mark.asyncio
+async def test_delivery_awaits_framework_idle_primitive_before_replying(monkeypatch):
+    """When the bound session exposes async wait_for_idle(), the delivery worker
+    awaits it before calling generate_reply (preferred over the state poll)."""
+    session = IdlePrimitiveSession()
+    proc = FakeProc(stdout=b"ready via primitive\n")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
+
+    mgr = HermesTaskManager(task_timeout=10)
+    mgr.attach_session(session)
+    await mgr.delegate("задача")
+    await mgr.join()
+
+    assert session.idle_awaited is True  # the framework primitive was awaited
+    assert any("ready via primitive" in r for r in session.replies)  # and a reply was made
+    assert session.order == ["idle", "reply"]  # await happened before the reply
+
+
+class RaisingHandle:
+    """Stand-in for a SpeechHandle whose await raises — mirrors FakeHandle's shape
+    so the raise happens at ``await handle`` inside the delivery worker."""
+
+    def __await__(self):
+        async def _boom():
+            raise RuntimeError("speech handle exploded")
+
+        return _boom().__await__()
+
+
+class FlakyHandleSession(FakeSession):
+    """First generate_reply yields a handle that raises on await; later ones are
+    normal — so a test can prove the worker survives a failed delivery and still
+    delivers the next result."""
+
+    def __init__(self):
+        super().__init__()
+        self._calls = 0
+
+    def generate_reply(self, *, instructions=None, allow_interruptions=None, **kwargs):
+        self.replies.append(instructions or "")
+        self._calls += 1
+        if self._calls == 1:
+            return RaisingHandle()
+        return FakeHandle()
+
+
+@pytest.mark.asyncio
+async def test_delivery_logs_and_continues_when_handle_await_raises(monkeypatch, caplog):
+    """A speech handle that raises on await must be logged as a warning (not
+    swallowed silently, not crashing the worker), and a subsequent result must
+    still be delivered (no strand)."""
+    session = FlakyHandleSession()
+    p1 = FakeProc(stdout=b"first result\n")
+    p2 = FakeProc(stdout=b"second result\n")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([p1, p2]))
+
+    mgr = HermesTaskManager(task_timeout=10)
+    mgr.attach_session(session)
+
+    with caplog.at_level(logging.WARNING, logger="agent"):
+        # First result: its delivery handle raises on await.
+        await mgr.delegate("первая задача")
+        await mgr.join()  # must NOT propagate the handle's exception
+
+        assert any(
+            "hermes proactive delivery failed" in rec.message for rec in caplog.records
+        ), "the failed delivery must be logged at WARNING, not swallowed"
+
+        # Second result: delivered by a healthy worker after the first one failed.
+        await mgr.delegate("вторая задача")
+        await mgr.join()
+
+    assert any("second result" in r for r in session.replies)  # next result still delivered
