@@ -326,9 +326,15 @@ class HermesTaskManager:
                 if self._session is None:
                     return
                 instructions = self._build_delivery(batch)
-                handle = self._session.generate_reply(instructions=instructions)
-                with contextlib.suppress(Exception):
+                handle = self._session.generate_reply(
+                    instructions=instructions, allow_interruptions=True
+                )
+                try:
                     await handle
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.warning("hermes proactive delivery failed: %r", e)
         finally:
             # Drop the delivering flag, then re-arm if a result landed during the
             # final delivery (the window after the while-check) so it is not stranded.
@@ -340,7 +346,22 @@ class HermesTaskManager:
                 self._update_idle()
 
     async def _wait_until_idle(self) -> None:
-        """Block until the agent is listening and the user is not speaking."""
+        """Block until the agent is listening and the user is not speaking.
+
+        Prefer the framework's own idle primitive (it knows about every speech
+        source, not just the ones we poll); fall back to the state poll when it
+        is unavailable. A closed/errored session is treated as "stop waiting this
+        cycle" — the worker's ``_session is None`` guard and the awaited handle
+        below handle a session that has gone away.
+        """
+        if self._session is not None and hasattr(self._session, "wait_for_idle"):
+            try:
+                await self._session.wait_for_idle()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
         while not self._session_is_idle():
             await asyncio.sleep(self.idle_poll_interval)
 
