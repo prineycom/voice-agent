@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Voice Agent — тест-стенд</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #0e1116; color: #e6edf3; height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 18px; border-bottom: 1px solid #222a35; display: flex;
+    align-items: center; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .grow { flex: 1; }
+  button {
+    font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid #2f3b4a;
+    background: #1b2330; color: #e6edf3; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #243044; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #2563eb; border-color: #2563eb; }
+  button.primary:hover:not(:disabled) { background: #1d4ed8; }
+  button.danger { background: #3a1d24; border-color: #5b2733; }
+  .badge {
+    padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    border: 1px solid #2f3b4a; white-space: nowrap;
+  }
+  .badge.ok { background: #102a1a; border-color: #1d5235; color: #6ee7a8; }
+  .badge.warn { background: #2c2410; border-color: #5b4a1d; color: #f1d27a; }
+  .badge.err { background: #2c1416; border-color: #5b2327; color: #f3a3a3; }
+  .badge.idle { background: #1b2330; }
+  main { flex: 1; display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
+  aside { border-right: 1px solid #222a35; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+  .panel { background: #131a24; border: 1px solid #222a35; border-radius: 10px; padding: 12px 14px; }
+  .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #8b97a8; margin: 0 0 8px; }
+  .metric { font-size: 22px; font-weight: 700; }
+  .metric small { font-size: 12px; font-weight: 400; color: #8b97a8; }
+  .vu { height: 12px; background: #0c1118; border-radius: 6px; overflow: hidden; border: 1px solid #222a35; }
+  .vu > div { height: 100%; width: 0%; background: linear-gradient(90deg,#22c55e,#eab308,#ef4444); transition: width .06s linear; }
+  #transcript { padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 80%; padding: 9px 13px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: #1d3a5f; border-bottom-right-radius: 3px; }
+  .msg.agent { align-self: flex-start; background: #1b2330; border-bottom-left-radius: 3px; }
+  .msg .who { font-size: 11px; color: #8b97a8; margin-bottom: 2px; }
+  .msg.partial { opacity: .6; }
+  .empty { color: #5b6675; margin: auto; text-align: center; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .ops-empty { color: #5b6675; font-size: 12px; }
+  .op { display: flex; align-items: center; gap: 7px; font-size: 13px; padding: 3px 0; }
+  .op .lbl { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .op .t { color: #8b97a8; font-size: 11px; font-variant-numeric: tabular-nums; }
+  .op.queued { opacity: .55; }
+  .spin { animation: spin 1s linear infinite; display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #toolfeed { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .tf { font-size: 12px; border-left: 2px solid #2f3b4a; padding: 2px 0 2px 8px; }
+  .tf.done { border-color: #1d5235; }
+  .tf.error { border-color: #5b2327; }
+  .tf.cancelled { border-color: #5b4a1d; }
+  .tf .tf-head { color: #c7d1de; }
+  .tf .tf-sum { color: #8b97a8; margin-top: 1px; word-break: break-word; }
+  .tf details { margin-top: 2px; }
+  .tf summary { color: #6b93d6; cursor: pointer; font-size: 11px; }
+  .tf pre { white-space: pre-wrap; word-break: break-word; background: #0c1118; border: 1px solid #222a35;
+            border-radius: 6px; padding: 6px; margin: 4px 0 0; max-height: 200px; overflow: auto; color: #c7d1de; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎙️ Voice Agent — тест-стенд</h1>
+  <span id="connState" class="badge idle">отключено</span>
+  <span id="agentState" class="badge idle">агент: —</span>
+  <span class="grow"></span>
+  <button id="muteBtn" disabled>🔇 Mute</button>
+  <button id="connectBtn" class="primary">Connect</button>
+</header>
+<main>
+  <aside>
+    <div class="panel">
+      <h2>Латенси (voice-to-voice)</h2>
+      <div class="metric"><span id="latency">—</span> <small>мс</small></div>
+      <small style="color:#5b6675">от конца твоей речи до ответа агента</small>
+    </div>
+    <div class="panel">
+      <h2>Микрофон</h2>
+      <div class="vu"><div id="vuBar"></div></div>
+      <div class="row" style="margin-top:8px"><small id="micLabel" style="color:#8b97a8">не активен</small></div>
+    </div>
+    <div class="panel">
+      <h2>⚙️ Фоновые операции</h2>
+      <div id="ops"><div class="ops-empty">нет активных</div></div>
+    </div>
+    <div class="panel">
+      <h2>🔧 Инструменты</h2>
+      <div id="toolfeed"><div class="ops-empty">пока пусто</div></div>
+    </div>
+    <div class="panel">
+      <h2>Лог</h2>
+      <div id="log" style="font-size:12px;color:#8b97a8;max-height:160px;overflow-y:auto;white-space:pre-wrap"></div>
+    </div>
+  </aside>
+  <section id="transcript">
+    <div class="empty" id="emptyHint">Нажми <b>Connect</b> и разреши доступ к микрофону.<br>Агент поздоровается первым.</div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<script>
+const LK = window.LivekitClient;
+const { Room, RoomEvent, Track } = LK;
+
+const els = {
+  connectBtn: document.getElementById('connectBtn'),
+  muteBtn: document.getElementById('muteBtn'),
+  connState: document.getElementById('connState'),
+  agentState: document.getElementById('agentState'),
+  latency: document.getElementById('latency'),
+  vuBar: document.getElementById('vuBar'),
+  micLabel: document.getElementById('micLabel'),
+  transcript: document.getElementById('transcript'),
+  emptyHint: document.getElementById('emptyHint'),
+  log: document.getElementById('log'),
+  ops: document.getElementById('ops'),
+  toolfeed: document.getElementById('toolfeed'),
+};
+
+let room = null;
+let myIdentity = null;
+let muted = false;
+let vuRAF = null;
+let audioCtx = null;
+let lastUserFinalAt = null;       // performance.now() when user finished speaking
+const lines = new Map();          // segment/stream id -> {el, textEl}
+let opsState = { running: [], queued: [] };  // last task snapshot
+let opsBase = 0;                  // performance.now() when the snapshot arrived (for live elapsed)
+let opsTick = null;               // interval id for the live elapsed counter
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  els.log.textContent = `${t}  ${msg}\n` + els.log.textContent;
+  console.log('[harness]', msg);
+}
+function setConn(text, cls) { els.connState.textContent = text; els.connState.className = `badge ${cls}`; }
+function setAgent(state) {
+  const map = { listening: ['слушает','ok'], thinking: ['думает','warn'], speaking: ['говорит','ok'], initializing: ['инициализация','idle'] };
+  const [label, cls] = map[state] || [state || '—', 'idle'];
+  els.agentState.textContent = `агент: ${label}`;
+  els.agentState.className = `badge ${cls}`;
+}
+
+function isLocal(identity) { return identity && identity === myIdentity; }
+
+function renderLine(key, identity, text, isFinal) {
+  if (els.emptyHint) { els.emptyHint.remove(); els.emptyHint = null; }
+  const mine = isLocal(identity);
+  let line = lines.get(key);
+  if (!line) {
+    const el = document.createElement('div');
+    el.className = `msg ${mine ? 'user' : 'agent'} partial`;
+    const who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = mine ? 'Вы' : `Агент (${identity || '?'})`;
+    const textEl = document.createElement('div');
+    el.append(who, textEl);
+    els.transcript.append(el);
+    line = { el, textEl };
+    lines.set(key, line);
+  }
+  line.textEl.textContent = text;
+  if (isFinal) line.el.classList.remove('partial');
+  els.transcript.scrollTop = els.transcript.scrollHeight;
+
+  // Latency bookkeeping: stamp on user final, resolve on first agent text after it.
+  const now = performance.now();
+  if (mine && isFinal) {
+    lastUserFinalAt = now;
+  } else if (!mine && lastUserFinalAt != null) {
+    els.latency.textContent = Math.round(now - lastUserFinalAt);
+    lastUserFinalAt = null;
+  }
+}
+
+// --- Transcriptions: use EXACTLY ONE source, or the same segment renders twice ---
+// (one finalized line + one stuck-partial dimmed line). Prefer TranscriptionReceived
+// — it carries the speaker participant and a clean `final` flag; only fall back to the
+// lk.transcription text stream when that event is unavailable.
+function wireTranscriptions(r) {
+  if (RoomEvent.TranscriptionReceived) {
+    r.on(RoomEvent.TranscriptionReceived, (segments, participant) => {
+      const identity = participant?.identity;
+      // DIAGNOSTIC: log every transcription event so a repro shows whether the
+      // events stop arriving (path issue) or keep arriving but fail to render.
+      const who = isLocal(identity) ? 'you' : 'agent';
+      const fin = (segments || []).some(s => s.final) ? ' FINAL' : '';
+      log(`TR: ${who} x${(segments || []).length}${fin}`);
+      try {
+        for (const s of segments) renderLine(s.id, identity, s.text, s.final);
+      } catch (e) {
+        log('TR renderLine ERROR: ' + e.message);
+      }
+    });
+    log('подписка на транскрипт: TranscriptionReceived');
+    return;
+  }
+  if (typeof r.registerTextStreamHandler === 'function') {
+    r.registerTextStreamHandler('lk.transcription', async (reader, info) => {
+      const identity = info?.identity;
+      const attrs = reader.info?.attributes || {};
+      const key = reader.info?.id || attrs['lk.segment_id'] || `${identity}:${Date.now()}`;
+      let text = '';
+      for await (const chunk of reader) { text += chunk; renderLine(key, identity, text, false); }
+      renderLine(key, identity, text, attrs['lk.transcription_final'] !== 'false');
+    });
+    log('подписка на транскрипт: text-stream lk.transcription');
+  }
+}
+
+// --- Tool-calling / background-operations visualization (LiveKit data msgs) ---
+function wireDataChannel(r) {
+  r.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
+    if (topic !== 'voiceagent') return;
+    let evt;
+    try { evt = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
+    if (evt.type === 'tasks') renderOps(evt);
+    else if (evt.type === 'event') addToolEvent(evt);
+  });
+}
+
+function renderOps(snapshot) {
+  opsState = { running: snapshot.running || [], queued: snapshot.queued || [] };
+  opsBase = performance.now();
+  drawOps();
+}
+
+function drawOps() {
+  const { running, queued } = opsState;
+  if (!running.length && !queued.length) {
+    els.ops.innerHTML = '<div class="ops-empty">нет активных</div>';
+    return;
+  }
+  const dt = (performance.now() - opsBase) / 1000;
+  const rows = [];
+  for (const op of running) {
+    const secs = Math.max(0, Math.round((op.elapsed || 0) + dt));
+    rows.push(`<div class="op"><span class="spin">⏳</span><span class="lbl">${esc(op.label)}</span><span class="t">${secs}s</span></div>`);
+  }
+  for (const label of queued) {
+    rows.push(`<div class="op queued"><span>⌛</span><span class="lbl">${esc(label)}</span><span class="t">очередь</span></div>`);
+  }
+  els.ops.innerHTML = rows.join('');
+}
+
+function addToolEvent(evt) {
+  const empty = els.toolfeed.querySelector('.ops-empty');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  const time = new Date().toLocaleTimeString();
+  if (evt.kind === 'delegated') {
+    div.className = 'tf';
+    div.innerHTML = `<div class="tf-head">🔧 delegate «${esc(evt.label)}»</div>`;
+  } else if (evt.kind === 'done' || evt.kind === 'error') {
+    div.className = 'tf ' + evt.kind;
+    const icon = evt.kind === 'done' ? '✅' : '❌';
+    let html = `<div class="tf-head">${icon} ${esc(evt.label)}</div>`;
+    if (evt.summary) html += `<div class="tf-sum">${esc(evt.summary)}</div>`;
+    if (evt.full && evt.full.length > (evt.summary || '').length) {
+      html += `<details><summary>полный вывод</summary><pre>${esc(evt.full)}</pre></details>`;
+    }
+    div.innerHTML = html;
+  } else if (evt.kind === 'cancelled') {
+    div.className = 'tf cancelled';
+    div.innerHTML = `<div class="tf-head">✖️ отменено задач: ${evt.count || ''}</div>`;
+  } else {
+    return;
+  }
+  div.title = time;
+  els.toolfeed.appendChild(div);
+  els.toolfeed.scrollTop = els.toolfeed.scrollHeight;
+}
+
+function resetOpsUI() {
+  opsState = { running: [], queued: [] };
+  drawOps();
+  els.toolfeed.innerHTML = '<div class="ops-empty">пока пусто</div>';
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function watchAgentState(participant) {
+  const apply = () => {
+    const st = participant.attributes && participant.attributes['lk.agent.state'];
+    if (st) setAgent(st);
+  };
+  apply();
+  participant.on('attributesChanged', apply);
+}
+
+function startVU(mediaStreamTrack) {
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(new MediaStream([mediaStreamTrack]));
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      analyser.getByteTimeDomainData(data);
+      let peak = 0;
+      for (const v of data) peak = Math.max(peak, Math.abs(v - 128));
+      const pct = muted ? 0 : Math.min(100, Math.round((peak / 128) * 180));
+      els.vuBar.style.width = pct + '%';
+      vuRAF = requestAnimationFrame(tick);
+    };
+    tick();
+  } catch (e) { log('VU meter недоступен: ' + e.message); }
+}
+
+async function connect() {
+  els.connectBtn.disabled = true;
+  setConn('подключение…', 'warn');
+  try {
+    const identity = 'web-' + Math.random().toString(36).slice(2, 7);
+    const res = await fetch('/token?identity=' + encodeURIComponent(identity));
+    if (!res.ok) throw new Error('token endpoint ' + res.status);
+    const { token, url } = await res.json();
+    myIdentity = identity;
+    log(`токен получен, подключаюсь к ${url}`);
+
+    room = new Room({ adaptiveStream: true, dynacast: true });
+    wireTranscriptions(room);
+    wireDataChannel(room);
+    if (opsTick) clearInterval(opsTick);
+    opsTick = setInterval(drawOps, 1000);  // live-tick the running-task seconds
+
+    room.on(RoomEvent.ConnectionStateChanged, (s) => log('состояние: ' + s));
+    room.on(RoomEvent.Disconnected, () => onDisconnected());
+    room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
+      if (track.kind === Track.Kind.Audio) {
+        const el = track.attach();
+        el.autoplay = true;
+        document.body.appendChild(el);
+        log('подписка на аудио агента (' + participant.identity + ')');
+      }
+    });
+    room.on(RoomEvent.ParticipantConnected, (p) => { log('участник: ' + p.identity); watchAgentState(p); });
+    room.on(RoomEvent.ParticipantAttributesChanged, (_changed, p) => {
+      const st = p.attributes && p.attributes['lk.agent.state'];
+      if (st) setAgent(st);
+    });
+
+    await room.connect(url, token);
+    setConn('подключено', 'ok');
+    log('в комнате: ' + room.name);
+
+    // Existing remote participants (the agent may already be here).
+    room.remoteParticipants.forEach(watchAgentState);
+
+    await room.localParticipant.setMicrophoneEnabled(true);
+    const micPub = room.localParticipant.getTrackPublication(Track.Source.Microphone);
+    if (micPub?.track) {
+      els.micLabel.textContent = 'активен';
+      startVU(micPub.track.mediaStreamTrack);
+    }
+    els.muteBtn.disabled = false;
+    els.connectBtn.textContent = 'Disconnect';
+    els.connectBtn.className = 'danger';
+    els.connectBtn.disabled = false;
+    els.connectBtn.onclick = disconnect;
+  } catch (e) {
+    log('ОШИБКА: ' + e.message);
+    setConn('ошибка', 'err');
+    els.connectBtn.disabled = false;
+  }
+}
+
+function onDisconnected() {
+  setConn('отключено', 'idle');
+  setAgent(null);
+  els.micLabel.textContent = 'не активен';
+  els.vuBar.style.width = '0%';
+  if (vuRAF) cancelAnimationFrame(vuRAF);
+  if (audioCtx) { audioCtx.close().catch(()=>{}); audioCtx = null; }
+  if (opsTick) { clearInterval(opsTick); opsTick = null; }
+  resetOpsUI();
+  els.muteBtn.disabled = true;
+  els.connectBtn.textContent = 'Connect';
+  els.connectBtn.className = 'primary';
+  els.connectBtn.disabled = false;
+  els.connectBtn.onclick = connect;
+}
+
+async function disconnect() {
+  log('отключаюсь');
+  if (room) await room.disconnect();
+  room = null;
+}
+
+els.muteBtn.onclick = async () => {
+  if (!room) return;
+  muted = !muted;
+  await room.localParticipant.setMicrophoneEnabled(!muted);
+  els.muteBtn.textContent = muted ? '🎤 Unmute' : '🔇 Mute';
+  els.micLabel.textContent = muted ? 'выключен' : 'активен';
+};
+
+els.connectBtn.onclick = connect;
+log('готов. SDK ' + (LK.version || '2.x'));
+</script>
+</body>
+</html>
