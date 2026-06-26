@@ -31,7 +31,7 @@ state = {"loaded": False}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        log.info("Loading TTS model %s", synthesize.MODEL_NAME)
+        log.info("Loading TTS engine %s, model %s", synthesize.engine().name, synthesize.engine().model_name)
         synthesize.load_model()
         state["loaded"] = True
         log.info("TTS model loaded")
@@ -46,15 +46,18 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health():
+    eng = synthesize.engine()
     body = {
         "status": "ok" if state["loaded"] else "degraded",
         "service": "tts",
-        "model": synthesize.MODEL_NAME,
+        "engine": eng.name,
+        "model": eng.model_name,
         "device": "cuda",
-        "speaker": synthesize.SPEAKER,
-        "language": synthesize.LANGUAGE,
+        "language": eng.language,
         "model_loaded": state["loaded"],
     }
+    # Engine-specific fields (speaker / ref_profiles / instruct, …).
+    body.update(eng.health_fields())
     return JSONResponse(body, status_code=200 if state["loaded"] else 503)
 
 

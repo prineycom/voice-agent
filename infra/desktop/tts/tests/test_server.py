@@ -38,15 +38,22 @@ def test_health_degraded_when_not_loaded(not_loaded):
     assert body["model_loaded"] is False
 
 
-def test_health_ok_when_loaded(loaded):
+def test_health_ok_when_loaded(loaded, monkeypatch):
+    # pin the engine so health fields are deterministic (custom_voice exposes `speaker`).
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    monkeypatch.setenv("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    monkeypatch.setenv("TTS_SPEAKER", "aiden")
+    synthesize._engine = None  # force re-selection with the env above
     client = TestClient(server.app)
     resp = client.get("/health")
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
     assert body["model_loaded"] is True
-    assert body["model"] == synthesize.MODEL_NAME
-    assert body["speaker"] == synthesize.SPEAKER
+    assert body["engine"] == "custom_voice"
+    assert body["model"] == "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    assert body["speaker"] == "aiden"
+    synthesize._engine = None
 
 
 def test_ws_rejects_when_not_loaded(not_loaded):
