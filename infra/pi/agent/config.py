@@ -25,6 +25,7 @@ class AgentConfig:
     tts_health_url: str
     tts_voice: str
     tts_sample_rate: int
+    tts_streaming: bool
     agent_greeting: str
     worker_port: int
     # LLM (via local LiteLLM proxy)
@@ -74,6 +75,13 @@ def load_config() -> AgentConfig:
             f"Invalid TTS_SAMPLE_RATE={raw_sample_rate!r}: expected an integer."
         ) from exc
 
+    tts_streaming = os.environ.get("TTS_STREAMING", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
     raw_worker_port = os.environ.get("AGENT_WORKER_PORT", "8090")
     try:
         worker_port = int(raw_worker_port)
@@ -98,6 +106,7 @@ def load_config() -> AgentConfig:
         ),
         tts_voice=os.environ.get("TTS_VOICE", "default"),
         tts_sample_rate=tts_sample_rate,
+        tts_streaming=tts_streaming,
         agent_greeting=os.environ.get("AGENT_GREETING", DEFAULT_GREETING),
         worker_port=worker_port,
         llm_base_url=os.environ.get("LLM_BASE_URL", "http://localhost:4000/v1"),

@@ -59,6 +59,28 @@ def test_env_overrides(monkeypatch):
     assert cfg.soul_path == Path("/tmp/custom-soul.md")
 
 
+def test_tts_streaming_default_true(monkeypatch):
+    """tts_streaming defaults to True when TTS_STREAMING is unset."""
+    monkeypatch.setenv("LIVEKIT_API_KEY", "devkey")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "devsecret")
+    monkeypatch.delenv("TTS_STREAMING", raising=False)
+
+    cfg = load_config()
+
+    assert cfg.tts_streaming is True
+
+
+def test_tts_streaming_env_false(monkeypatch):
+    """TTS_STREAMING=false yields tts_streaming False."""
+    monkeypatch.setenv("LIVEKIT_API_KEY", "devkey")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "devsecret")
+    monkeypatch.setenv("TTS_STREAMING", "false")
+
+    cfg = load_config()
+
+    assert cfg.tts_streaming is False
+
+
 def test_missing_livekit_keys_raise(monkeypatch):
     """Regression: missing required LiveKit keys still fails loud.
 
