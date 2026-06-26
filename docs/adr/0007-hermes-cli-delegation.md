@@ -62,3 +62,24 @@ background scheduler needed.
   startup gate (unlike STT/TTS).
 - No MCP package needed in the worker venv; PyYAML (already a transitive dep
   of livekit-agents) reads config.yaml.
+
+## Update (2026-06-25): async background delegation
+
+The synchronous `run_command("hermes ...")` blocked the voice turn for the whole
+Hermes call (up to the timeout), leaving the agent deaf in a "thinking" state.
+Hermes delegation is now **asynchronous and backgrounded** via a per-session
+`HermesTaskManager` (`hermes_tasks.py`) and three thin `function_tool` adapters:
+
+- `delegate_to_hermes(request)` — spawns Hermes in the background, returns at once
+  with a directive ("ack the user, keep talking"); the result is delivered
+  proactively via `session.generate_reply` when ready (LLM re-voices it in SOUL
+  style — hands-and-mouth split preserved). The worker owns `--resume` continuity
+  now, so the LLM no longer threads `session_id`.
+- `cancel_hermes_tasks(hint)` and `list_hermes_tasks()` — cancellation and visibility.
+
+The manager enforces a concurrency limit + FIFO overflow queue, emits capped
+progress nudges for slow tasks, times tasks out, and is cancelled on a job
+shutdown callback so a user disconnect never orphans Hermes subprocesses. Knobs
+live under `worker_tools.*` in config.yaml. The generic `run_command` remains for
+rare synchronous whitelisted commands. See
+docs/superpowers/specs/2026-06-25-hermes-async-delegation-design.md.

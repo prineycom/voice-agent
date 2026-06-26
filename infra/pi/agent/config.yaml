@@ -9,3 +9,11 @@ worker_tools:
     - hermes
     # - git      # add later if needed
     # - docker   # add later
+
+  # Async Hermes delegation (delegate_to_hermes). Hermes runs in the background
+  # so the agent stays conversational; results are spoken proactively (coalesced,
+  # only when the conversation is idle) when ready — no progress nudges.
+  hermes_max_concurrent: 3          # max background Hermes tasks running at once
+  hermes_max_queued: 5              # FIFO overflow queue cap (beyond it: refuse + ask user to wait)
+  hermes_task_timeout_seconds: 300  # hard ceiling per task; over it → cancel + report failure
+  hermes_output_limit_chars: 600    # trim each Hermes result to this before it reaches the LLM/TTS

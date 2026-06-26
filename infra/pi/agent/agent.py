@@ -50,11 +50,37 @@ from health import (
     check_stt_health,
     check_tts_health,
 )
+from hermes_tasks import UI_TOPIC
 from stt_plugin import DesktopSTT
 from tts_plugin import DesktopTTS
-from worker_tools import run_command
+from worker_tools import (
+    cancel_hermes_tasks,
+    delegate_to_hermes,
+    list_hermes_tasks,
+    make_hermes_manager,
+    run_command,
+)
 
 log = logging.getLogger("agent")
+
+
+class GreetingAgent(Agent):
+    """Agent that speaks a fixed greeting as soon as it enters the session.
+
+    on_enter is the livekit-agents lifecycle hook that fires once the agent is
+    active in the AgentSession (room connected, IO wired). Speaking the greeting
+    here — instead of awaiting ctx.wait_for_participant() in the entrypoint —
+    avoids a fragile wait that hung in practice while the participant was already
+    present; RoomIO delivers the audio to the connected participant.
+    """
+
+    def __init__(self, *, instructions: str, tools: list, greeting: str) -> None:
+        super().__init__(instructions=instructions, tools=tools)
+        self._greeting = greeting
+
+    async def on_enter(self) -> None:
+        log.info("Agent entered session; speaking greeting.")
+        self.session.say(self._greeting)
 
 
 def _load_text_file(path: Path, *, what: str, required: bool = True) -> str | None:
@@ -133,6 +159,19 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await ctx.connect()  # type: ignore[call-arg]
 
+    # Background Hermes delegation manager (async tool calls). Stored in the
+    # session userdata so the function_tool adapters reach it; cancelled on
+    # shutdown so a user disconnect never leaves orphan Hermes subprocesses.
+    hermes_manager = make_hermes_manager()
+    ctx.add_shutdown_callback(hermes_manager.shutdown)
+    # Stream tool/background-task events to the web UI as LiveKit data messages
+    # (topic UI_TOPIC); the frontend renders the live operations panel + tool feed.
+    hermes_manager.set_publisher(
+        lambda data: ctx.room.local_participant.publish_data(
+            data, reliable=True, topic=UI_TOPIC
+        )
+    )
+
     # Full STT → LLM → TTS session with local VAD; turn_detection="vad" uses the
     # loaded Silero VAD to bound user turns. The LLM is the local LiteLLM proxy
     # spoken to via the OpenAI-compatible plugin (base_url must carry the /v1
@@ -172,6 +211,7 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
         vad=vad,
         turn_detection="vad",
+        userdata=hermes_manager,
     )
 
     # First-audio latency (req #6): log LLM time-to-first-token and TTS
@@ -187,18 +227,41 @@ async def entrypoint(ctx: JobContext) -> None:
         elif isinstance(m, agent_metrics.TTSMetrics):
             log.info("first-audio-latency: TTS ttfb=%.3fs", m.ttfb)
 
+    # --- Diagnostics for the "transcript stops on long output" bug (issue under
+    # investigation). These are cheap, high-signal hooks: which conversation items
+    # actually get committed (and their length), agent state transitions (to spot a
+    # wedge), and a loud log if the session closes with an error. Remove once root-caused.
+    @session.on("conversation_item_added")
+    def _on_item(ev) -> None:
+        item = getattr(ev, "item", None)
+        role = getattr(item, "role", "?")
+        text = getattr(item, "text_content", None) or ""
+        log.info("diag: conversation_item role=%s len=%d", role, len(text))
+
+    @session.on("agent_state_changed")
+    def _on_agent_state(ev) -> None:
+        log.info("diag: agent_state %s -> %s",
+                 getattr(ev, "old_state", "?"), getattr(ev, "new_state", "?"))
+
+    @session.on("close")
+    def _on_close(ev) -> None:
+        log.error("diag: session close reason=%s error=%r",
+                  getattr(ev, "reason", "?"), getattr(ev, "error", None))
+
+    # Greet from on_enter (the documented livekit-agents pattern) rather than
+    # awaiting ctx.wait_for_participant(): in a live test that helper hung even
+    # though the participant was present and its mic was already being read, so
+    # the greeting never played. on_enter fires once the agent is active in the
+    # session; RoomIO routes the audio to the connected participant.
     await session.start(
-        agent=Agent(instructions=instructions, tools=[run_command]),
+        agent=GreetingAgent(
+            instructions=instructions,
+            tools=[delegate_to_hermes, cancel_hermes_tasks, list_hermes_tasks, run_command],
+            greeting=cfg.agent_greeting,
+        ),
         room=ctx.room,
     )
-
-    # Gate the greeting on a participant being present/subscribed so the opening
-    # words are not clipped (Risk 5). If someone already joined, returns at once.
-    participant = await ctx.wait_for_participant()
-    log.info("Participant %s joined; speaking greeting.", participant.identity)
-
-    session.say(cfg.agent_greeting)
-    log.info("Greeting spoken; entering STT → LLM → TTS loop.")
+    log.info("Session started; greeting on agent enter, then STT → LLM → TTS loop.")
 
 
 # Dispatch is automatic (empty agent_name => room dispatch). The entrypoint runs

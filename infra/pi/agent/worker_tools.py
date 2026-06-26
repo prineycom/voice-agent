@@ -41,6 +41,15 @@ from pathlib import Path
 
 import yaml
 from livekit.agents import function_tool
+from livekit.agents.voice.events import RunContext
+
+from hermes_tasks import (
+    DEFAULT_MAX_CONCURRENT,
+    DEFAULT_MAX_QUEUED,
+    DEFAULT_OUTPUT_LIMIT,
+    DEFAULT_TASK_TIMEOUT,
+    HermesTaskManager,
+)
 
 log = logging.getLogger("agent")
 
@@ -171,3 +180,66 @@ async def run_command(args: str) -> str:
     if stdout:
         parts.append(stdout)
     return "\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Async Hermes delegation: background task manager + thin function_tool adapters
+# --------------------------------------------------------------------------- #
+def make_hermes_manager() -> HermesTaskManager:
+    """Construct a HermesTaskManager using worker_tools.* knobs from config.yaml.
+
+    Missing keys fall back to the module defaults so the worker always boots.
+    Stored in AgentSession.userdata; the tool adapters reach it from there.
+    """
+    try:
+        raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        raw = {}
+    wt = raw.get("worker_tools") or {}
+
+    def _num(key, default, cast):
+        try:
+            return cast(wt.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    return HermesTaskManager(
+        max_concurrent=_num("hermes_max_concurrent", DEFAULT_MAX_CONCURRENT, int),
+        max_queued=_num("hermes_max_queued", DEFAULT_MAX_QUEUED, int),
+        task_timeout=_num("hermes_task_timeout_seconds", DEFAULT_TASK_TIMEOUT, float),
+        output_limit=_num("hermes_output_limit_chars", DEFAULT_OUTPUT_LIMIT, int),
+    )
+
+
+def _manager(context: RunContext) -> HermesTaskManager:
+    """Fetch the per-session task manager and bind the live session to it."""
+    manager: HermesTaskManager = context.session.userdata
+    manager.attach_session(context.session)
+    return manager
+
+
+@function_tool
+async def delegate_to_hermes(request: str, context: RunContext) -> str:
+    """Delegate a task to Hermes in the BACKGROUND and return immediately.
+
+    Use this for anything needing tools (web search, files, memory, terminal,
+    messaging, etc.). Pass a complete, specific natural-language `request`. The
+    call returns at once with a directive: give the user a brief acknowledgement
+    and keep talking — Hermes runs in the background and the result is spoken to
+    the user automatically when ready. Do NOT wait for the result in this turn.
+    """
+    return await _manager(context).delegate(request)
+
+
+@function_tool
+async def cancel_hermes_tasks(context: RunContext, hint: str = "") -> str:
+    """Cancel background Hermes tasks. Empty `hint` cancels all; a `hint` cancels
+    only tasks whose request contains it. Returns a directive to confirm to the user."""
+    return await _manager(context).cancel(hint)
+
+
+@function_tool
+async def list_hermes_tasks(context: RunContext) -> str:
+    """List the background Hermes tasks currently running or queued, so you can
+    tell the user what you are working on."""
+    return _manager(context).list_tasks()
