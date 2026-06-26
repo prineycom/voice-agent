@@ -39,6 +39,12 @@ Type=simple
 #Group=voice-agent
 
 WorkingDirectory=/opt/voice-agent/infra/pi/agent
+
+# The worker shells out to the `hermes` CLI, which usually lives in the deploy
+# user's ~/.local/bin — NOT on systemd's default PATH. Include it explicitly or
+# the Hermes tools report "not found on PATH". Adjust the home dir to your user.
+Environment=PATH=/home/<deploy-user>/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 EnvironmentFile=/opt/voice-agent/infra/pi/agent/.env
 ExecStart=/opt/voice-agent/infra/pi/agent/.venv/bin/python -m agent start
 
