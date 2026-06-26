@@ -7,7 +7,20 @@ from pathlib import Path
 
 import pytest
 
+import config
 from config import load_config
+
+
+@pytest.fixture(autouse=True)
+def _isolate_dotenv(monkeypatch):
+    """Isolate config tests from the developer's on-disk .env.
+
+    load_config() unconditionally calls load_dotenv() on the agent's .env, so a
+    populated local file (e.g. LLM_BASE_URL=127.0.0.1, LLM_MODEL=...) would leak
+    into these default/override tests and make them machine-dependent. Neutralise
+    it so the tests see only the env they set via monkeypatch.
+    """
+    monkeypatch.setattr(config, "load_dotenv", lambda *args, **kwargs: False)
 
 
 def test_llm_defaults(monkeypatch):
