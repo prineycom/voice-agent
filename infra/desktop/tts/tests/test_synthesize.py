@@ -1,14 +1,26 @@
-"""Tests for the Qwen3-TTS synthesis adapter (load/stream/resample/speaker)."""
+"""Tests for the TTS engine dispatch (engines.py) and the synthesize facade.
+
+No GPU, no real model — each engine's `_model` is monkeypatched with a fake that
+yields canned (audio, sr) chunks and records call kwargs. Tests cover:
+
+- engine selection from `TTS_ENGINE` (custom_voice / voice_clone / voice_design);
+- each engine's `stream_pcm` calls the right model method with the right kwargs;
+- `voice` resolution rules per engine (default fallback, override, named profile);
+- the `synthesize` facade forwards to the active engine and exposes backcompat attrs;
+- voice_clone ref parsing (simple one-voice + multi-voice) and validation.
+"""
 
 import numpy as np
 import pytest
 
+import engines
 import synthesize
 
 
-class _FakeModel:
-    """Yields canned (audio, sr) chunks and records the call kwargs."""
-
+# --------------------------------------------------------------------------- #
+# Fakes
+# --------------------------------------------------------------------------- #
+class _FakeCustomVoiceModel:
     def __init__(self, chunks):
         self._chunks = chunks
         self.calls = []
@@ -19,87 +31,288 @@ class _FakeModel:
             yield audio, sr
 
 
+class _FakeVoiceCloneModel:
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self.calls = []
+
+    def generate_voice_clone_streaming(self, **kwargs):
+        self.calls.append(kwargs)
+        for audio, sr in self._chunks:
+            yield audio, sr
+
+
+class _FakeVoiceDesignModel:
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self.calls = []
+
+    def generate_voice_design_streaming(self, **kwargs):
+        self.calls.append(kwargs)
+        for audio, sr in self._chunks:
+            yield audio, sr
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures
+# --------------------------------------------------------------------------- #
 @pytest.fixture(autouse=True)
-def reset_model():
-    prev = synthesize._model
-    synthesize._model = None
+def reset_engine():
+    """Reset the cached engine + module state between tests."""
+    synthesize._engine = None
     yield
-    synthesize._model = prev
+    synthesize._engine = None
 
 
-def test_is_loaded_reflects_model_presence():
-    assert synthesize.is_loaded() is False
-    synthesize._model = object()
-    assert synthesize.is_loaded() is True
+@pytest.fixture(autouse=True)
+def isolate_env(monkeypatch):
+    """Default a clean env per test (tests set what they need explicitly)."""
+    for k in [
+        "TTS_ENGINE", "TTS_MODEL", "TTS_LANGUAGE", "TTS_SPEAKER", "TTS_CHUNK_SIZE",
+        "TTS_INSTRUCT", "TTS_REF_AUDIO", "TTS_REF_TEXT", "TTS_VOICE_REFS",
+    ]:
+        monkeypatch.delenv(k, raising=False)
 
 
-def test_load_model_uses_from_pretrained(monkeypatch):
-    sentinel = object()
-    captured = {}
-
-    class _FQ:
-        @classmethod
-        def from_pretrained(cls, name):
-            captured["name"] = name
-            return sentinel
-
-    import faster_qwen3_tts
-
-    monkeypatch.setattr(faster_qwen3_tts, "FasterQwen3TTS", _FQ)
-    out = synthesize.load_model()
-    assert out is sentinel
-    assert synthesize._model is sentinel
-    assert synthesize.is_loaded() is True
-    assert captured["name"] == synthesize.MODEL_NAME
+def _chunks():
+    return [(np.zeros(10, dtype=np.float32), 24000)]
 
 
-def test_stream_pcm_yields_pcm16_bytes():
-    audio = np.array([0.0, 1.0, -1.0], dtype=np.float32)
-    synthesize._model = _FakeModel([(audio, 24000)])
-    out = list(synthesize.stream_pcm("привет"))
-    assert len(out) == 1
-    ints = np.frombuffer(out[0], dtype="<i2")
-    assert list(ints) == [0, 32767, -32767]
+# --------------------------------------------------------------------------- #
+# Engine selection
+# --------------------------------------------------------------------------- #
+def test_default_engine_is_custom_voice(monkeypatch):
+    monkeypatch.delenv("TTS_ENGINE", raising=False)
+    eng = engines.Engines.from_env()
+    assert isinstance(eng, engines.CustomVoiceEngine)
 
 
-def test_stream_pcm_resamples_to_24k():
-    audio = np.zeros(48000, dtype=np.float32)  # 1s @ 48k
-    synthesize._model = _FakeModel([(audio, 48000)])
-    out = b"".join(synthesize.stream_pcm("text"))
-    n_samples = len(out) // 2
-    assert abs(n_samples - 24000) < 100  # ~1s @ 24k
+def test_unknown_engine_raises(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "nope")
+    with pytest.raises(RuntimeError, match="Unknown TTS_ENGINE"):
+        engines.Engines.from_env()
 
 
-def test_stream_pcm_multiple_chunks():
-    a = np.zeros(10, dtype=np.float32)
-    b = np.zeros(20, dtype=np.float32)
-    synthesize._model = _FakeModel([(a, 24000), (b, 24000)])
-    out = list(synthesize.stream_pcm("text"))
-    assert len(out) == 2
-    assert len(out[0]) == 20  # 10 samples * 2 bytes
-    assert len(out[1]) == 40
+def test_select_voice_clone(monkeypatch, tmp_path):
+    wav = tmp_path / "x.wav"
+    wav.write_bytes(b"fake")
+    monkeypatch.setenv("TTS_ENGINE", "voice_clone")
+    monkeypatch.setenv("TTS_REF_AUDIO", str(wav))
+    monkeypatch.setenv("TTS_REF_TEXT", "привет")
+    eng = engines.Engines.from_env()
+    assert isinstance(eng, engines.VoiceCloneEngine)
 
 
-def test_stream_pcm_uses_configured_speaker_by_default():
-    model = _FakeModel([(np.zeros(4, dtype=np.float32), 24000)])
-    synthesize._model = model
-    list(synthesize.stream_pcm("text", voice="default"))
-    assert model.calls[-1]["speaker"] == synthesize.SPEAKER
-    assert model.calls[-1]["language"] == synthesize.LANGUAGE
-    assert model.calls[-1]["chunk_size"] == synthesize.CHUNK_SIZE
+def test_select_voice_design(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "voice_design")
+    eng = engines.Engines.from_env()
+    assert isinstance(eng, engines.VoiceDesignEngine)
+
+
+# --------------------------------------------------------------------------- #
+# CustomVoiceEngine
+# --------------------------------------------------------------------------- #
+def test_custom_voice_stream_uses_configured_speaker(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    monkeypatch.setenv("TTS_SPEAKER", "serena")
+    eng = engines.Engines.from_env()
+    m = _FakeCustomVoiceModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("text"))
+    assert m.calls[-1]["speaker"] == "serena"
+    assert m.calls[-1]["language"] == "Russian"
 
 
 @pytest.mark.parametrize("voice", ["bob", "alice"])
-def test_stream_pcm_overrides_speaker_with_voice(voice):
-    model = _FakeModel([(np.zeros(4, dtype=np.float32), 24000)])
-    synthesize._model = model
-    list(synthesize.stream_pcm("text", voice=voice))
-    assert model.calls[-1]["speaker"] == voice
+def test_custom_voice_overrides_speaker(monkeypatch, voice):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    monkeypatch.setenv("TTS_SPEAKER", "aiden")
+    eng = engines.Engines.from_env()
+    m = _FakeCustomVoiceModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("text", voice=voice))
+    assert m.calls[-1]["speaker"] == voice
 
 
 @pytest.mark.parametrize("voice", [None, "", "default"])
-def test_stream_pcm_falls_back_to_speaker_for_empty_voice(voice):
-    model = _FakeModel([(np.zeros(4, dtype=np.float32), 24000)])
-    synthesize._model = model
-    list(synthesize.stream_pcm("text", voice=voice))
-    assert model.calls[-1]["speaker"] == synthesize.SPEAKER
+def test_custom_voice_default_falls_back_to_speaker(monkeypatch, voice):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    monkeypatch.setenv("TTS_SPEAKER", "ryan")
+    eng = engines.Engines.from_env()
+    m = _FakeCustomVoiceModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("text", voice=voice))
+    assert m.calls[-1]["speaker"] == "ryan"
+
+
+def test_custom_voice_yields_pcm16_bytes(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    eng = engines.Engines.from_env()
+    eng._model = _FakeCustomVoiceModel([(np.array([0.0, 1.0, -1.0], dtype=np.float32), 24000)])
+    out = list(eng.stream_pcm("привет"))
+    assert len(out) == 1
+    assert list(np.frombuffer(out[0], dtype="<i2")) == [0, 32767, -32767]
+
+
+def test_custom_voice_resamples_to_24k(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    eng = engines.Engines.from_env()
+    eng._model = _FakeCustomVoiceModel([(np.zeros(48000, dtype=np.float32), 48000)])
+    out = b"".join(eng.stream_pcm("text"))
+    assert abs(len(out) // 2 - 24000) < 100
+
+
+# --------------------------------------------------------------------------- #
+# VoiceCloneEngine
+# --------------------------------------------------------------------------- #
+def test_voice_clone_simple_one_profile(monkeypatch, tmp_path):
+    wav = tmp_path / "ref.wav"
+    wav.write_bytes(b"fake")
+    monkeypatch.setenv("TTS_ENGINE", "voice_clone")
+    monkeypatch.setenv("TTS_REF_AUDIO", str(wav))
+    monkeypatch.setenv("TTS_REF_TEXT", "привет мир")
+    eng = engines.Engines.from_env()
+    assert list(eng.refs) == ["default"]
+    m = _FakeVoiceCloneModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("test"))
+    assert m.calls[-1]["ref_audio"] == str(wav)
+    assert m.calls[-1]["ref_text"] == "привет мир"
+    assert m.calls[-1]["language"] == "Russian"
+
+
+def test_voice_clone_multi_profile_named(monkeypatch, tmp_path):
+    a = tmp_path / "p.wav"; a.write_bytes(b"a")
+    b = tmp_path / "m.wav"; b.write_bytes(b"m")
+    monkeypatch.setenv("TTS_ENGINE", "voice_clone")
+    monkeypatch.setenv("TTS_VOICE_REFS", "pasha,mama")
+    monkeypatch.setenv("TTS_REF_pasha_AUDIO", str(a))
+    monkeypatch.setenv("TTS_REF_pasha_TEXT", "текст паши")
+    monkeypatch.setenv("TTS_REF_mama_AUDIO", str(b))
+    monkeypatch.setenv("TTS_REF_mama_TEXT", "текст мамы")
+    eng = engines.Engines.from_env()
+    assert set(eng.refs) == {"pasha", "mama"}
+    m = _FakeVoiceCloneModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("x", voice="mama"))
+    assert m.calls[-1]["ref_audio"] == str(b)
+    assert m.calls[-1]["ref_text"] == "текст мамы"
+
+
+def test_voice_clone_default_resolves_to_first(monkeypatch, tmp_path):
+    a = tmp_path / "p.wav"; a.write_bytes(b"a")
+    b = tmp_path / "m.wav"; b.write_bytes(b"m")
+    monkeypatch.setenv("TTS_ENGINE", "voice_clone")
+    monkeypatch.setenv("TTS_VOICE_REFS", "pasha,mama")
+    monkeypatch.setenv("TTS_REF_pasha_AUDIO", str(a))
+    monkeypatch.setenv("TTS_REF_pasha_TEXT", "p")
+    monkeypatch.setenv("TTS_REF_mama_AUDIO", str(b))
+    monkeypatch.setenv("TTS_REF_mama_TEXT", "m")
+    eng = engines.Engines.from_env()
+    m = _FakeVoiceCloneModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("x", voice="default"))
+    assert m.calls[-1]["ref_audio"] == str(a)  # first profile
+
+
+def test_voice_clone_unknown_profile_raises(monkeypatch, tmp_path):
+    wav = tmp_path / "ref.wav"; wav.write_bytes(b"x")
+    monkeypatch.setenv("TTS_ENGINE", "voice_clone")
+    monkeypatch.setenv("TTS_REF_AUDIO", str(wav))
+    monkeypatch.setenv("TTS_REF_TEXT", "привет")
+    eng = engines.Engines.from_env()
+    eng._model = _FakeVoiceCloneModel(_chunks())
+    with pytest.raises(RuntimeError, match="unknown ref profile"):
+        list(eng.stream_pcm("x", voice="nope"))
+
+
+def test_voice_clone_missing_refs_raises(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "voice_clone")
+    with pytest.raises(RuntimeError, match="requires reference audio"):
+        engines.Engines.from_env()
+
+
+def test_voice_clone_missing_audio_file_raises(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "voice_clone")
+    monkeypatch.setenv("TTS_REF_AUDIO", "/no/such/file.wav")
+    monkeypatch.setenv("TTS_REF_TEXT", "x")
+    with pytest.raises(RuntimeError, match="audio file not found"):
+        engines.Engines.from_env()
+
+
+def test_voice_clone_incomplete_profile_raises(monkeypatch, tmp_path):
+    a = tmp_path / "p.wav"; a.write_bytes(b"a")
+    monkeypatch.setenv("TTS_ENGINE", "voice_clone")
+    monkeypatch.setenv("TTS_VOICE_REFS", "pasha")
+    monkeypatch.setenv("TTS_REF_pasha_AUDIO", str(a))
+    # TTS_REF_pasha_TEXT missing
+    with pytest.raises(RuntimeError, match="incomplete"):
+        engines.Engines.from_env()
+
+
+# --------------------------------------------------------------------------- #
+# VoiceDesignEngine
+# --------------------------------------------------------------------------- #
+def test_voice_design_uses_configured_instruct(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "voice_design")
+    monkeypatch.setenv("TTS_INSTRUCT", "warm baritone")
+    eng = engines.Engines.from_env()
+    m = _FakeVoiceDesignModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("text"))
+    assert m.calls[-1]["instruct"] == "warm baritone"
+
+
+def test_voice_design_overrides_instruct_via_voice(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "voice_design")
+    monkeypatch.setenv("TTS_INSTRUCT", "default instruct")
+    eng = engines.Engines.from_env()
+    m = _FakeVoiceDesignModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("text", voice="bright cheerful female"))
+    assert m.calls[-1]["instruct"] == "bright cheerful female"
+
+
+def test_voice_design_missing_instruct_raises(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "voice_design")
+    eng = engines.Engines.from_env()
+    eng._model = _FakeVoiceDesignModel(_chunks())
+    with pytest.raises(RuntimeError, match="requires an instruction"):
+        list(eng.stream_pcm("x"))
+
+
+# --------------------------------------------------------------------------- #
+# synthesize facade
+# --------------------------------------------------------------------------- #
+def test_facade_is_loaded(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    assert synthesize.is_loaded() is False
+    synthesize._engine = engines.Engines.from_env()
+    synthesize._engine._model = object()
+    assert synthesize.is_loaded() is True
+
+
+def test_facade_stream_delegates(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    m = _FakeCustomVoiceModel([(np.array([0.0, 1.0], dtype=np.float32), 24000)])
+    synthesize._engine = engines.Engines.from_env()
+    synthesize._engine._model = m
+    out = list(synthesize.stream_pcm("hi"))
+    assert len(out) == 1
+    assert list(np.frombuffer(out[0], dtype="<i2")) == [0, 32767]
+
+
+def test_facade_backcompat_attrs(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    monkeypatch.setenv("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    monkeypatch.setenv("TTS_SPEAKER", "aiden")
+    synthesize._engine = engines.Engines.from_env()
+    assert synthesize.MODEL_NAME == "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    assert synthesize.SPEAKER == "aiden"
+    assert synthesize.LANGUAGE == "Russian"
+
+
+def test_facade_engine_accessor(monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "voice_design")
+    monkeypatch.setenv("TTS_INSTRUCT", "x")
+    assert synthesize.engine().name == "voice_design"

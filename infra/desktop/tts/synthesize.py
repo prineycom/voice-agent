@@ -1,72 +1,73 @@
-"""Qwen3-TTS synthesis adapter.
+"""TTS synthesis facade (engine-dispatched).
 
-Isolates the model call so the WebSocket server stays backend-agnostic.
-`stream_pcm` yields 24kHz mono int16 PCM byte chunks.
+The actual synthesis lives in `engines.py` (pluggable strategies). This module
+keeps the historical `synthesize.load_model` / `synthesize.stream_pcm` /
+`synthesize.is_loaded` surface the server and tests already import, and forwards
+to the engine selected by `TTS_ENGINE` in `.env`.
 
-Backend method name is confirmed via introspection (plan Task D5). Default path
-uses CustomVoice streaming; see FALLBACKS at the bottom if that method is absent.
+Kept for backward compat:
+- `MODEL_NAME`, `SPEAKER`, `LANGUAGE`, `CHUNK_SIZE` — exposed for the `/health`
+  report and tests. They mirror the CustomVoice engine's config when that engine
+  is selected; otherwise they reflect the selected engine's model_name/language.
+- `stream_pcm(text, voice)` — delegates to the active engine.
 """
+
+from __future__ import annotations
 
 import logging
 import os
 
-import numpy as np
-
-from audio import float32_to_pcm16, resample_to_24k
+import engines as _engines_mod
+from engines import Engines, TTSEngine
 
 log = logging.getLogger("tts.synthesize")
 
-MODEL_NAME = os.getenv("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
-SPEAKER = os.getenv("TTS_SPEAKER", "aiden")
-LANGUAGE = os.getenv("TTS_LANGUAGE", "Russian")
-CHUNK_SIZE = int(os.getenv("TTS_CHUNK_SIZE", "4"))
+_engine: TTSEngine | None = None
 
-_model = None
+
+def _ensure_engine() -> TTSEngine:
+    global _engine
+    if _engine is None:
+        _engine = Engines.from_env()
+    return _engine
 
 
 def load_model():
-    """Load the Qwen3-TTS model into VRAM. Call once at startup."""
-    global _model
-    from faster_qwen3_tts import FasterQwen3TTS
-
-    _model = FasterQwen3TTS.from_pretrained(MODEL_NAME)
-    return _model
+    """Load the selected engine's model into VRAM. Call once at startup."""
+    eng = _ensure_engine()
+    eng.load()
+    return eng
 
 
 def is_loaded() -> bool:
-    return _model is not None
+    return _engine is not None and getattr(_engine, "_model", None) is not None
 
 
 def stream_pcm(text: str, voice: str = "default"):
-    """Yield 24kHz mono int16 PCM byte chunks for `text`.
-
-    `voice` overrides the configured speaker unless it is empty/"default".
-    """
-    speaker = SPEAKER if voice in (None, "", "default") else voice
-    for audio_chunk, sr, *_ in _model.generate_custom_voice_streaming(
-        text=text,
-        language=LANGUAGE,
-        speaker=speaker,
-        chunk_size=CHUNK_SIZE,
-    ):
-        samples = np.asarray(audio_chunk, dtype=np.float32).reshape(-1)
-        samples = resample_to_24k(samples, int(sr))
-        yield float32_to_pcm16(samples)
+    """Yield 24kHz mono int16 PCM byte chunks for `text`. Delegates to the engine."""
+    eng = _ensure_engine()
+    yield from eng.stream_pcm(text, voice)
 
 
-# FALLBACKS (apply in Task D5 if generate_custom_voice_streaming is not exposed):
-#
-# (a) Non-streaming custom voice — wrap the single returned array as one chunk:
-#       audio, sr = _model.generate_custom_voice(text=text, language=LANGUAGE,
-#                                                 speaker=speaker)
-#       yield float32_to_pcm16(resample_to_24k(np.asarray(audio, np.float32), int(sr)))
-#
-# (b) Voice clone streaming (requires a Russian reference clip on disk):
-#       for audio_chunk, sr, *_ in _model.generate_voice_clone_streaming(
-#           text=text, language=LANGUAGE, ref_audio=REF_WAV, ref_text=REF_TEXT,
-#           chunk_size=CHUNK_SIZE):
-#           ...
-#
-# (c) Official package `qwen-tts`:
-#       from qwen_tts import Qwen3TTSModel
-#       model.generate_custom_voice(...) with its documented signature.
+def engine() -> TTSEngine:
+    """The active engine instance (for server health fields)."""
+    return _ensure_engine()
+
+
+# --- backward-compat module-level attributes ------------------------------- #
+# These exist so old code that reads `synthesize.MODEL_NAME` etc. keeps working.
+# They reflect the active engine's config and are populated lazily.
+
+def __getattr__(name: str):
+    # Called only when the attribute isn't found the normal way.
+    eng = _ensure_engine()
+    if name == "MODEL_NAME":
+        return eng.model_name
+    if name == "LANGUAGE":
+        return eng.language
+    if name == "CHUNK_SIZE":
+        return getattr(eng, "chunk_size", None)
+    if name == "SPEAKER":
+        # Only CustomVoice has a `speaker`; others don't. Mirror old behaviour.
+        return getattr(eng, "speaker", None)
+    raise AttributeError(name)

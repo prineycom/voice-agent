@@ -7,7 +7,7 @@ tags:
 
 # Voice Agent
 
-Realtime voice communication platform with visual presence. Hybrid architecture: Pi 5 hosts the LiveKit SFU, Agent Worker, LiteLLM, and web/kiosk frontend; Desktop provides GPU-accelerated STT and TTS via WebSocket; cloud LLM provides reasoning via LiteLLM. Hermes MCP supplies tool calling, memory, and skills.
+Realtime voice communication platform with visual presence. Hybrid architecture: Pi 5 hosts the LiveKit SFU, Agent Worker, LiteLLM, and web/kiosk frontend; Desktop provides GPU-accelerated STT and TTS via WebSocket; cloud LLM provides reasoning via LiteLLM. Hermes (CLI subprocess) is the agent's hands — it supplies tool calling, memory, skills, file/web/terminal access, and third-party services.
 
 ## Language
 
@@ -55,9 +55,28 @@ _Avoid_: avatar, character, 3D model
 Proxy running on Pi 5 that routes LLM requests to cloud providers (Ollama Cloud, Google AI Studio, OpenAI). Provides a unified OpenAI-compatible API endpoint.
 _Avoid_: LLM gateway, model router
 
-**Hermes MCP**:
-The MCP server providing tool calling, persistent memory, and skills to the Agent Worker. Runs locally on Pi 5.
-_Avoid_: tool server, function server
+**Hermes**:
+A standalone agent application already installed on Pi 5 (`hermes` CLI). It is the **hands** of the voice agent — it does web search, file work, computer use, memory, skills, and anything requiring tools the voice agent itself lacks. The [[Agent Worker]] reaches it by shelling out to the `hermes` CLI as an async subprocess (`asyncio.create_subprocess_exec`, non-blocking to the event loop; no MCP, no messaging bridge). Hermes does reasoning and acts on its side; the worker never touches Hermes-internal state.
+_Avoid_: tool server, function server, MCP server, skill server
+
+**Hands-and-Mouth Split**:
+The division of labour: the [[Agent Worker]] is the **mouth** — it carries the live conversation and routes every task it cannot itself do to Hermes via [[run_command]]. Hermes is the **hands** — it has memory, web search, files, computer use, skills, and third-party services. The voice agent owns no tools except the single [[Hermes Tools|whitelisted run_command tool]]. Per turn the worker's LLM decides: if the turn needs a tool it delegates to Hermes; if it's pure conversation it answers directly. The worker may lightly re-voice a Hermes result in SOUL style but never does the underlying work itself.
+_Avoid_: sub-agent, backend, tool layer
+
+**Hermes Tools** (whitelisted CLI tool + skill):
+The [[Agent Worker]] exposes ONE generic `livekit.agents.function_tool` to its LLM: [[run_command]](`args: str`) — which runs any whitelisted CLI command on the Pi as an async subprocess. The whitelist lives in `infra/pi/agent/config.yaml` (`worker_tools.allowed_commands`, default `["hermes"]`) and is enforced by checking `shlex.split(args)[0]` against it. A skill file (`infra/pi/agent/skills/hermes.md`) describes the command patterns (delegate task, list sessions, send message) and is appended verbatim to the Agent instructions alongside SOUL.md at startup. Any future `hermes` subcommand works without code changes — add the command to the whitelist + a pattern to the skill and restart. No MCP, no messaging bridge.
+_Avoid_: hermes functions, hermes API, MCP tools
+
+**run_command**:
+`run_command(args: str) -> str` — a `livekit.agents.function_tool` that parses `args` with `shlex`, checks `args[0]` against `worker_tools.allowed_commands` (config.yaml), and runs the command via `asyncio.create_subprocess_exec` (async, non-blocking to the event loop), returning stdout. The LLM composes the full CLI args (e.g. `"hermes chat -q '...' -Q --yolo --source tool --resume <sid>"`). Non-whitelisted commands are rejected before exec; a missing command returns a clear error string so the agent degrades gracefully and keeps talking.
+_Avoid_: shell, exec, subprocess tool
+
+**Worker Skill**:
+A Markdown file (`infra/pi/agent/skills/hermes.md`) teaching the LLM how to compose `run_command` args for Hermes CLI patterns (delegate task, list sessions, send message) plus the "any future hermes subcommand works" principle. Read at startup and concatenated to the Agent `instructions` string alongside [[SOUL.md]] — same loading pattern. Extension is declarative: add a command to `worker_tools.allowed_commands` + a pattern here, restart the worker.
+_Avoid_: system prompt, tool docs
+
+**Hermes Session ID**:
+The handle Hermes returns on every `run_command("hermes chat ...")` call (a `session_id:` line folded in from stderr in -Q mode, e.g. `20260625_114014_15b9a3`). Passed back via `--resume <id>` to keep one continuous Hermes dialog across many voice turns. Persists on Hermes's on-disk SQLite session store, independent of the [[Agent Worker]] lifecycle.
 
 **Cascaded Pipeline**:
 The architecture where audio flows through discrete stages: STT → LLM → TTS. Each stage is a separate process. Chosen over speech-to-speech for auditability and tool-calling reliability.
@@ -87,7 +106,7 @@ _Avoid_: HTTPS, SSL
 - **STT/TTS transport**: WebSocket binary frames between Pi 5 and Desktop. → [[0003-websocket-stt-tts]]
 - **LLM**: Start with nemotron-3-super:cloud (Ollama Cloud), experiment later. Fastest available (~1.6s TTFT), tool calling supported.
 - **Turn control**: LiveKit owns endpointing + interruption; STT/TTS protocols driven by end/reset events and socket-close. → [[0006-agent-turn-control]]
-- **Tool calling**: Through [[Hermes MCP]] (HTTP, standalone service) — SOUL.md, memory, skills. Deferred to Agent Worker slice 2; slice 1 is the bare voice loop.
+- **Hermes integration**: The Agent Worker reaches Hermes via one generic whitelisted CLI tool ([[run_command]]) + a [[Worker Skill]] describing patterns. Hermes runs with full CLI tools (web, files, terminal, memory, skills, YouTrack, SSH, send_message, vision, cron, everything). Hands-and-mouth split unchanged: the worker only talks and delegates; re-voicing is the LLM's job in-turn. Transport = subprocess exec, whitelist in config.yaml. → [[0007-hermes-cli-delegation]]
 - **Client**: Kiosk (physical display on Pi 5) + web access in local network.
 - **Animation**: Live2D free sample, motion states only, no lip-sync.
 - **Sound**: Via LiveKit WebRTC in browser (Pi 5 kiosk browser fullscreen).

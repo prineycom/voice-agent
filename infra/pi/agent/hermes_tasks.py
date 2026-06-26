@@ -1,0 +1,378 @@
+"""Async Hermes delegation manager.
+
+Runs Hermes CLI tasks in the background so the Agent Worker stays conversational:
+the delegating tool returns immediately, the agent voices a short acknowledgement,
+and when Hermes finishes the manager makes the agent speak the result proactively
+via ``session.generate_reply``. See docs/superpowers/specs/2026-06-25-hermes-async-delegation-design.md.
+
+Proactive delivery is deliberately conservative to avoid flooding the framework's
+speech queue (the failure mode that made the agent natter and garble audio):
+- NO progress nudges — a long task stays silent until it actually finishes.
+- Results are buffered and delivered by ONE worker that waits for the conversation
+  to go idle (agent listening, user not speaking, no current speech), so a result
+  never cuts off the user or the agent mid-utterance.
+- Multiple results that pile up are coalesced into a SINGLE reply, and each task's
+  raw output is trimmed before it reaches the LLM/TTS.
+
+The manager is plain (no livekit decorators) so it is fully unit-testable; the
+``@function_tool`` adapters in worker_tools.py are thin wrappers that fetch the
+manager from ``context.session.userdata`` and call into it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+from collections import deque
+
+log = logging.getLogger("agent")
+
+UI_TOPIC = "voiceagent"  # LiveKit data topic the web UI subscribes to
+UI_FULL_OUTPUT_CAP = 4000  # chars of full Hermes output sent to the UI (data-msg size guard)
+
+DEFAULT_MAX_CONCURRENT = 3
+DEFAULT_MAX_QUEUED = 5
+DEFAULT_TASK_TIMEOUT = 300.0
+DEFAULT_IDLE_POLL_INTERVAL = 0.3
+DEFAULT_OUTPUT_LIMIT = 600  # chars of Hermes output handed to the LLM per result
+
+DIRECTIVE_BACKGROUND = (
+    "Запущено в фоне (running in background). Дай пользователю одну короткую "
+    "фразу-подтверждение и продолжай разговор — результат придёт позже сам. "
+    "НЕ перезапускай эту задачу, чтобы узнать статус — результат озвучится автоматически."
+)
+DIRECTIVE_QUEUED = (
+    "Принято, но я уже занят другими задачами — поставил в очередь (queued). "
+    "Скажи пользователю, что возьмёшься чуть позже, и продолжай разговор."
+)
+DIRECTIVE_FULL = (
+    "Слишком много задач уже в работе и очередь полна. Попроси пользователя "
+    "подождать, пока освободишься, и не запускай эту задачу сейчас."
+)
+
+
+def build_hermes_argv(request: str, *, resume_session_id: str | None = None) -> list[str]:
+    """Compose the Hermes CLI argv for a single delegated request.
+
+    -Q (quiet: final answer + session_id only), --yolo (no approval prompts; no
+    TTY in a subprocess), --source tool (mark as tool-originated). --resume keeps
+    one continuous Hermes dialog across delegations.
+    """
+    argv = ["hermes", "chat", "-q", request, "-Q", "--yolo", "--source", "tool"]
+    if resume_session_id:
+        argv += ["--resume", resume_session_id]
+    return argv
+
+
+class HermesTaskManager:
+    """Owns background Hermes tasks for one Agent Worker job/session."""
+
+    def __init__(
+        self,
+        *,
+        max_concurrent: int = DEFAULT_MAX_CONCURRENT,
+        max_queued: int = DEFAULT_MAX_QUEUED,
+        task_timeout: float = DEFAULT_TASK_TIMEOUT,
+        idle_poll_interval: float = DEFAULT_IDLE_POLL_INTERVAL,
+        output_limit: int = DEFAULT_OUTPUT_LIMIT,
+    ) -> None:
+        self.max_concurrent = max_concurrent
+        self.max_queued = max_queued
+        self.task_timeout = task_timeout
+        self.idle_poll_interval = idle_poll_interval
+        self.output_limit = output_limit
+
+        self._session = None
+        self._session_id: str | None = None
+        self._publish = None  # async (data: bytes) -> None, or None
+        self._tasks: set[asyncio.Task] = set()
+        self._labels: dict[asyncio.Task, str] = {}
+        self._started_at: dict[asyncio.Task, float] = {}
+        self._queue: deque[str] = deque()
+        self._running = 0
+        # Completed results awaiting a quiet moment to be spoken: (label, ok, text).
+        self._pending: list[tuple[str, bool, str]] = []
+        self._delivery_task: asyncio.Task | None = None
+        self._delivering = False
+        # Set whenever nothing is running, queued, pending, or being delivered.
+        self._idle = asyncio.Event()
+        self._idle.set()
+
+    # -- wiring -------------------------------------------------------------
+    def attach_session(self, session) -> None:
+        """Bind the live AgentSession used for proactive replies."""
+        self._session = session
+
+    def set_publisher(self, publish) -> None:
+        """Bind an async ``publish(data: bytes)`` used to stream UI events to the
+        browser (LiveKit data messages). None disables publishing (the default)."""
+        self._publish = publish
+
+    # -- public API ---------------------------------------------------------
+    async def delegate(self, request: str) -> str:
+        """Admit, queue, or refuse a Hermes task; return a directive for the LLM."""
+        self._idle.clear()
+        self._emit({"type": "event", "kind": "delegated", "label": self._label(request)})
+        if self._running < self.max_concurrent:
+            self._start(request)
+            self._emit_tasks()
+            return DIRECTIVE_BACKGROUND
+        if len(self._queue) < self.max_queued:
+            self._queue.append(request)
+            self._emit_tasks()
+            return DIRECTIVE_QUEUED
+        self._update_idle()
+        return DIRECTIVE_FULL
+
+    async def cancel(self, hint: str = "") -> str:
+        """Cancel active Hermes tasks (running + queued); return a directive.
+
+        Empty hint cancels everything; a hint cancels only tasks whose request
+        label contains it (case-insensitive). Cancelled tasks deliver no result.
+        """
+        hint_l = hint.strip().lower()
+
+        def matches(label: str) -> bool:
+            return not hint_l or hint_l in label.lower()
+
+        running_targets = [t for t in list(self._tasks) if matches(self._labels.get(t, ""))]
+        queued_kept = deque(r for r in self._queue if not matches(self._label(r)))
+        queued_cancelled = len(self._queue) - len(queued_kept)
+        self._queue = queued_kept
+
+        if not running_targets and queued_cancelled == 0:
+            self._update_idle()
+            return "Сейчас нет активных задач для отмены. Так и скажи пользователю."
+
+        for task in running_targets:
+            task.cancel()
+        await asyncio.gather(*running_targets, return_exceptions=True)
+        self._update_idle()
+
+        total = len(running_targets) + queued_cancelled
+        self._emit({"type": "event", "kind": "cancelled", "count": total})
+        self._emit_tasks()
+        return (
+            f"Отменил задач(и): {total}. Подтверди пользователю, что остановил их, "
+            "и продолжай разговор."
+        )
+
+    async def shutdown(self) -> None:
+        """Cancel everything and kill subprocesses — called when the session ends.
+
+        Silent (no proactive speech): the room is gone, there is no one to tell.
+        """
+        self._queue.clear()
+        self._pending.clear()
+        targets = list(self._tasks)
+        if self._delivery_task is not None:
+            targets.append(self._delivery_task)
+        for task in targets:
+            task.cancel()
+        await asyncio.gather(*targets, return_exceptions=True)
+        self._update_idle()
+
+    def list_tasks(self) -> str:
+        """A short summary of running and queued tasks for the agent to read out."""
+        running = list(self._labels.values())
+        queued = [self._label(r) for r in self._queue]
+        if not running and not queued:
+            return "Сейчас никаких фоновых задач нет."
+        parts = []
+        if running:
+            parts.append("в работе: " + "; ".join(running))
+        if queued:
+            parts.append("в очереди: " + "; ".join(queued))
+        return ". ".join(parts) + "."
+
+    async def join(self) -> None:
+        """Test/shutdown helper: wait until nothing is running, queued, or pending."""
+        await self._idle.wait()
+
+    # -- internals: scheduling ---------------------------------------------
+    @staticmethod
+    def _label(request: str) -> str:
+        """A short human label for a request, for status/cancel messages."""
+        label = " ".join(request.split())
+        return label if len(label) <= 48 else label[:47] + "…"
+
+    def _trim(self, text: str, limit: int | None = None) -> str:
+        """Collapse whitespace and cap length so TTS never chokes on a wall of text."""
+        t = " ".join(text.split())
+        cap = self.output_limit if limit is None else limit
+        return t if len(t) <= cap else t[:cap] + "…"
+
+    def _start(self, request: str) -> None:
+        """Admit a request: occupy a slot and spawn its background task."""
+        self._running += 1
+        task = asyncio.create_task(self._run(request))
+        self._tasks.add(task)
+        self._labels[task] = self._label(request)
+        self._started_at[task] = asyncio.get_event_loop().time()
+        task.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """Free the slot and pull the next queued request, if any."""
+        self._tasks.discard(task)
+        self._labels.pop(task, None)
+        self._started_at.pop(task, None)
+        self._running -= 1
+        if self._queue:
+            self._start(self._queue.popleft())
+        self._update_idle()
+        self._emit_tasks()
+
+    # -- internals: UI publishing ------------------------------------------
+    def _emit(self, payload: dict) -> None:
+        """Fire-and-forget publish a UI event (safe from sync or async context)."""
+        if self._publish is None:
+            return
+        asyncio.create_task(self._safe_publish(payload))
+
+    async def _safe_publish(self, payload: dict) -> None:
+        with contextlib.suppress(Exception):
+            await self._publish(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    def _emit_tasks(self) -> None:
+        """Publish a snapshot of running + queued tasks for the live UI panel."""
+        if self._publish is None:
+            return
+        now = asyncio.get_event_loop().time()
+        running = [
+            {"label": label, "elapsed": round(now - self._started_at.get(task, now), 1)}
+            for task, label in self._labels.items()
+        ]
+        queued = [self._label(r) for r in self._queue]
+        self._emit({"type": "tasks", "running": running, "queued": queued})
+
+    def _update_idle(self) -> None:
+        """Set the idle event iff there is no outstanding work of any kind."""
+        if self._running == 0 and not self._queue and not self._pending and not self._delivering:
+            self._idle.set()
+
+    async def _run(self, request: str) -> None:
+        label = self._label(request)
+        argv = build_hermes_argv(request, resume_session_id=self._session_id)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            self._enqueue_result(label, False, "Hermes не найден на этом хосте")
+            return
+
+        comm = asyncio.create_task(proc.communicate())
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(comm, timeout=self.task_timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            comm.cancel()
+            # await on a cancelled task raises CancelledError (a BaseException),
+            # which suppress(Exception) would NOT catch — suppress everything so
+            # cleanup never escapes before we enqueue the failure result.
+            with contextlib.suppress(BaseException):
+                await comm
+            self._enqueue_result(label, False, "не уложилась в отведённое время — отменил")
+            return
+        except asyncio.CancelledError:
+            proc.kill()
+            comm.cancel()
+            # await on a cancelled task raises CancelledError (a BaseException),
+            # which suppress(Exception) would NOT catch — suppress everything so
+            # cleanup never escapes before we enqueue the failure result.
+            with contextlib.suppress(BaseException):
+                await comm
+            raise  # cancelled tasks deliver nothing
+
+        stdout = stdout_b.decode("utf-8", errors="replace").strip()
+        stderr = stderr_b.decode("utf-8", errors="replace").strip()
+        for line in stderr.splitlines():
+            if line.strip().startswith("session_id:"):
+                self._session_id = line.split("session_id:", 1)[1].strip()
+
+        if proc.returncode not in (0, None):
+            self._enqueue_result(label, False, (stderr or stdout)[-self.output_limit:])
+            return
+        self._enqueue_result(label, True, stdout or "(no output)")
+
+    # -- internals: delivery ------------------------------------------------
+    def _enqueue_result(self, label: str, ok: bool, text: str) -> None:
+        """Buffer a finished result and make sure the delivery worker is running."""
+        self._idle.clear()
+        self._emit({
+            "type": "event",
+            "kind": "done" if ok else "error",
+            "label": label,
+            "summary": self._trim(text),
+            "full": text[:UI_FULL_OUTPUT_CAP],
+        })
+        self._pending.append((label, ok, text))
+        if not self._delivering:
+            self._delivering = True
+            self._delivery_task = asyncio.create_task(self._delivery_worker())
+
+    async def _delivery_worker(self) -> None:
+        """Speak buffered results when the conversation is idle, coalesced into one
+        reply per quiet moment so the speech queue never floods."""
+        try:
+            while self._pending:
+                await self._wait_until_idle()
+                batch = self._pending[:]
+                self._pending.clear()
+                if self._session is None:
+                    return
+                instructions = self._build_delivery(batch)
+                handle = self._session.generate_reply(instructions=instructions)
+                with contextlib.suppress(Exception):
+                    await handle
+        finally:
+            # Drop the delivering flag, then re-arm if a result landed during the
+            # final delivery (the window after the while-check) so it is not stranded.
+            self._delivering = False
+            if self._pending:
+                self._delivering = True
+                self._delivery_task = asyncio.create_task(self._delivery_worker())
+            else:
+                self._update_idle()
+
+    async def _wait_until_idle(self) -> None:
+        """Block until the agent is listening and the user is not speaking."""
+        while not self._session_is_idle():
+            await asyncio.sleep(self.idle_poll_interval)
+
+    def _session_is_idle(self) -> bool:
+        s = self._session
+        if s is None:
+            return True
+        return (
+            getattr(s, "agent_state", "listening") == "listening"
+            and getattr(s, "user_state", "listening") != "speaking"
+            and getattr(s, "current_speech", None) is None
+        )
+
+    def _build_delivery(self, batch: list[tuple[str, bool, str]]) -> str:
+        """Build ONE generate_reply instruction for a batch of finished results."""
+        if len(batch) == 1:
+            label, ok, text = batch[0]
+            if ok:
+                return (
+                    f"Фоновая задача «{label}» готова. Результат Hermes: {self._trim(text)}. "
+                    "Передай пользователю суть кратко, своими словами, без markdown."
+                )
+            return (
+                f"Фоновая задача «{label}» завершилась с ошибкой: {self._trim(text, 200)}. "
+                "Скажи пользователю кратко, что не получилось."
+            )
+        lines = []
+        for label, ok, text in batch:
+            status = "готово" if ok else "ошибка"
+            lines.append(f"- «{label}» [{status}]: {self._trim(text, 200)}")
+        joined = "\n".join(lines)
+        return (
+            "Готовы несколько фоновых задач. Сведи их в одну короткую устную сводку "
+            f"для пользователя, без markdown:\n{joined}"
+        )
