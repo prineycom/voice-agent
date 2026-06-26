@@ -46,3 +46,8 @@ logs/
 *.mp3
 *.ogg
 *.flac
+# Desktop deploy runtime artifacts (exist only in the Desktop git checkout)
+infra/desktop/**/voices/
+infra/desktop/**/refs/
+infra/desktop/**/*.log
+infra/desktop/**/*.bak
