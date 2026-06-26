@@ -85,6 +85,40 @@ def test_ws_streams_chunks_then_done(loaded, monkeypatch):
     assert received == chunks
 
 
+def test_ws_streams_multiple_messages_on_one_connection(loaded, monkeypatch):
+    # The streaming plugin reuses a single connection for sequential segments:
+    # each text message must produce its own PCM chunks followed by {"done": True}.
+    chunks_by_text = {
+        "first": [b"\x01\x02", b"\x03\x04"],
+        "second": [b"\x05\x06", b"\x07\x08", b"\x09\x0a"],
+    }
+
+    def fake_stream(text, voice):
+        for c in chunks_by_text[text]:
+            yield c
+
+    monkeypatch.setattr(synthesize, "stream_pcm", fake_stream)
+    client = TestClient(server.app)
+
+    def collect_until_done(ws):
+        received = []
+        while True:
+            msg = ws.receive()
+            if "bytes" in msg and msg["bytes"] is not None:
+                received.append(msg["bytes"])
+            elif "text" in msg and msg["text"] is not None:
+                assert json.loads(msg["text"]) == {"done": True}
+                break
+        return received
+
+    with client.websocket_connect("/tts") as ws:
+        ws.send_text(json.dumps({"text": "first", "voice": "default"}))
+        assert collect_until_done(ws) == chunks_by_text["first"]
+
+        ws.send_text(json.dumps({"text": "second", "voice": "default"}))
+        assert collect_until_done(ws) == chunks_by_text["second"]
+
+
 def test_ws_empty_text_returns_error(loaded):
     client = TestClient(server.app)
     with client.websocket_connect("/tts") as ws:
