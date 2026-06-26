@@ -35,20 +35,39 @@ if str(SERVICE_DIR) not in sys.path:
 class FakeTTSServer:
     """A real WebSocket server mimicking the Desktop /tts contract.
 
-    On each client connection it reads the JSON request (recorded in
-    ``received``), streams ``chunks`` as binary frames, then terminates the
-    stream according to ``mode``:
+    Two connection shapes, selected by ``loop``:
+
+    - One-shot (``loop=False``, the one-shot ``ChunkedStream`` path): each
+      connection reads ONE JSON request, streams its PCM, terminates, and then
+      holds the socket open so the client controls teardown.
+    - Streaming (``loop=True``, the persistent ``DesktopSynthesizeStream`` path):
+      ONE connection serves MANY requests — it loops ``async for msg in ws``,
+      and for each text message streams that message's PCM then sends a terminal
+      frame, so a whole turn's sentences pipeline over a single socket.
+
+    The request JSON each client sends is recorded in ``received`` (one entry per
+    message, across both shapes). ``chunks`` is either a flat ``list[bytes]``
+    (sent for every request) or a callable ``index -> list[bytes]`` so streaming
+    tests can emit distinct, recoverable PCM per sentence. The terminal frame
+    after each request's PCM follows ``mode``:
         - "done"       → JSON {"done": true}
         - "error"      → JSON {"error": <error>}
         - "disconnect" → close the socket mid-stream (no terminal frame)
+        - "hang"       → (loop only) stream the FIRST turn's PCM but never send
+                         its terminal frame, idling until the client drops the
+                         socket; models a synthesis still in progress when a
+                         barge-in cancels it. Reconnected turns complete normally,
+                         so a dropped-then-reconnected stream can be exercised on
+                         a single server.
     """
 
-    def __init__(self, chunks, *, mode="done", error="boom"):
+    def __init__(self, chunks, *, mode="done", error="boom", loop=False):
 
         self.chunks = chunks
         self.mode = mode
         self.error = error
-        self.received = []  # request JSON dicts, one per client connection
+        self.loop = loop
+        self.received = []  # request JSON dicts, one per received message
         self.connections = 0  # cumulative count of accepted connections
         self.active = 0  # currently-open connections (drains to 0 on no leak)
         # Set to True and signalled when the connection ends (either side closes;
@@ -60,27 +79,18 @@ class FakeTTSServer:
         self._server = None
         self.url = None
 
+    def _chunks_for(self, index):
+        """PCM chunks for the ``index``-th request (callable or flat list)."""
+        return self.chunks(index) if callable(self.chunks) else self.chunks
+
     async def _handler(self, ws):
         self.connections += 1
         self.active += 1
         try:
-            req = await ws.recv()
-            self.received.append(json.loads(req))
-            for chunk in self.chunks:
-                await ws.send(chunk)
-            if self.mode == "error":
-                await ws.send(json.dumps({"error": self.error}))
-            elif self.mode == "disconnect":
-                await ws.close()
-                return
+            if self.loop:
+                await self._serve_loop(ws)
             else:
-                await ws.send(json.dumps({"done": True}))
-            # Keep the handler alive so the client controls teardown; this lets
-            # the test assert per-utterance client-side disconnect.
-            try:
-                await ws.wait_closed()
-            except Exception:
-                pass
+                await self._serve_once(ws)
         except websockets.exceptions.ConnectionClosed:
             # Client closed mid-stream (e.g. barge-in abort).
             pass
@@ -90,6 +100,52 @@ class FakeTTSServer:
             # Always mark the disconnect so tests can assert the socket closed.
             self.disconnected = True
             self.disconnected_event.set()
+
+    async def _serve_once(self, ws):
+        """One request per connection (the one-shot ChunkedStream contract)."""
+        req = await ws.recv()
+        self.received.append(json.loads(req))
+        for chunk in self._chunks_for(0):
+            await ws.send(chunk)
+        if self.mode == "error":
+            await ws.send(json.dumps({"error": self.error}))
+        elif self.mode == "disconnect":
+            await ws.close()
+            return
+        else:
+            await ws.send(json.dumps({"done": True}))
+        # Keep the handler alive so the client controls teardown; this lets
+        # the test assert per-utterance client-side disconnect.
+        try:
+            await ws.wait_closed()
+        except Exception:
+            pass
+
+    async def _serve_loop(self, ws):
+        """Many requests over one persistent socket (the streaming contract).
+
+        Mirrors the Desktop /tts per-message contract: read each text message,
+        stream that message's PCM, then send one terminal frame for it.
+        """
+        index = 0
+        async for msg in ws:
+            self.received.append(json.loads(msg))
+            for chunk in self._chunks_for(index):
+                await ws.send(chunk)
+            index += 1
+            if self.mode == "hang" and self.connections == 1:
+                # First turn is left in progress (no terminal frame); idle until
+                # the client drops the socket (barge-in). Reconnected turns
+                # (connections > 1) fall through to the normal "done" path.
+                await ws.wait_closed()
+                return
+            if self.mode == "error":
+                await ws.send(json.dumps({"error": self.error}))
+            elif self.mode == "disconnect":
+                await ws.close()
+                return
+            else:
+                await ws.send(json.dumps({"done": True}))
 
     async def start(self):
         self._server = await websockets.serve(self._handler, "127.0.0.1", 0)
@@ -106,8 +162,8 @@ async def tts_server_factory():
     """Yield a factory that starts FakeTTSServers and tears them all down."""
     servers = []
 
-    async def _make(chunks, *, mode="done", error="boom"):
-        srv = FakeTTSServer(chunks, mode=mode, error=error)
+    async def _make(chunks, *, mode="done", error="boom", loop=False):
+        srv = FakeTTSServer(chunks, mode=mode, error=error, loop=loop)
         await srv.start()
         servers.append(srv)
         return srv

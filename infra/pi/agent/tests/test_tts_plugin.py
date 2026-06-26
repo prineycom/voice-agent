@@ -17,13 +17,31 @@ import asyncio
 
 import pytest
 import websockets
-from livekit.agents import APIError
+from livekit.agents import APIConnectOptions, APIError
 
 from tts_plugin import NUM_CHANNELS, SAMPLE_RATE, DesktopTTS
 
 
 async def _collect(stream):
     """Consume a ChunkedStream → (frames, total_samples, concatenated_bytes)."""
+    frames = []
+    async for ev in stream:
+        frames.append(ev.frame)
+    await stream.aclose()
+    total = sum(f.samples_per_channel for f in frames)
+    data = b"".join(bytes(f.data) for f in frames)
+    return frames, total, data
+
+
+async def _drive(stream, text):
+    """Feed one turn of text into a SynthesizeStream and collect its audio.
+
+    Pushes the whole turn in a single segment (the persistent streaming path
+    sentence-tokenizes it internally), ends input, then drains the emitted
+    frames → (frames, total_samples, concatenated_bytes).
+    """
+    stream.push_text(text)
+    stream.end_input()
     frames = []
     async for ev in stream:
         frames.append(ev.frame)
@@ -217,3 +235,126 @@ async def test_rapid_interruptions_no_leak(tts_server_factory):
         _collect(ok_tts.synthesize("recovered")), timeout=5
     )
     assert data.rstrip(b"\x00") == b"\x01\x02\x03\x04"
+
+
+# --- Streaming path (DesktopTTS(streaming=True).stream()) -------------------
+#
+# These drive the persistent DesktopSynthesizeStream: text is sentence-tokenized
+# and pipelined over ONE reused WebSocket. Each non-empty sentence becomes its
+# own {"text","voice"} request and yields its own PCM run + {"done": true}, all
+# over the same connection.
+
+# Distinct, recoverable PCM per sentence: each ends in a non-zero byte so the
+# framework's trailing end-of-segment silence can be stripped to recover the
+# exact bytes, and the two runs are byte-distinguishable to prove ordering.
+_S1_PCM = (b"\xaa" * 200) + b"\x11"
+_S2_PCM = (b"\xbb" * 200) + b"\x22"
+
+
+@pytest.mark.asyncio
+async def test_streaming_two_sentences_one_connection(tts_server_factory):
+    # Two sentences over ONE persistent socket: exactly one connection accepted,
+    # both request dicts received with the right text, PCM emitted in order.
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM] if i == 0 else [_S2_PCM], loop=True
+    )
+
+    tts_impl = DesktopTTS(ws_url=srv.url, voice="narrator")
+    stream = tts_impl.stream()
+    _, _, data = await _drive(stream, "First sentence here. Second sentence now.")
+
+    assert srv.connections == 1
+    assert srv.received == [
+        {"text": "First sentence here.", "voice": "narrator"},
+        {"text": "Second sentence now.", "voice": "narrator"},
+    ]
+    # Both PCM runs survive intact and in order (sentence-1 audio precedes
+    # sentence-2 audio), recovered by stripping the trailing silence marker.
+    assert data.rstrip(b"\x00") == _S1_PCM + _S2_PCM
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_pipelined_ordering_no_loss(tts_server_factory):
+    # Pipelined ordering: sentence-2 PCM follows sentence-1 PCM with nothing lost
+    # or interleaved. Distinct per-sentence payloads make any reorder/loss visible.
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM] if i == 0 else [_S2_PCM], loop=True
+    )
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    stream = tts_impl.stream()
+    _, _, data = await _drive(
+        stream, "The first sentence is here. The second sentence is now."
+    )
+
+    real = data.rstrip(b"\x00")
+    assert real == _S1_PCM + _S2_PCM
+    # Sentence-1 audio is the exact prefix; sentence-2 audio is the exact suffix.
+    assert real[: len(_S1_PCM)] == _S1_PCM
+    assert real[len(_S1_PCM) :] == _S2_PCM
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_error_frame_raises_api_error(tts_server_factory):
+    # An {"error": ...} frame from the server surfaces as an APIError. max_retry=0
+    # so the single failure propagates instead of being retried.
+    srv = await tts_server_factory([b"\x01\x02"], mode="error", error="kaboom",
+                                   loop=True)
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    stream = tts_impl.stream(conn_options=APIConnectOptions(max_retry=0))
+
+    with pytest.raises(APIError):
+        await _drive(stream, "fail please.")
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_bargein_drops_socket_then_reconnects(tts_server_factory):
+    # Barge-in: cancel mid-synthesis → the persistent socket is dropped (the
+    # server's handler `finally` fires), and a SUBSEQUENT stream() reconnects
+    # (second connection accepted) and synthesizes cleanly.
+    srv = await tts_server_factory([], mode="hang", loop=True)
+    # First connection (the interrupted turn) streams one big chunk and then
+    # hangs with NO terminal frame, so synthesis is genuinely mid-flight when we
+    # cancel. The reconnected second connection streams small, recoverable
+    # per-sentence PCM and completes normally.
+    srv.chunks = lambda i: (
+        [_BIG_CHUNK]
+        if srv.connections == 1
+        else ([_S1_PCM] if i == 0 else [_S2_PCM])
+    )
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    stream = tts_impl.stream()
+    stream.push_text("interrupt me now.")
+    stream.end_input()
+
+    aiter = stream.__aiter__()
+    # Pull exactly the first frame — synthesis is now genuinely mid-flight.
+    first = await asyncio.wait_for(aiter.__anext__(), timeout=2)
+    assert first.frame is not None
+    assert srv.disconnected is False
+
+    # Abort mid-stream (what a real barge-in does): aclose() cancels _run, whose
+    # CancelledError path calls _drop_ws() → the socket closes.
+    await asyncio.wait_for(stream.aclose(), timeout=2)
+    await asyncio.wait_for(srv.disconnected_event.wait(), timeout=2)
+    assert srv.disconnected is True
+    assert srv.connections == 1
+
+    # The next turn reconnects (second connection accepted) and completes cleanly.
+    stream2 = tts_impl.stream()
+    _, _, data = await asyncio.wait_for(
+        _drive(stream2, "This is the first part. And here is the second part."),
+        timeout=5,
+    )
+    assert srv.connections == 2
+    assert data.rstrip(b"\x00") == _S1_PCM + _S2_PCM
+
+    await tts_impl.aclose()
