@@ -350,9 +350,9 @@ class HermesTaskManager:
 
         Prefer the framework's own idle primitive (it knows about every speech
         source, not just the ones we poll); fall back to the state poll when it
-        is unavailable. A closed/errored session is treated as "stop waiting this
-        cycle" — the worker's ``_session is None`` guard and the awaited handle
-        below handle a session that has gone away.
+        is unavailable or errors. A non-cancellation error from the primitive
+        falls through to the state poll so idle-gating is still attempted; the
+        worker's ``_session is None`` guard handles a session that has gone away.
         """
         if self._session is not None and hasattr(self._session, "wait_for_idle"):
             try:
@@ -360,8 +360,8 @@ class HermesTaskManager:
                 return
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                return
+            except Exception as e:
+                log.debug("wait_for_idle unavailable, falling back to poll: %r", e)
         while not self._session_is_idle():
             await asyncio.sleep(self.idle_poll_interval)
 
