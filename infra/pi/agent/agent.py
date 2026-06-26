@@ -36,6 +36,7 @@ See the README (Task 8) for the on-Pi smoke test.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from livekit.agents import NOT_GIVEN, Agent, AgentSession, JobContext, WorkerOptions, cli
@@ -229,24 +230,22 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # --- Diagnostics for the "transcript stops on long output" bug (issue under
     # investigation). These are cheap, high-signal hooks: which conversation items
-    # actually get committed (and their length), agent state transitions (to spot a
-    # wedge), and a loud log if the session closes with an error. Remove once root-caused.
-    @session.on("conversation_item_added")
-    def _on_item(ev) -> None:
-        item = getattr(ev, "item", None)
-        role = getattr(item, "role", "?")
-        text = getattr(item, "text_content", None) or ""
-        log.info("diag: conversation_item role=%s len=%d", role, len(text))
+    # actually get committed (and their length), and a loud log if the session closes
+    # with an error. Gated behind AGENT_DIAG (default off).
+    # TODO(#23): remove once the transcript-wedge fix is confirmed on live hardware.
+    diag_enabled = bool(os.getenv("AGENT_DIAG"))
+    if diag_enabled:
+        @session.on("conversation_item_added")
+        def _on_item(ev) -> None:
+            item = getattr(ev, "item", None)
+            role = getattr(item, "role", "?")
+            text = getattr(item, "text_content", None) or ""
+            log.info("diag: conversation_item role=%s len=%d", role, len(text))
 
-    @session.on("agent_state_changed")
-    def _on_agent_state(ev) -> None:
-        log.info("diag: agent_state %s -> %s",
-                 getattr(ev, "old_state", "?"), getattr(ev, "new_state", "?"))
-
-    @session.on("close")
-    def _on_close(ev) -> None:
-        log.error("diag: session close reason=%s error=%r",
-                  getattr(ev, "reason", "?"), getattr(ev, "error", None))
+        @session.on("close")
+        def _on_close(ev) -> None:
+            log.error("diag: session close reason=%s error=%r",
+                      getattr(ev, "reason", "?"), getattr(ev, "error", None))
 
     # Greet from on_enter (the documented livekit-agents pattern) rather than
     # awaiting ctx.wait_for_participant(): in a live test that helper hung even
