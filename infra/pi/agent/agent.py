@@ -186,7 +186,10 @@ async def entrypoint(ctx: JobContext) -> None:
     # DesktopTTS._run's finally-block closes the /tts WebSocket; the Desktop
     # TTS server cancels its producer on disconnect (no in-band stop message,
     # per ADR-0006); locally-buffered audio is dropped via the framework's
-    # clear_buffer.  To tune, pass:
+    # clear_buffer.  In the streaming path (streaming=True) the persistent TTS
+    # socket is dropped and reconnected on the next stream, so interruption
+    # still means "close the TTS WebSocket" — preserving the ADR-0006 contract
+    # (no in-band stop).  To tune, pass:
     #   turn_handling=TurnHandlingOptions(interruption=InterruptionOptions(...))
     # Do NOT use the deprecated flat kwargs allow_interruptions= /
     # min_interruption_* — they were removed in 1.6.x.
@@ -209,6 +212,7 @@ async def entrypoint(ctx: JobContext) -> None:
             ws_url=cfg.tts_ws_url,
             voice=cfg.tts_voice,
             sample_rate=cfg.tts_sample_rate,
+            streaming=cfg.tts_streaming,
         ),
         vad=vad,
         turn_detection="vad",
