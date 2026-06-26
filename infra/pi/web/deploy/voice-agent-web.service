@@ -1,0 +1,22 @@
+[Unit]
+Description=Voice Agent Web Test-Harness (token server + test page)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=priney
+Group=priney
+WorkingDirectory=/home/priney/repos/voice-agent/infra/pi/web
+Environment=LIVEKIT_WS_URL=wss://rpi.darter-smoot.ts.net:8443
+Environment=WEB_BIND_HOST=127.0.0.1
+Environment=WEB_BIND_PORT=8095
+ExecStart=/home/priney/repos/voice-agent/infra/pi/agent/.venv/bin/python /home/priney/repos/voice-agent/infra/pi/web/server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice-agent-web
+
+[Install]
+WantedBy=multi-user.target
