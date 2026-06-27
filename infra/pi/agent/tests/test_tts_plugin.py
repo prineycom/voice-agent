@@ -247,8 +247,17 @@ async def test_rapid_interruptions_no_leak(tts_server_factory):
 # Distinct, recoverable PCM per sentence: each ends in a non-zero byte so the
 # framework's trailing end-of-segment silence can be stripped to recover the
 # exact bytes, and the two runs are byte-distinguishable to prove ordering.
-_S1_PCM = (b"\xaa" * 200) + b"\x11"
-_S2_PCM = (b"\xbb" * 200) + b"\x22"
+# Even length (a complete 16-bit PCM run, as the real /tts server emits), so the
+# within-message odd-byte carry never spills across the {"done"} boundary.
+_S1_PCM = (b"\xaa" * 199) + b"\x11"
+_S2_PCM = (b"\xbb" * 199) + b"\x22"
+
+
+def _odd_chunks(payload):
+    # Split a complete (even-length) PCM run into two odd-length chunks so a
+    # 16-bit sample straddles the chunk boundary. Exercises the within-message
+    # leftover carry; the run total stays even so nothing carries across `done`.
+    return [payload[:99], payload[99:]]
 
 
 @pytest.mark.asyncio
@@ -279,8 +288,10 @@ async def test_streaming_two_sentences_one_connection(tts_server_factory):
 async def test_streaming_pipelined_ordering_no_loss(tts_server_factory):
     # Pipelined ordering: sentence-2 PCM follows sentence-1 PCM with nothing lost
     # or interleaved. Distinct per-sentence payloads make any reorder/loss visible.
+    # Each run is delivered as odd-length chunks to also exercise the within-message
+    # 16-bit alignment carry (and confirm it does not leak across sentences).
     srv = await tts_server_factory(
-        lambda i: [_S1_PCM] if i == 0 else [_S2_PCM], loop=True
+        lambda i: _odd_chunks(_S1_PCM) if i == 0 else _odd_chunks(_S2_PCM), loop=True
     )
 
     tts_impl = DesktopTTS(ws_url=srv.url)
@@ -355,6 +366,74 @@ async def test_streaming_bargein_drops_socket_then_reconnects(tts_server_factory
         timeout=5,
     )
     assert srv.connections == 2
+    assert data.rstrip(b"\x00") == _S1_PCM + _S2_PCM
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_disconnect_midstream_raises_api_error(tts_server_factory):
+    # Mid-stream server disconnect on the persistent socket: the loop server
+    # streams the first sentence's PCM then closes the socket WITHOUT the terminal
+    # {"done": true}. The plugin's drain loop (`await ws.recv()`) then raises
+    # ConnectionClosed, which `_run` surfaces as an APIError. max_retry=0 so the
+    # single failure propagates instead of being retried.
+    srv = await tts_server_factory([_S1_PCM], mode="disconnect", loop=True)
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    stream = tts_impl.stream(conn_options=APIConnectOptions(max_retry=0))
+
+    with pytest.raises(APIError):
+        await _drive(stream, "drop me midstream.")
+
+    # The server accepted exactly one connection (and then closed it itself).
+    assert srv.connections == 1
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_midstream_flush_separate_sentences(tts_server_factory):
+    # Mid-stream FlushSentinel: feed two sentences and a `flush()` within ONE
+    # stream, exercising the `_feed` FlushSentinel branch (it forwards the flush
+    # to the streaming tokenizer, forcing emission of the buffered sentences) and
+    # the `_recv` re-check under partial sends. Both sentences must go out as
+    # SEPARATE {"text","voice"} requests over the SAME connection, with PCM
+    # emitted in order.
+    #
+    # Note: livekit-agents' SynthesizeStream allows only one segment per stream —
+    # a `push_text` after a `flush()` is dropped with a deprecation warning — so
+    # the two sentences are pushed (with a sentence boundary between them) before
+    # a single `flush()` forces them out, rather than as two push/flush cycles.
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM] if i == 0 else [_S2_PCM], loop=True
+    )
+
+    tts_impl = DesktopTTS(ws_url=srv.url, voice="narrator")
+    stream = tts_impl.stream()
+
+    # The trailing space after the first sentence gives the streaming tokenizer a
+    # boundary it actually splits on; `flush()` then forces both buffered
+    # sentences to be emitted as distinct tokens.
+    stream.push_text("First sentence here. ")
+    stream.push_text("Second sentence now.")
+    stream.flush()
+    stream.end_input()
+
+    frames = []
+    async for ev in stream:
+        frames.append(ev.frame)
+    await stream.aclose()
+    data = b"".join(bytes(f.data) for f in frames)
+
+    # One persistent connection carried both sentences as separate requests.
+    assert srv.connections == 1
+    assert srv.received == [
+        {"text": "First sentence here.", "voice": "narrator"},
+        {"text": "Second sentence now.", "voice": "narrator"},
+    ]
+    # Both PCM runs survive intact and in order, recovered by stripping the
+    # framework's trailing end-of-segment silence marker.
     assert data.rstrip(b"\x00") == _S1_PCM + _S2_PCM
 
     await tts_impl.aclose()

@@ -36,7 +36,6 @@ See the README (Task 8) for the on-Pi smoke test.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 from livekit.agents import NOT_GIVEN, Agent, AgentSession, JobContext, WorkerOptions, cli
@@ -44,7 +43,7 @@ from livekit.agents import metrics as agent_metrics
 from livekit.agents.voice.events import MetricsCollectedEvent
 from livekit.plugins import openai, silero
 
-from config import load_config
+from config import _env_bool, load_config
 from health import (
     STTHealthError,
     TTSHealthError,
@@ -237,7 +236,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # actually get committed (and their length), and a loud log if the session closes
     # with an error. Gated behind AGENT_DIAG (default off).
     # TODO(#23): remove once the transcript-wedge fix is confirmed on live hardware.
-    diag_enabled = bool(os.getenv("AGENT_DIAG"))
+    diag_enabled = _env_bool("AGENT_DIAG", default=False)
     if diag_enabled:
         @session.on("conversation_item_added")
         def _on_item(ev) -> None:

@@ -11,6 +11,20 @@ from dotenv import load_dotenv
 
 DEFAULT_GREETING = "Привет! Я голосовой ассистент. Чем могу помочь?"
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var with a case-insensitive truthy-set.
+
+    Treats "1"/"true"/"yes"/"on" (any case, surrounding whitespace ignored) as
+    True and everything else as False. When the var is unset, returns `default`.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUTHY
+
 
 @dataclass(frozen=True)
 class AgentConfig:
@@ -75,12 +89,7 @@ def load_config() -> AgentConfig:
             f"Invalid TTS_SAMPLE_RATE={raw_sample_rate!r}: expected an integer."
         ) from exc
 
-    tts_streaming = os.environ.get("TTS_STREAMING", "true").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    tts_streaming = _env_bool("TTS_STREAMING", default=True)
 
     raw_worker_port = os.environ.get("AGENT_WORKER_PORT", "8090")
     try:

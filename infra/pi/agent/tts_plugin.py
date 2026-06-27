@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import websockets
 from livekit.agents import (
@@ -35,6 +36,8 @@ from livekit.agents import (
     tts,
     utils,
 )
+
+log = logging.getLogger("agent")
 
 SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
@@ -112,12 +115,20 @@ class DesktopTTS(tts.TTS):
         return DesktopSynthesizeStream(tts=self, conn_options=conn_options)
 
     async def aclose(self) -> None:
-        """Close the persistent socket if open."""
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            finally:
-                self._ws = None
+        """Close the persistent socket if open.
+
+        Acquire the lock so shutdown waits for any in-flight stream to release the
+        socket before tearing it down, mirroring how `_run` holds it for the
+        duration of a stream. Best-effort: never raises.
+        """
+        async with self._lock:
+            if self._ws is not None:
+                try:
+                    await self._ws.close()
+                except Exception:  # noqa: BLE001 — best-effort teardown, ignore
+                    pass
+                finally:
+                    self._ws = None
 
 
 class ChunkedStream(tts.ChunkedStream):
@@ -241,8 +252,11 @@ class DesktopSynthesizeStream(tts.SynthesizeStream):
 
                 async def _recv() -> None:
                     nonlocal seen_done
-                    # Carry a trailing odd byte across frames so a 16-bit sample is
-                    # never split (PCM runs from consecutive sentences are contiguous).
+                    # Carry a trailing odd byte across frames within one message so a
+                    # 16-bit sample split across two WebSocket frames is never broken.
+                    # Each `/tts` message is a self-contained PCM run, so the carry is
+                    # reset at every `done` boundary (see below) — never spanning
+                    # sentences, where it would parity-shift all subsequent audio.
                     leftover = b""
                     recv_task: asyncio.Task | None = None
                     send_done_task = asyncio.ensure_future(send_done.wait())
@@ -281,6 +295,13 @@ class DesktopSynthesizeStream(tts.SynthesizeStream):
                             if data.get("error"):
                                 raise APIError(f"TTS service error: {data['error']}")
                             if data.get("done"):
+                                if leftover:
+                                    log.warning(
+                                        "TTS message ended on an odd byte boundary; "
+                                        "dropping %d trailing byte(s)",
+                                        len(leftover),
+                                    )
+                                    leftover = b""
                                 output_emitter.flush()
                                 seen_done += 1
                     finally:
