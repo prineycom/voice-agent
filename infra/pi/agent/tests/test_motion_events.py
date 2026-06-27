@@ -150,6 +150,101 @@ def test_dangling_partial_tag_emitted_verbatim_on_flush():
     assert s.pop_emotions() == []
 
 
+def test_malformed_tag_no_colon_stripped_as_neutral():
+    """"[emotion]" (no colon/word) is a complete tag: stripped, recorded neutral."""
+    s = EmotionTagStripper()
+    out = s.feed("[emotion]hi")
+    out += s.flush()
+    assert out == "hi"
+    assert s.pop_emotions() == ["neutral"]
+    _assert_no_tag(out)
+
+
+def test_malformed_tag_space_no_colon_stripped():
+    """"[emotion happy]" (space, no colon) is stripped, recorded neutral, no leak."""
+    s = EmotionTagStripper()
+    out = s.feed("[emotion happy]hi")
+    out += s.flush()
+    assert out == "hi"
+    assert s.pop_emotions() == ["neutral"]
+    _assert_no_tag(out)
+
+
+def test_malformed_tag_mid_text_stripped():
+    """"a[emotion b]c" -> "ac" with the malformed complete tag removed."""
+    s = EmotionTagStripper()
+    out = s.feed("a[emotion b]c")
+    out += s.flush()
+    assert out == "ac"
+    assert s.pop_emotions() == ["neutral"]
+    _assert_no_tag(out)
+
+
+def test_malformed_tag_extra_chars_stripped():
+    """"[emotionX abc]" is a complete tag (no parseable word): stripped, neutral."""
+    s = EmotionTagStripper()
+    out = s.feed("[emotionX abc]done")
+    out += s.flush()
+    assert out == "done"
+    assert s.pop_emotions() == ["neutral"]
+    _assert_no_tag(out)
+
+
+def test_malformed_tag_split_across_feeds():
+    """A malformed tag split mid-stream is still held back and stripped on close."""
+    s = EmotionTagStripper()
+    out = s.feed("a[emotionX")
+    # No closing ']' yet: the partial must be held, never leaked.
+    _assert_no_tag(out)
+    assert out == "a"
+    out += s.feed(" z]b")
+    out += s.flush()
+    assert out == "ab"
+    assert s.pop_emotions() == ["neutral"]
+    _assert_no_tag(out)
+
+
+def test_numeric_bracket_not_stranded():
+    """"array[7] = 1" passes through losslessly (no emotion tag involved)."""
+    s = EmotionTagStripper()
+    out = s.feed("array[7] = 1")
+    out += s.flush()
+    assert out == "array[7] = 1"
+    assert s.pop_emotions() == []
+    _assert_no_tag(out)
+
+
+def test_open_bracket_text_not_stranded():
+    """"[abc def" diverges from "[emotion" and is emitted, never stranded."""
+    s = EmotionTagStripper()
+    out = s.feed("[abc def")
+    out += s.flush()
+    assert out == "[abc def"
+    assert s.pop_emotions() == []
+    _assert_no_tag(out)
+
+
+def test_global_invariant_no_emotion_substring_ever_leaks():
+    """Across every case, concatenated feed outputs + flush never contain "[emotion"."""
+    cases = [
+        "[emotion]hi",
+        "[emotion happy]hi",
+        "a[emotion b]c",
+        "[emotionX abc]done",
+        "[emotion:happy]well-formed",
+        "x[emotion happy]y",
+        "a[emotionX z]b",
+        "q[emotion:happy]w",
+        "array[7] = 1 [em",
+        "[abc def",
+        "plain text, no tags",
+    ]
+    for text in cases:
+        s = EmotionTagStripper()
+        out = "".join(s.feed(ch) for ch in text) + s.flush()
+        assert "[emotion" not in out, f"leaked for {text!r}: {out!r}"
+
+
 def test_char_by_char_streaming():
     """Feeding one character at a time still strips the tag cleanly."""
     s = EmotionTagStripper()

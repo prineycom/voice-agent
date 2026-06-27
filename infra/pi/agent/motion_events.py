@@ -9,6 +9,11 @@ This module is pure logic — no framework calls — so it is trivially unit-tes
 - ``motion_event_json`` builds the data-channel payload for a motion event.
 - ``EmotionTagStripper`` removes tags from text arriving in arbitrary chunks, where
   a single tag may be split across ``feed()`` calls.
+
+Invariant: any COMPLETE ``[emotion...]`` tag (with a closing ``]``) is stripped and
+never reaches the output, whether well-formed (``[emotion:happy]``) or malformed
+(``[emotion]``, ``[emotion happy]``, ``[emotionX abc]``); only a tag left incomplete
+at end-of-stream may be emitted verbatim.
 """
 
 from __future__ import annotations
@@ -20,11 +25,18 @@ from typing import Callable
 EMOTIONS = ("neutral", "happy", "sad", "surprised", "thinking")
 DEFAULT_EMOTION = "neutral"
 
-# Matches a complete inline emotion tag, e.g. "[emotion:happy]" or "[emotion: Sad ]".
+# Matches a well-formed inline emotion tag, e.g. "[emotion:happy]" or "[emotion: Sad ]".
+# Used to extract the emotion word.
 _TAG_RE = re.compile(r"\[emotion:\s*([a-zA-Z]+)\s*\]", re.IGNORECASE)
 
+# Matches ANY complete emotion tag (with a closing "]"), well-formed or malformed:
+# "[emotion]", "[emotion happy]", "[emotionX abc]", "[emotion:happy]". These must
+# never leak to TTS/transcript; malformed ones (no parseable ":<word>") count as
+# neutral.
+_ANY_TAG_RE = re.compile(r"\[\s*emotion[^\]]*\]", re.IGNORECASE)
+
 # Literal start of an open (not-yet-closed) tag, used to decide what to hold back.
-_OPEN_PREFIX = "[emotion:"
+_OPEN_PREFIX = "[emotion"
 
 
 def normalize_emotion(name: str | None) -> str:
@@ -50,11 +62,14 @@ class EmotionTagStripper:
     """Streaming, stateful remover of ``[emotion:xxx]`` tags from chunked text.
 
     Text arrives via ``feed()`` in arbitrary chunks; a tag may be split across calls
-    (e.g. ``"[emo"`` then ``"tion:happy]"``). Each complete tag is removed, its
-    normalized emotion recorded (and passed to ``on_emotion``), and the cleaned text
-    is emitted as soon as it is safe — i.e. everything except a trailing suffix that
-    could still be the beginning of an incomplete tag is returned. The emitted text
-    never contains the substring ``"[emotion"``.
+    (e.g. ``"[emo"`` then ``"tion:happy]"``). Any COMPLETE ``[emotion...]`` tag (with a
+    closing ``]``) is removed — well-formed (``[emotion:happy]``) or malformed
+    (``[emotion]``, ``[emotion happy]``, ``[emotionX abc]``) — its normalized emotion
+    recorded (and passed to ``on_emotion``; malformed tags record ``neutral``), and the
+    cleaned text is emitted as soon as it is safe — i.e. everything except a trailing
+    suffix that could still be the beginning of an incomplete tag is returned. The
+    emitted text never contains the substring ``"[emotion"``; only a tag left
+    incomplete at end-of-stream may be emitted verbatim by ``flush()``.
     """
 
     def __init__(self, on_emotion: Callable[[str], None] | None = None) -> None:
@@ -68,31 +83,41 @@ class EmotionTagStripper:
         self._emotions = []
         return drained
 
-    def _record(self, raw: str) -> None:
+    def _record(self, raw: str | None) -> None:
         emotion = normalize_emotion(raw)
         self._emotions.append(emotion)
         if self._on_emotion is not None:
             self._on_emotion(emotion)
 
     def _strip_complete_tags(self) -> None:
-        """Remove every complete tag currently in the buffer, recording each."""
+        """Remove every complete tag currently in the buffer, recording each.
+
+        A single left-to-right pass over ``_ANY_TAG_RE`` removes any complete
+        ``[emotion...]`` tag (well-formed or malformed). For each match, the emotion
+        word is extracted via ``_TAG_RE`` when the tag is well-formed; a malformed
+        complete tag (no parseable ``:<word>``) is recorded as ``neutral`` so a
+        motion event still fires. This guarantees no complete tag ever survives.
+        """
 
         def _replace(match: re.Match[str]) -> str:
-            self._record(match.group(1))
+            well_formed = _TAG_RE.search(match.group(0))
+            self._record(well_formed.group(1) if well_formed else None)
             return ""
 
-        self._buffer = _TAG_RE.sub(_replace, self._buffer)
+        self._buffer = _ANY_TAG_RE.sub(_replace, self._buffer)
 
     @staticmethod
     def _is_partial_open_tag(tail: str) -> bool:
         """True if ``tail`` (starting at a ``'['``) could still grow into a tag.
 
-        Two cases, neither of which has a closing ``']'`` yet:
-        - the tail is a prefix of ``"[emotion:"`` itself (e.g. ``"["``, ``"[emo"``);
-        - the tail already includes ``"[emotion:"`` and the emotion word is still
-          streaming (e.g. ``"[emotion:ha"``).
-        A ``'['`` that diverges from ``"[emotion:"`` (e.g. ``"[abc"``) is NOT partial,
-        so it is emitted rather than held back forever.
+        Held back only while there is no closing ``']'`` yet, in two cases:
+        - the tail is a prefix of the literal ``"[emotion"`` (e.g. ``"["``, ``"[emo"``);
+        - the tail already starts with ``"[emotion"`` and is still streaming, whether
+          heading toward a well-formed tag (``"[emotion:ha"``) or a malformed one
+          (``"[emotion ha"``, ``"[emotionX"``) — the closing ``']'`` may yet arrive.
+        A ``'['`` that diverges from ``"[emotion"`` (e.g. ``"[abc"``, ``"[em"`` whose
+        next char is not ``'o'``) is NOT partial, so it is emitted rather than held
+        back forever.
         """
         if "]" in tail:
             return False
