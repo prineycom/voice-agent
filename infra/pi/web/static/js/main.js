@@ -30,13 +30,17 @@ const avatarEl = document.getElementById('avatar');
 const avatar = createAvatar(avatarEl, { log: logger.log });
 const motion = createMotionController(avatar);
 
+let lastAgentState = null;
+
 avatar.init().then((ok) => {
   if (ok) {
     const h = document.getElementById('avatarHint');
     if (h) h.remove();
-    motion.setState(null);
+    motion.setState(lastAgentState);
   }
 }).catch((e) => logger.log('аватар: ' + e.message));
+
+window.addEventListener('beforeunload', () => { try { avatar.dispose(); } catch (e) {} });
 
 function onConn(text, cls) {
   connStateEl.textContent = text;
@@ -71,7 +75,7 @@ const hooks = {
     connectBtn.disabled = false;
     connectBtn.onclick = doConnect;
   },
-  onAgentState: (state) => { agentState.set(state); motion.setState(state); },
+  onAgentState: (state) => { lastAgentState = state; agentState.set(state); motion.setState(state); },
   watchAgentParticipant: agentState.watch,
   attachAudio: (el) => document.body.appendChild(el),
   onMicActive() { micLabelEl.textContent = 'активен'; },

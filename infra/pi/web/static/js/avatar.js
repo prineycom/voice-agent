@@ -9,7 +9,25 @@ export function createAvatar(containerEl, { log } = {}) {
   let ready = false;
   let ro = null;
 
+  function teardown() {
+    ro && ro.disconnect();
+    const view = app && app.view;
+    try {
+      app && app.destroy(true, { children: true });
+    } catch (e) {
+      log && log('освобождение ресурсов не удалось: ' + e.message);
+    }
+    if (view && view.parentNode) {
+      view.parentNode.removeChild(view);
+    }
+    app = null;
+    model = null;
+    ro = null;
+    ready = false;
+  }
+
   async function init() {
+    if (app) return ready;
     if (!(window.PIXI && window.PIXI.live2d)) {
       log && log('Live2D SDK не загружен');
       return false;
@@ -35,6 +53,7 @@ export function createAvatar(containerEl, { log } = {}) {
       model = await PIXI.live2d.Live2DModel.from('static/models/natori/Natori.model3.json');
     } catch (e) {
       log && log('загрузка модели не удалась: ' + e.message);
+      teardown();
       return false;
     }
 
@@ -75,24 +94,11 @@ export function createAvatar(containerEl, { log } = {}) {
     }
   }
 
-  function dispose() {
-    ro && ro.disconnect();
-    try {
-      app && app.destroy(true, { children: true });
-    } catch (e) {
-      log && log('освобождение ресурсов не удалось: ' + e.message);
-    }
-    app = null;
-    model = null;
-    ready = false;
-    ro = null;
-  }
-
   return {
     init,
     playMotion,
     setExpression,
-    dispose,
+    dispose: teardown,
     get ready() { return ready; },
   };
 }
