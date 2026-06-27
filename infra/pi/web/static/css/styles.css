@@ -28,14 +28,21 @@
   .badge.err { background: #2c1416; border-color: #5b2327; color: #f3a3a3; }
   .badge.idle { background: #1b2330; }
   main { flex: 1; display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
-  aside { border-right: 1px solid #222a35; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+  aside { border-right: 1px solid #222a35; padding: 16px; display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
+  .stage { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  #avatar {
+    flex: 1 1 auto; min-height: 0; margin: 16px 16px 0;
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    border: 1px dashed #2f3b4a; border-radius: 12px; background: #0c1118;
+  }
+  #avatar .avatar-hint { color: #5b6675; font-size: 13px; line-height: 1.5; }
   .panel { background: #131a24; border: 1px solid #222a35; border-radius: 10px; padding: 12px 14px; }
   .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #8b97a8; margin: 0 0 8px; }
   .metric { font-size: 22px; font-weight: 700; }
   .metric small { font-size: 12px; font-weight: 400; color: #8b97a8; }
   .vu { height: 12px; background: #0c1118; border-radius: 6px; overflow: hidden; border: 1px solid #222a35; }
   .vu > div { height: 100%; width: 0%; background: linear-gradient(90deg,#22c55e,#eab308,#ef4444); transition: width .06s linear; }
-  #transcript { padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  #transcript { flex: 0 0 40%; min-height: 0; padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
   .msg { max-width: 80%; padding: 9px 13px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
   .msg.user { align-self: flex-end; background: #1d3a5f; border-bottom-right-radius: 3px; }
   .msg.agent { align-self: flex-start; background: #1b2330; border-bottom-left-radius: 3px; }
