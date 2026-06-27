@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Callable
 
 from livekit.agents import NOT_GIVEN, Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.agents import metrics as agent_metrics
@@ -51,6 +52,7 @@ from health import (
     check_tts_health,
 )
 from hermes_tasks import UI_TOPIC
+from motion_events import DEFAULT_EMOTION, EmotionTagStripper, motion_event_json
 from stt_plugin import DesktopSTT
 from tts_plugin import DesktopTTS
 from worker_tools import (
@@ -74,13 +76,60 @@ class GreetingAgent(Agent):
     present; RoomIO delivers the audio to the connected participant.
     """
 
-    def __init__(self, *, instructions: str, tools: list, greeting: str) -> None:
+    def __init__(
+        self,
+        *,
+        instructions: str,
+        tools: list,
+        greeting: str,
+        publish_motion: Callable[[bytes], None] | None = None,
+    ) -> None:
         super().__init__(instructions=instructions, tools=tools)
         self._greeting = greeting
+        # Authoritative motion publisher (ADR-0009): emits motion/expression
+        # events on the voiceagent data channel. None disables publishing.
+        self._publish_motion = publish_motion
+        # Current expression, parsed from inline LLM emotion tags in llm_node;
+        # the state-change hook in the entrypoint pairs it with the motion state.
+        self.current_emotion = DEFAULT_EMOTION
 
     async def on_enter(self) -> None:
         log.info("Agent entered session; speaking greeting.")
         self.session.say(self._greeting)
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        """Strip inline emotion tags from the LLM stream, driving expressions.
+
+        The LLM emits inline ``[emotion:xxx]`` tags in its reply (ADR-0009). They
+        must never reach TTS or the transcript, so this override runs every text
+        delta through EmotionTagStripper: complete tags are removed and each parsed
+        emotion both updates ``self.current_emotion`` and publishes a "speaking"
+        motion event. Non-text chunks (tool calls) pass through untouched.
+        """
+        self.current_emotion = DEFAULT_EMOTION
+
+        def _on_emotion(emotion: str) -> None:
+            self.current_emotion = emotion
+            if self._publish_motion:
+                self._publish_motion(motion_event_json("speaking", emotion))
+
+        stripper = EmotionTagStripper(on_emotion=_on_emotion)
+        async for chunk in super().llm_node(chat_ctx, tools, model_settings):
+            # Only transform text deltas; pass tool-call / non-text chunks through
+            # untouched (they have no .delta.content to strip).
+            delta = getattr(chunk, "delta", None)
+            if delta is not None and getattr(delta, "content", None):
+                cleaned = stripper.feed(delta.content)
+                if cleaned:
+                    delta.content = cleaned
+                    yield chunk
+                # else: fully-consumed chunk (held back / all tag) -> drop it
+            else:
+                yield chunk
+        # Emit any text held back at end-of-stream (a dangling partial tag).
+        tail = stripper.flush()
+        if tail:
+            yield tail
 
 
 def _load_text_file(path: Path, *, what: str, required: bool = True) -> str | None:
@@ -172,6 +221,13 @@ async def entrypoint(ctx: JobContext) -> None:
         )
     )
 
+    # Authoritative motion-event publisher (ADR-0009): the agent is the single
+    # source of truth for the avatar's motion state. State changes (below) and
+    # inline-emotion parsing (GreetingAgent.llm_node) both publish through this on
+    # the same UI_TOPIC data channel the frontend already consumes.
+    def publish_motion(payload: bytes) -> None:
+        ctx.room.local_participant.publish_data(payload, reliable=True, topic=UI_TOPIC)
+
     # Full STT → LLM → TTS session with local VAD; turn_detection="vad" uses the
     # loaded Silero VAD to bound user turns. The LLM is the local LiteLLM proxy
     # spoken to via the OpenAI-compatible plugin (base_url must carry the /v1
@@ -231,6 +287,14 @@ async def entrypoint(ctx: JobContext) -> None:
         elif isinstance(m, agent_metrics.TTSMetrics):
             log.info("first-audio-latency: TTS ttfb=%.3fs", m.ttfb)
 
+    # Authoritative motion source (ADR-0009): the framework's agent-state changes
+    # (initializing/listening/thinking/speaking) drive the avatar's motion state.
+    # The emotion is the latest expression parsed from the inline LLM tags in
+    # llm_node, so each motion event carries the current state + expression.
+    @session.on("agent_state_changed")
+    def _on_agent_state(ev) -> None:
+        publish_motion(motion_event_json(ev.new_state, agent.current_emotion))
+
     # --- Diagnostics for the "transcript stops on long output" bug (issue under
     # investigation). These are cheap, high-signal hooks: which conversation items
     # actually get committed (and their length), and a loud log if the session closes
@@ -255,12 +319,14 @@ async def entrypoint(ctx: JobContext) -> None:
     # though the participant was present and its mic was already being read, so
     # the greeting never played. on_enter fires once the agent is active in the
     # session; RoomIO routes the audio to the connected participant.
+    agent = GreetingAgent(
+        instructions=instructions,
+        tools=[delegate_to_hermes, cancel_hermes_tasks, list_hermes_tasks, run_command],
+        greeting=cfg.agent_greeting,
+        publish_motion=publish_motion,
+    )
     await session.start(
-        agent=GreetingAgent(
-            instructions=instructions,
-            tools=[delegate_to_hermes, cancel_hermes_tasks, list_hermes_tasks, run_command],
-            greeting=cfg.agent_greeting,
-        ),
+        agent=agent,
         room=ctx.room,
     )
     log.info("Session started; greeting on agent enter, then STT → LLM → TTS loop.")
