@@ -4,10 +4,14 @@
 export function createTranscript(containerEl, { isLocal, onLatency, log }) {
   const lines = new Map();          // segment/stream id -> {el, textEl}
   let lastUserFinalAt = null;       // performance.now() when user finished speaking
+  let emptyHintRemoved = false;     // query/remove the .empty hint at most once
 
   function renderLine(key, identity, text, isFinal) {
-    const hint = containerEl.querySelector('.empty');
-    if (hint) hint.remove();
+    if (!emptyHintRemoved) {
+      const hint = containerEl.querySelector('.empty');
+      if (hint) hint.remove();
+      emptyHintRemoved = true;
+    }
     const mine = isLocal(identity);
     let line = lines.get(key);
     if (!line) {
@@ -75,6 +79,7 @@ export function createTranscript(containerEl, { isLocal, onLatency, log }) {
   function reset() {
     lines.clear();
     lastUserFinalAt = null;
+    emptyHintRemoved = false;
   }
 
   return { wire, reset };

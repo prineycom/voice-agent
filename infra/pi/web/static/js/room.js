@@ -4,6 +4,8 @@
 export function createRoomController({ log, onConn, onError }) {
   let room = null;
   let myIdentity = null;
+  // room.js is the single source of truth for `muted`; vu.js holds only a cache
+  // written exclusively via vu.setMuted(...) calls from here.
   let muted = false;
   let hooks = null;   // the opts passed to connect(); reused by onDisconnected/toggleMute
 
@@ -23,6 +25,8 @@ export function createRoomController({ log, onConn, onError }) {
 
       const { Room, RoomEvent, Track } = window.LivekitClient;
       room = new Room({ adaptiveStream: true, dynacast: true });
+      muted = false;
+      opts.vu.setMuted(false);  // sync the vu cache to room.js's authoritative state
       opts.transcript.wire(room);
       opts.ops.wire(room);
       opts.ops.startTick();  // live-tick the running-task seconds
@@ -61,12 +65,17 @@ export function createRoomController({ log, onConn, onError }) {
     } catch (e) {
       log('ОШИБКА: ' + e.message);
       onConn('ошибка', 'err');
+      opts.ops.stopTick();  // the 1s interval was started before the failure
+      opts.ops.reset();
+      room = null;          // discard the half-built room
       onError(e);
     }
   }
 
   function onDisconnected() {
     onConn('отключено', 'idle');
+    muted = false;           // a fresh connection must start unmuted
+    hooks.vu.setMuted(false);
     hooks.onAgentState(null);
     hooks.onMicInactive();   // mic label -> inactive, VU bar -> 0%
     hooks.vu.stop();
@@ -74,6 +83,7 @@ export function createRoomController({ log, onConn, onError }) {
     hooks.ops.reset();
     hooks.transcript.reset();
     hooks.setMuteEnabled(false);
+    hooks.resetMuteUI();     // reset the mute button label to its default
     hooks.onDisconnectedUI();
   }
 

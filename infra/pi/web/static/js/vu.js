@@ -1,5 +1,6 @@
 // VU meter: drives a bar element's width from the live peak of a mic track.
-// Holds its own AudioContext / RAF handle and a muted flag (muted -> 0%).
+// Holds its own AudioContext / RAF handle. The `muted` flag (muted -> 0%) is a
+// cache only — room.js owns mute state and drives it via setMuted(...).
 // Optional `log` mirrors the original harness's failure logging verbatim.
 export function createVuMeter(barEl, { log } = {}) {
   let muted = false;

@@ -63,6 +63,7 @@ const hooks = {
   onMicActive() { micLabelEl.textContent = 'активен'; },
   onMicInactive() { micLabelEl.textContent = 'не активен'; vuBarEl.style.width = '0%'; },
   setMuteEnabled(enabled) { muteBtn.disabled = !enabled; },
+  resetMuteUI() { muteBtn.textContent = '🔇 Mute'; micLabelEl.textContent = 'не активен'; },
   transcript,
   ops,
   vu,
