@@ -90,7 +90,11 @@ class DesktopTTS(tts.TTS):
         if ws is None:
             return
         try:
-            await ws.close()
+            # Bound the close handshake: on barge-in the recv task is already
+            # cancelled, so if the server is mid-send the graceful close would
+            # otherwise wait the full websockets close-timeout (~10s). Cap it so
+            # interruption stays responsive — we forget the socket regardless.
+            await asyncio.wait_for(ws.close(), timeout=2.0)
         except Exception:  # noqa: BLE001 — best-effort teardown, ignore
             pass
 
