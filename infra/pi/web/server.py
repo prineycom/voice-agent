@@ -13,6 +13,7 @@ Routes:
     GET /                      -> index.html
     GET /token?identity=<name> -> {"token": "...", "url": "wss://..."}
     GET /healthz              -> "ok"
+    GET /static/...           -> static asset
 
 The public WSS URL handed to the browser is LIVEKIT_WS_URL (the tailscale-serve
 HTTPS endpoint in front of LiveKit), NOT the internal ws://localhost:7880 the
@@ -32,8 +33,17 @@ from livekit.api import AccessToken, VideoGrants
 
 HERE = Path(__file__).resolve().parent
 INDEX_HTML = HERE / "index.html"
+STATIC_ROOT = HERE / "static"
 # The Agent Worker's .env is the single source of truth for LiveKit creds.
 AGENT_ENV = HERE.parent / "agent" / ".env"
+
+# Content types for static assets, keyed by file suffix.
+_STATIC_CONTENT_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+}
 
 ROOM = os.environ.get("LIVEKIT_ROOM", "test")
 BIND_HOST = os.environ.get("WEB_BIND_HOST", "127.0.0.1")
@@ -142,6 +152,19 @@ class Handler(BaseHTTPRequestHandler):
                 json.dumps(payload).encode(),
                 "application/json; charset=utf-8",
             )
+            return
+
+        if route.startswith("/static/"):
+            rel = route[len("/static/") :]
+            target = (STATIC_ROOT / rel).resolve()
+            # Containment check: reject paths that escape STATIC_ROOT (traversal).
+            if not target.is_relative_to(STATIC_ROOT.resolve()) or not target.is_file():
+                self._send(404, b"not found", "text/plain; charset=utf-8")
+                return
+            content_type = _STATIC_CONTENT_TYPES.get(
+                target.suffix, "application/octet-stream"
+            )
+            self._send(200, target.read_bytes(), content_type)
             return
 
         self._send(404, b"not found", "text/plain; charset=utf-8")
