@@ -1,6 +1,6 @@
 // Background-operations + tool-call visualization driven by LiveKit data
 // messages on the `voiceagent` topic.
-export function createOps(opsEl, toolfeedEl, { log }) {
+export function createOps(opsEl, toolfeedEl, { log, onMotion }) {
   let opsState = { running: [], queued: [] };  // last task snapshot
   let opsBase = 0;                  // performance.now() when the snapshot arrived (for live elapsed)
   let opsTick = null;               // interval id for the live elapsed counter
@@ -14,6 +14,7 @@ export function createOps(opsEl, toolfeedEl, { log }) {
       try { evt = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
       if (evt.type === 'tasks') renderOps(evt);
       else if (evt.type === 'event') addToolEvent(evt);
+      else if (evt.type === 'motion') { if (onMotion) onMotion(evt); }
     });
   }
 

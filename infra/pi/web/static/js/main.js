@@ -58,7 +58,7 @@ const transcript = createTranscript(transcriptEl, {
   onLatency: (ms) => { latencyEl.textContent = ms; },
   log: logger.log,
 });
-const ops = createOps(opsEl, toolfeedEl, { log: logger.log });
+const ops = createOps(opsEl, toolfeedEl, { log: logger.log, onMotion: (evt) => motion.applyMotionEvent(evt) });
 
 // Hook set room.js destructures from connect(opts) and reuses on disconnect.
 const hooks = {

@@ -9,6 +9,8 @@ export function createMotionController(avatar) {
     speaking:  { group: 'TapBody', index: 2, expression: 'Smile' },
   };
 
+  const EMOTION_EXPR = { neutral: 'Normal', happy: 'Smile', sad: 'Sad', surprised: 'Surprised', thinking: 'Blushing' };
+
   function resolve(state) {
     const key = String(state).toLowerCase();
     if (key === 'listening' || key === 'thinking' || key === 'speaking') return key;
@@ -16,8 +18,10 @@ export function createMotionController(avatar) {
   }
 
   let current = null;
+  let motionEventActive = false;
 
   function setState(state) {
+    if (motionEventActive) return;
     const key = resolve(state);
     if (key === current) return;
     current = key;
@@ -26,5 +30,17 @@ export function createMotionController(avatar) {
     avatar.setExpression(entry.expression);
   }
 
-  return { setState };
+  // Authoritative agent-published motion event: takes precedence over the
+  // lk.agent.state-derived motion. Always applies both motion + expression so
+  // an emotion-only change (same state, new emotion) still updates the face.
+  function applyMotionEvent(evt) {
+    const key = resolve(evt && evt.state);
+    motionEventActive = true;
+    current = key;
+    const entry = table[key];
+    avatar.playMotion(entry.group, entry.index);
+    avatar.setExpression(EMOTION_EXPR[String(evt && evt.emotion).toLowerCase()] || 'Normal');
+  }
+
+  return { setState, applyMotionEvent };
 }

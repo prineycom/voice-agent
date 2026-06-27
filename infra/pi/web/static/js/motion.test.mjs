@@ -96,5 +96,38 @@ function newAvatar() {
   eq(avatar.calls, [['motion', 'Idle', 0], ['exp', 'Normal']], 'unknown state maps to Idle/0 + Normal');
 }
 
+// 6. applyMotionEvent drives motion (from table) + expression (from emotion map)
+{
+  const avatar = newAvatar();
+  const c = createMotionController(avatar);
+  c.applyMotionEvent({ state: 'speaking', emotion: 'happy' });
+  eq(avatar.calls, [['motion', 'TapBody', 2], ['exp', 'Smile']], 'motion event speaking/happy -> TapBody/2 + Smile');
+}
+
+// 7. applyMotionEvent state -> table motion, emotion -> mapped expression (independent of table expression)
+{
+  const avatar = newAvatar();
+  const c = createMotionController(avatar);
+  c.applyMotionEvent({ state: 'thinking', emotion: 'surprised' });
+  eq(avatar.calls, [['motion', 'TapBody', 0], ['exp', 'Surprised']], 'motion event thinking/surprised -> TapBody/0 + Surprised');
+}
+
+// 8. unknown emotion falls back to Normal
+{
+  const avatar = newAvatar();
+  const c = createMotionController(avatar);
+  c.applyMotionEvent({ state: 'speaking', emotion: 'bewildered' });
+  eq(avatar.calls, [['motion', 'TapBody', 2], ['exp', 'Normal']], 'unknown emotion falls back to Normal');
+}
+
+// 9. precedence: once a motion event arrives, setState is ignored
+{
+  const avatar = newAvatar();
+  const c = createMotionController(avatar);
+  c.applyMotionEvent({ state: 'speaking', emotion: 'happy' });
+  c.setState('listening');
+  eq(avatar.calls, [['motion', 'TapBody', 2], ['exp', 'Smile']], 'setState ignored after a motion event (precedence)');
+}
+
 console.log(`motion.js: all ${assertions} assertions passed`);
 process.exit(0);
