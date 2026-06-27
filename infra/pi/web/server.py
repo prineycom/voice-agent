@@ -43,6 +43,7 @@ _STATIC_CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".html": "text/html; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".png": "image/png",
 }
 
 ROOM = os.environ.get("LIVEKIT_ROOM", "test")
