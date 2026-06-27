@@ -42,7 +42,8 @@
   </aside>
   <div class="stage">
     <div id="avatar">
-      <span class="avatar-hint">Live2D-аватар появится в слайсе 2</span>
+      <span class="avatar-hint" id="avatarHint">загрузка аватара…</span>
+      <small class="live2d-credit">This content uses sample data owned and copyrighted by Live2D Inc.</small>
     </div>
     <section id="transcript">
       <div class="empty" id="emptyHint">Нажми <b>Connect</b> и разреши доступ к микрофону.<br>Агент поздоровается первым.</div>
@@ -51,6 +52,9 @@
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js"></script>
+<script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
 <script type="module" src="static/js/main.js"></script>
 </body>
 </html>

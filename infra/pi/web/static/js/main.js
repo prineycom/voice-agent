@@ -7,6 +7,8 @@ import { createVuMeter } from './vu.js';
 import { createTranscript } from './transcript.js';
 import { createOps } from './ops.js';
 import { createRoomController } from './room.js';
+import { createAvatar } from './avatar.js';
+import { createMotionController } from './motion.js';
 
 const connectBtn = document.getElementById('connectBtn');
 const muteBtn = document.getElementById('muteBtn');
@@ -23,6 +25,18 @@ const toolfeedEl = document.getElementById('toolfeed');
 const logger = createLog(logEl);
 const agentState = createAgentState(agentStateEl);
 const vu = createVuMeter(vuBarEl, { log: logger.log });
+
+const avatarEl = document.getElementById('avatar');
+const avatar = createAvatar(avatarEl, { log: logger.log });
+const motion = createMotionController(avatar);
+
+avatar.init().then((ok) => {
+  if (ok) {
+    const h = document.getElementById('avatarHint');
+    if (h) h.remove();
+    motion.setState(null);
+  }
+}).catch((e) => logger.log('аватар: ' + e.message));
 
 function onConn(text, cls) {
   connStateEl.textContent = text;
@@ -57,7 +71,7 @@ const hooks = {
     connectBtn.disabled = false;
     connectBtn.onclick = doConnect;
   },
-  onAgentState: agentState.set,
+  onAgentState: (state) => { agentState.set(state); motion.setState(state); },
   watchAgentParticipant: agentState.watch,
   attachAudio: (el) => document.body.appendChild(el),
   onMicActive() { micLabelEl.textContent = 'активен'; },
