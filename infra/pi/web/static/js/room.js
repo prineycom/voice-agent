@@ -38,6 +38,7 @@ export function createRoomController({ log, onConn, onError }) {
           const el = track.attach();
           el.autoplay = true;
           opts.attachAudio(el);
+          if (opts.lipsync) opts.lipsync.start(track.mediaStreamTrack);
           log('подписка на аудио агента (' + participant.identity + ')');
         }
       });
@@ -79,6 +80,7 @@ export function createRoomController({ log, onConn, onError }) {
     hooks.onAgentState(null);
     hooks.onMicInactive();   // mic label -> inactive, VU bar -> 0%
     hooks.vu.stop();
+    if (hooks.lipsync) hooks.lipsync.stop();
     hooks.ops.stopTick();
     hooks.ops.reset();
     hooks.transcript.reset();

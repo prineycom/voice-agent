@@ -9,6 +9,7 @@ import { createOps } from './ops.js';
 import { createRoomController } from './room.js';
 import { createAvatar } from './avatar.js';
 import { createMotionController } from './motion.js';
+import { createLipSync } from './lipsync.js';
 
 const connectBtn = document.getElementById('connectBtn');
 const muteBtn = document.getElementById('muteBtn');
@@ -29,6 +30,7 @@ const vu = createVuMeter(vuBarEl, { log: logger.log });
 const avatarEl = document.getElementById('avatar');
 const avatar = createAvatar(avatarEl, { log: logger.log });
 const motion = createMotionController(avatar);
+const lipsync = createLipSync(avatar, { log: logger.log });
 
 let lastAgentState = null;
 
@@ -85,6 +87,7 @@ const hooks = {
   transcript,
   ops,
   vu,
+  lipsync,
 };
 
 function doConnect() {
