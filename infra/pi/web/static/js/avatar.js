@@ -8,6 +8,7 @@ export function createAvatar(containerEl, { log } = {}) {
   let model = null;
   let ready = false;
   let ro = null;
+  let mouthOpen = 0;
 
   function teardown() {
     ro && ro.disconnect();
@@ -24,6 +25,7 @@ export function createAvatar(containerEl, { log } = {}) {
     model = null;
     ro = null;
     ready = false;
+    mouthOpen = 0;
   }
 
   async function init() {
@@ -60,6 +62,16 @@ export function createAvatar(containerEl, { log } = {}) {
     app.stage.addChild(model);
     model.anchor.set(0.5, 0.5);
 
+    // Volume-driven lip-sync. `beforeModelUpdate` fires after the motion/physics
+    // pass and just before the frame commits, so writing an absolute value here
+    // makes us the last writer and overrides the idle motion's mouth keyframes.
+    // (setParameterValueById is absolute; addParameterValueById would be additive.)
+    model.internalModel.on('beforeModelUpdate', () => {
+      try {
+        model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpen);
+      } catch (e) { /* unknown param id silently no-ops */ }
+    });
+
     const layout = () => {
       const { width, height } = app.renderer.screen;
       const scale = Math.min(width / model.internalModel.width, height / model.internalModel.height) * 0.9;
@@ -85,6 +97,11 @@ export function createAvatar(containerEl, { log } = {}) {
     }
   }
 
+  // External lip-sync driver pushes a 0..1 mouth-open value applied every frame.
+  function setMouthOpen(v) {
+    mouthOpen = Math.max(0, Math.min(1, Number(v) || 0));
+  }
+
   function setExpression(name) {
     if (!ready || !model) return;
     try {
@@ -98,6 +115,7 @@ export function createAvatar(containerEl, { log } = {}) {
     init,
     playMotion,
     setExpression,
+    setMouthOpen,
     dispose: teardown,
     get ready() { return ready; },
   };
