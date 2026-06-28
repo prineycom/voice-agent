@@ -38,6 +38,10 @@ export function createRoomController({ log, onConn, onError }) {
           const el = track.attach();
           el.autoplay = true;
           opts.attachAudio(el);
+          // Single-agent room: the only remote audio track is the agent's, so we
+          // drive lip-sync from whatever audio track we subscribe to (the mic is
+          // local and never subscribed). A multi-participant room would need a
+          // participant/source filter here.
           if (opts.lipsync) opts.lipsync.start(track.mediaStreamTrack);
           log('подписка на аудио агента (' + participant.identity + ')');
         }

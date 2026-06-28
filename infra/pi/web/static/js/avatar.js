@@ -66,6 +66,9 @@ export function createAvatar(containerEl, { log } = {}) {
     // pass and just before the frame commits, so writing an absolute value here
     // makes us the last writer and overrides the idle motion's mouth keyframes.
     // (setParameterValueById is absolute; addParameterValueById would be additive.)
+    // Deliberate: this also pins the mouth to `mouthOpen` (0 when no lip-sync is
+    // active), suppressing the idle motion's baked mouth movement so a silent
+    // agent reads as closed-mouthed rather than appearing to talk silently.
     model.internalModel.on('beforeModelUpdate', () => {
       try {
         model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpen);
