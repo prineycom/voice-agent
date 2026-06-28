@@ -14,6 +14,9 @@ export function createLipSync(avatar, { log } = {}) {
   let cur = 0;
 
   function start(mediaStreamTrack) {
+    // Idempotent: tear down any prior stream first so a second TrackSubscribed
+    // (e.g. the agent republishing audio) can't leak an AudioContext.
+    if (audioCtx || raf) stop();
     try {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const src = audioCtx.createMediaStreamSource(new MediaStream([mediaStreamTrack]));
