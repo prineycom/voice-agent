@@ -129,5 +129,29 @@ function newAvatar() {
   eq(avatar.calls, [['motion', 'TapBody', 2], ['exp', 'Smile']], 'setState ignored after a motion event (precedence)');
 }
 
+// 10. emotion-only change (same state, new emotion) updates expression but does not restart motion
+{
+  const avatar = newAvatar();
+  const c = createMotionController(avatar);
+  c.applyMotionEvent({ state: 'speaking', emotion: 'happy' });
+  c.applyMotionEvent({ state: 'speaking', emotion: 'sad' });
+  eq(avatar.calls, [
+    ['motion', 'TapBody', 2], ['exp', 'Smile'],
+    ['exp', 'Sad'],
+  ], 'same state with a new emotion updates expression only (no motion restart)');
+}
+
+// 11. an actual state change re-triggers the motion
+{
+  const avatar = newAvatar();
+  const c = createMotionController(avatar);
+  c.applyMotionEvent({ state: 'speaking', emotion: 'happy' });
+  c.applyMotionEvent({ state: 'thinking', emotion: 'happy' });
+  eq(avatar.calls, [
+    ['motion', 'TapBody', 2], ['exp', 'Smile'],
+    ['motion', 'TapBody', 0], ['exp', 'Smile'],
+  ], 'a new state restarts the motion and updates expression');
+}
+
 console.log(`motion.js: all ${assertions} assertions passed`);
 process.exit(0);

@@ -35,6 +35,7 @@ See the README (Task 8) for the on-Pi smoke test.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Callable
@@ -92,6 +93,10 @@ class GreetingAgent(Agent):
         # Current expression, parsed from inline LLM emotion tags in llm_node;
         # the state-change hook in the entrypoint pairs it with the motion state.
         self.current_emotion = DEFAULT_EMOTION
+        # Current motion state, mirrored from the framework's agent_state_changed
+        # hook. Emotion-driven events reuse it so a tag parsed mid-generation (often
+        # while still "thinking") doesn't flip the avatar to "speaking" prematurely.
+        self.current_state = "initializing"
 
     async def on_enter(self) -> None:
         log.info("Agent entered session; speaking greeting.")
@@ -111,7 +116,10 @@ class GreetingAgent(Agent):
         def _on_emotion(emotion: str) -> None:
             self.current_emotion = emotion
             if self._publish_motion:
-                self._publish_motion(motion_event_json("speaking", emotion))
+                # Pair the expression with the agent's *current* motion state, not a
+                # literal "speaking": tags are parsed during generation, often before
+                # TTS begins, so hardcoding "speaking" would flip the pose too early.
+                self._publish_motion(motion_event_json(self.current_state, emotion))
 
         stripper = EmotionTagStripper(on_emotion=_on_emotion)
         async for chunk in super().llm_node(chat_ctx, tools, model_settings):
@@ -120,10 +128,13 @@ class GreetingAgent(Agent):
             delta = getattr(chunk, "delta", None)
             if delta is not None and getattr(delta, "content", None):
                 cleaned = stripper.feed(delta.content)
-                if cleaned:
-                    delta.content = cleaned
-                    yield chunk
-                # else: fully-consumed chunk (held back / all tag) -> drop it
+                # Drop the chunk only if it's now empty AND carries no other payload:
+                # a delta can hold a tool_call alongside its text, and dropping the
+                # whole chunk would silently lose that co-located tool call.
+                if not cleaned and not getattr(delta, "tool_calls", None):
+                    continue  # fully-consumed text (held back / all tag) -> drop it
+                delta.content = cleaned
+                yield chunk
             else:
                 yield chunk
         # Emit any text held back at end-of-stream (a dangling partial tag).
@@ -225,8 +236,19 @@ async def entrypoint(ctx: JobContext) -> None:
     # source of truth for the avatar's motion state. State changes (below) and
     # inline-emotion parsing (GreetingAgent.llm_node) both publish through this on
     # the same UI_TOPIC data channel the frontend already consumes.
+    # publish_data is a coroutine; these call sites are sync event-loop callbacks,
+    # so schedule it as a task (awaiting inline isn't possible) and swallow any
+    # failure inside the task so a dropped publish can never abort the turn.
     def publish_motion(payload: bytes) -> None:
-        ctx.room.local_participant.publish_data(payload, reliable=True, topic=UI_TOPIC)
+        async def _send() -> None:
+            try:
+                await ctx.room.local_participant.publish_data(
+                    payload, reliable=True, topic=UI_TOPIC
+                )
+            except Exception:
+                log.exception("failed to publish motion event")
+
+        asyncio.create_task(_send())
 
     # Full STT → LLM → TTS session with local VAD; turn_detection="vad" uses the
     # loaded Silero VAD to bound user turns. The LLM is the local LiteLLM proxy
@@ -293,6 +315,9 @@ async def entrypoint(ctx: JobContext) -> None:
     # llm_node, so each motion event carries the current state + expression.
     @session.on("agent_state_changed")
     def _on_agent_state(ev) -> None:
+        # Keep the agent's tracked state current first, so emotion-driven events
+        # parsed in llm_node pair their expression with the right motion state.
+        agent.current_state = ev.new_state
         publish_motion(motion_event_json(ev.new_state, agent.current_emotion))
 
     # --- Diagnostics for the "transcript stops on long output" bug (issue under

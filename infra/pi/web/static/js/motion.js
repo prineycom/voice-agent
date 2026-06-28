@@ -31,15 +31,19 @@ export function createMotionController(avatar) {
   }
 
   // Authoritative agent-published motion event: takes precedence over the
-  // lk.agent.state-derived motion. Always applies both motion + expression so
-  // an emotion-only change (same state, new emotion) still updates the face.
+  // lk.agent.state-derived motion. The expression always updates (emotion-only
+  // changes), but the motion only restarts on an actual state change — the agent
+  // emits a fresh event per inline emotion tag during one reply, so restarting
+  // the same motion every time would stutter the animation back to frame 0.
   function applyMotionEvent(evt) {
     const key = resolve(evt && evt.state);
-    motionEventActive = true;
-    current = key;
     const entry = table[key];
-    avatar.playMotion(entry.group, entry.index);
+    if (key !== current) {
+      current = key;
+      avatar.playMotion(entry.group, entry.index);
+    }
     avatar.setExpression(EMOTION_EXPR[String(evt && evt.emotion).toLowerCase()] || 'Normal');
+    motionEventActive = true;
   }
 
   return { setState, applyMotionEvent };
