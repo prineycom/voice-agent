@@ -22,6 +22,9 @@ const transcriptEl = document.getElementById('transcript');
 const logEl = document.getElementById('log');
 const opsEl = document.getElementById('ops');
 const toolfeedEl = document.getElementById('toolfeed');
+const sidebarBtn = document.getElementById('sidebarBtn');
+const asideEl = document.querySelector('aside');
+const scrimEl = document.getElementById('scrim');
 
 const logger = createLog(logEl);
 const agentState = createAgentState(agentStateEl);
@@ -95,6 +98,14 @@ function doConnect() {
 }
 
 connectBtn.onclick = doConnect;
+
+function setSidebar(open) {
+  asideEl.classList.toggle('open', open);
+  scrimEl.classList.toggle('open', open);
+  sidebarBtn.setAttribute('aria-expanded', String(open));
+}
+sidebarBtn.onclick = () => setSidebar(!asideEl.classList.contains('open'));
+scrimEl.onclick = () => setSidebar(false);
 
 muteBtn.onclick = async () => {
   const muted = await room.toggleMute();
