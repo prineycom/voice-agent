@@ -14,6 +14,12 @@ rtc:
   # Private network only (LAN + Tailscale) per ADR-0005: gather host candidates on
   # all interfaces and let the client pick a reachable one. No external IP, no TURN.
   use_external_ip: false
+  # Advertise the Pi's Tailscale IP as the media ICE candidate. Access is tailnet-only
+  # (`tailscale serve`), and LiveKit does not auto-gather the tailscale0 /32 VPN
+  # interface — without this, remote clients (e.g. an iPhone on cellular) only see
+  # docker-bridge + public-srflx candidates, ICE fails, and audio never connects even
+  # though signaling succeeds. Pinning node_ip routes media over the Tailscale tunnel.
+  node_ip: 100.108.52.92
 
 # Single-node deployment — no Redis block.
 
