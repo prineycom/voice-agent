@@ -366,6 +366,7 @@ if __name__ == "__main__":
     cfg = load_config()
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
+        num_idle_processes=1,
         ws_url=cfg.livekit_url,
         api_key=cfg.livekit_api_key,
         api_secret=cfg.livekit_api_secret,
