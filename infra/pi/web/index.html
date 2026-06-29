@@ -8,9 +8,14 @@
 </head>
 <body>
 <header>
+  <button id="sidebarBtn" aria-label="Меню" aria-expanded="false">☰</button>
   <h1>🎙️ Voice Agent — тест-стенд</h1>
   <span id="connState" class="badge idle">отключено</span>
   <span id="agentState" class="badge idle">агент: —</span>
+  <div class="mic">
+    <div class="vu"><div id="vuBar"></div></div>
+    <small id="micLabel" style="color:#8b97a8">не активен</small>
+  </div>
   <span class="grow"></span>
   <button id="muteBtn" disabled>🔇 Mute</button>
   <button id="connectBtn" class="primary">Connect</button>
@@ -21,11 +26,6 @@
       <h2>Латенси (voice-to-voice)</h2>
       <div class="metric"><span id="latency">—</span> <small>мс</small></div>
       <small style="color:#5b6675">от конца твоей речи до ответа агента</small>
-    </div>
-    <div class="panel">
-      <h2>Микрофон</h2>
-      <div class="vu"><div id="vuBar"></div></div>
-      <div class="row" style="margin-top:8px"><small id="micLabel" style="color:#8b97a8">не активен</small></div>
     </div>
     <div class="panel">
       <h2>⚙️ Фоновые операции</h2>
@@ -49,6 +49,7 @@
       <div class="empty" id="emptyHint">Нажми <b>Connect</b> и разреши доступ к микрофону.<br>Агент поздоровается первым.</div>
     </section>
   </div>
+  <div id="scrim"></div>
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
