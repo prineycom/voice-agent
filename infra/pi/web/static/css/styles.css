@@ -51,6 +51,10 @@
   .metric small { font-size: 12px; font-weight: 400; color: #8b97a8; }
   .vu { height: 12px; background: #0c1118; border-radius: 6px; overflow: hidden; border: 1px solid #222a35; }
   .vu > div { height: 100%; width: 0%; background: linear-gradient(90deg,#22c55e,#eab308,#ef4444); transition: width .06s linear; }
+  .mic { display: flex; align-items: center; gap: 8px; }
+  header .vu { width: 90px; flex: 0 0 90px; }
+  #sidebarBtn { display: none; }
+  #scrim { display: none; }
   #transcript { flex: 0 0 40%; min-height: 0; padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
   .msg { max-width: 80%; padding: 9px 13px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
   .msg.user { align-self: flex-end; background: #1d3a5f; border-bottom-right-radius: 3px; }
