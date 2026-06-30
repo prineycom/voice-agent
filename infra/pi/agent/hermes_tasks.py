@@ -31,6 +31,10 @@ log = logging.getLogger("agent")
 
 UI_TOPIC = "voiceagent"  # LiveKit data topic the web UI subscribes to
 UI_FULL_OUTPUT_CAP = 4000  # chars of full Hermes output sent to the UI (data-msg size guard)
+# chars of a completed background result injected into the agent's chat context
+# so it can be referenced in later turns (larger than the TTS trim, bounded so a
+# wall of Hermes output never bloats the prompt).
+CONTEXT_RESULT_CAP = 2000
 # UI data is published lossy (decoupled from the transcript's reliable channel,
 # issue #23), so a datagram can be dropped on the Tailscale path. Re-send each
 # message after these delays (seconds, after the immediate first send) so the UI
@@ -372,6 +376,12 @@ class HermesTaskManager:
                 self._pending.clear()
                 if self._session is None:
                     return
+                # Persist the raw result into the chat context BEFORE speaking, so
+                # the agent can answer about it in later turns — and so it survives
+                # even if the proactive generate_reply below fails (the result is no
+                # longer carried only by the ephemeral `instructions=`). See #23 /
+                # "agent loses background results": instructions are not added to history.
+                await self._inject_results(batch)
                 instructions = self._build_delivery(batch)
                 handle = self._session.generate_reply(
                     instructions=instructions, allow_interruptions=True
@@ -421,6 +431,33 @@ class HermesTaskManager:
             and getattr(s, "user_state", "listening") != "speaking"
             and getattr(s, "current_speech", None) is None
         )
+
+    async def _inject_results(self, batch: list[tuple[str, bool, str]]) -> None:
+        """Durably append each finished result to the agent's chat context.
+
+        ``generate_reply(instructions=...)`` does NOT persist its instructions in
+        history, so a background result delivered only that way is forgotten the
+        moment the reply ends (the agent cannot answer "what did that task find?"
+        later). Writing the result as a system message into the live chat context
+        makes it durable and recallable across turns.
+        """
+        agent = getattr(self._session, "current_agent", None)
+        if agent is None or not hasattr(agent, "update_chat_ctx"):
+            return
+        try:
+            chat_ctx = agent.chat_ctx.copy()
+            for label, ok, text in batch:
+                status = "" if ok else " — ошибка"
+                body = " ".join(text.split())[:CONTEXT_RESULT_CAP]
+                chat_ctx.add_message(
+                    role="system",
+                    content=f"[Результат фоновой задачи «{label}»{status}]: {body}",
+                )
+            await agent.update_chat_ctx(chat_ctx)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("failed to inject hermes result into chat ctx: %r", e)
 
     def _build_delivery(self, batch: list[tuple[str, bool, str]]) -> str:
         """Build ONE generate_reply instruction for a batch of finished results."""

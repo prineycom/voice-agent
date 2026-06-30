@@ -45,6 +45,41 @@ class FakeSession:
         return FakeHandle()
 
 
+class FakeChatCtx:
+    """Minimal stand-in for llm.ChatContext (copy + add_message)."""
+
+    def __init__(self, messages=None):
+        self.messages = list(messages or [])
+
+    def copy(self):
+        return FakeChatCtx(self.messages)
+
+    def add_message(self, *, role, content, **kwargs):
+        self.messages.append((role, content))
+
+
+class FakeAgent:
+    """Stand-in for the live Agent: exposes a copyable chat_ctx + update_chat_ctx."""
+
+    def __init__(self):
+        self._ctx = FakeChatCtx()
+
+    @property
+    def chat_ctx(self):
+        return self._ctx
+
+    async def update_chat_ctx(self, chat_ctx, **kwargs):
+        self._ctx = chat_ctx
+
+
+class FakeSessionWithAgent(FakeSession):
+    """FakeSession that also exposes current_agent, for chat-context injection."""
+
+    def __init__(self):
+        super().__init__()
+        self.current_agent = FakeAgent()
+
+
 class FakeProc:
     """Controllable stand-in for asyncio.subprocess.Process.
 
@@ -402,6 +437,29 @@ async def test_publishes_ui_events_and_task_snapshot(monkeypatch):
     done = next(e for e in published if e.get("kind") == "done")
     assert "sunny, plus eighteen degrees" in done["full"]  # full, untrimmed
     assert len(done["summary"]) <= 11  # trimmed to output_limit (+ ellipsis)
+
+
+@pytest.mark.asyncio
+async def test_background_result_injected_into_chat_ctx(monkeypatch):
+    """A finished background result is written into the agent's chat context (not
+    just spoken via ephemeral generate_reply instructions) so it survives for
+    later turns — the 'agent forgets background results' fix."""
+    proc = FakeProc(stdout=b"the answer is 42\n")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
+
+    mgr = HermesTaskManager(task_timeout=10)
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    await mgr.delegate("посчитай ответ")
+    await mgr.join()
+    await asyncio.sleep(0.02)  # let the delivery worker inject + reply
+
+    msgs = session.current_agent.chat_ctx.messages
+    assert any("the answer is 42" in content for _role, content in msgs)
+    assert all(role == "system" for role, _content in msgs)
+    # and it is still spoken
+    assert any("the answer is 42" in r or "посчитай ответ" in r for r in session.replies)
 
 
 @pytest.mark.asyncio
