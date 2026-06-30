@@ -33,14 +33,42 @@ async def _check_health(
     service_name: str,
     error_cls: type[Exception],
     timeout: float = 5.0,
+    retries: int = 4,
+    retry_delay: float = 0.75,
 ) -> dict:
-    """GET a Desktop `/health` endpoint and apply the readiness gate.
+    """GET a Desktop `/health` endpoint and apply the readiness gate, with retries.
 
     Returns the parsed health dict on success (HTTP 200 + `model_loaded` true).
-    Raises ``error_cls`` with an actionable message for any failure: non-200,
-    falsy `model_loaded`, connection refused, timeout, or any other aiohttp
-    client error.
+    Retries up to ``retries`` times (``retry_delay`` seconds apart) before giving
+    up: the Desktop path is reached over a Tailscale direct link that can stall
+    for a few seconds when it has been idle, and a single transient timeout must
+    not abort the whole session. Raises ``error_cls`` only after every attempt
+    fails (non-200, falsy `model_loaded`, connection refused, timeout, or any
+    other aiohttp client error).
     """
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await _check_once(health_url, service_name, error_cls, timeout)
+        except error_cls as exc:
+            last_exc = exc
+            if attempt < retries:
+                log.warning(
+                    "%s health attempt %d/%d failed (%s); retrying in %.2fs",
+                    service_name, attempt, retries, exc, retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _check_once(
+    health_url: str,
+    service_name: str,
+    error_cls: type[Exception],
+    timeout: float,
+) -> dict:
+    """Single GET against a Desktop `/health` endpoint + readiness gate."""
     client_timeout = aiohttp.ClientTimeout(total=timeout)
     try:
         async with aiohttp.ClientSession(timeout=client_timeout) as session:
