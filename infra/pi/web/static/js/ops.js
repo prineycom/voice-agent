@@ -4,6 +4,10 @@ export function createOps(opsEl, toolfeedEl, { log, onMotion }) {
   let opsState = { running: [], queued: [] };  // last task snapshot
   let opsBase = 0;                  // performance.now() when the snapshot arrived (for live elapsed)
   let opsTick = null;               // interval id for the live elapsed counter
+  // Feed events arrive over the lossy data channel and the agent re-sends each a
+  // few times (see hermes_tasks.py) so a dropped datagram doesn't lose it; render
+  // each event id exactly once. Task snapshots are idempotent so they need no dedup.
+  const seenEvents = new Set();
 
   // --- Tool-calling / background-operations visualization (LiveKit data msgs) ---
   function wire(room) {
@@ -43,6 +47,10 @@ export function createOps(opsEl, toolfeedEl, { log, onMotion }) {
   }
 
   function addToolEvent(evt) {
+    if (evt.id != null) {
+      if (seenEvents.has(evt.id)) return;   // de-dup the lossy re-sends
+      seenEvents.add(evt.id);
+    }
     const empty = toolfeedEl.querySelector('.ops-empty');
     if (empty) empty.remove();
     const div = document.createElement('div');
@@ -72,6 +80,7 @@ export function createOps(opsEl, toolfeedEl, { log, onMotion }) {
 
   function resetOpsUI() {
     opsState = { running: [], queued: [] };
+    seenEvents.clear();
     drawOps();
     toolfeedEl.innerHTML = '<div class="ops-empty">пока пусто</div>';
   }

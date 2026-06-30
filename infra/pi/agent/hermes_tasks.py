@@ -31,6 +31,12 @@ log = logging.getLogger("agent")
 
 UI_TOPIC = "voiceagent"  # LiveKit data topic the web UI subscribes to
 UI_FULL_OUTPUT_CAP = 4000  # chars of full Hermes output sent to the UI (data-msg size guard)
+# UI data is published lossy (decoupled from the transcript's reliable channel,
+# issue #23), so a datagram can be dropped on the Tailscale path. Re-send each
+# message after these delays (seconds, after the immediate first send) so the UI
+# self-heals: task snapshots are re-read fresh each time and feed events carry an
+# id the client dedups on.
+_UI_RESEND_DELAYS = (0.5, 1.2)
 
 DEFAULT_MAX_CONCURRENT = 3
 DEFAULT_MAX_QUEUED = 5
@@ -96,6 +102,8 @@ class HermesTaskManager:
         self._pending: list[tuple[str, bool, str]] = []
         self._delivery_task: asyncio.Task | None = None
         self._delivering = False
+        self._event_seq = 0  # monotonic id for feed events (client dedups repeats)
+        self._ui_tasks: set[asyncio.Task] = set()  # in-flight UI (re)publish tasks
         # Set whenever nothing is running, queued, pending, or being delivered.
         self._idle = asyncio.Event()
         self._idle.set()
@@ -166,7 +174,7 @@ class HermesTaskManager:
         """
         self._queue.clear()
         self._pending.clear()
-        targets = list(self._tasks)
+        targets = list(self._tasks) + list(self._ui_tasks)
         if self._delivery_task is not None:
             targets.append(self._delivery_task)
         for task in targets:
@@ -225,20 +233,52 @@ class HermesTaskManager:
         self._emit_tasks()
 
     # -- internals: UI publishing ------------------------------------------
+    def _spawn(self, coro) -> None:
+        """Run a fire-and-forget UI publish task, tracked so shutdown can cancel it."""
+        task = asyncio.create_task(coro)
+        self._ui_tasks.add(task)
+        task.add_done_callback(self._ui_tasks.discard)
+
     def _emit(self, payload: dict) -> None:
         """Fire-and-forget publish a UI event (safe from sync or async context)."""
         if self._publish is None:
             return
-        asyncio.create_task(self._safe_publish(payload))
+        if payload.get("type") == "event":
+            # Append-only feed entry (delegated/done/error/cancelled): give it a
+            # stable id and send it a few times so a dropped lossy datagram does
+            # not lose the result; the client renders each id exactly once.
+            self._event_seq += 1
+            payload["id"] = f"e{self._event_seq}"
+            self._spawn(self._safe_publish(payload, sends=1 + len(_UI_RESEND_DELAYS)))
+        else:
+            self._spawn(self._safe_publish(payload, sends=1))
 
-    async def _safe_publish(self, payload: dict) -> None:
-        with contextlib.suppress(Exception):
-            await self._publish(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    async def _safe_publish(self, payload: dict, sends: int = 1) -> None:
+        # UI data is published lossy (see agent.py set_publisher) so a dropped
+        # message is expected and non-fatal; re-send `sends` times and log drops
+        # at debug only.
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        for i in range(sends):
+            if i:
+                await asyncio.sleep(_UI_RESEND_DELAYS[i - 1])
+            try:
+                await self._publish(data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.debug("UI publish dropped (%d bytes): %r", len(data), e)
 
     def _emit_tasks(self) -> None:
-        """Publish a snapshot of running + queued tasks for the live UI panel."""
+        """Publish the running + queued task snapshot now, then re-publish a couple
+        of *fresh* snapshots after a short delay. The snapshot is idempotent and
+        re-read each time, so a dropped lossy snapshot self-heals and a late
+        re-send can never resurrect an already-finished task."""
         if self._publish is None:
             return
+        self._publish_tasks_once()
+        self._spawn(self._resend_tasks())
+
+    def _publish_tasks_once(self) -> None:
         now = asyncio.get_event_loop().time()
         running = [
             {"label": label, "elapsed": round(now - self._started_at.get(task, now), 1)}
@@ -246,6 +286,13 @@ class HermesTaskManager:
         ]
         queued = [self._label(r) for r in self._queue]
         self._emit({"type": "tasks", "running": running, "queued": queued})
+
+    async def _resend_tasks(self) -> None:
+        for delay in _UI_RESEND_DELAYS:
+            await asyncio.sleep(delay)
+            if self._publish is None:
+                return
+            self._publish_tasks_once()
 
     def _update_idle(self) -> None:
         """Set the idle event iff there is no outstanding work of any kind."""

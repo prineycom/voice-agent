@@ -226,9 +226,18 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(hermes_manager.shutdown)
     # Stream tool/background-task events to the web UI as LiveKit data messages
     # (topic UI_TOPIC); the frontend renders the live operations panel + tool feed.
+    #
+    # reliable=False (lossy) is deliberate: transcription forwarding and these UI
+    # data messages share LiveKit's ORDERED reliable data channel to the browser.
+    # A single bulky UI message (e.g. a Hermes "done" event carrying tool output)
+    # that stalls on the Tailscale path head-of-line-blocks that channel, and the
+    # transcript silently freezes behind it while audio keeps flowing (issue #23).
+    # The lossy channel is a separate SCTP stream, so a stalled/dropped UI message
+    # can never wedge the transcript. UI data is non-critical: the task snapshot
+    # self-corrects on the next publish and a tool result is also spoken.
     hermes_manager.set_publisher(
         lambda data: ctx.room.local_participant.publish_data(
-            data, reliable=True, topic=UI_TOPIC
+            data, reliable=False, topic=UI_TOPIC
         )
     )
 
@@ -242,8 +251,11 @@ async def entrypoint(ctx: JobContext) -> None:
     def publish_motion(payload: bytes) -> None:
         async def _send() -> None:
             try:
+                # lossy (reliable=False) for the same reason as the Hermes UI
+                # publisher above: never share the transcript's ordered reliable
+                # channel, so a motion event can never head-of-line-block it (#23).
                 await ctx.room.local_participant.publish_data(
-                    payload, reliable=True, topic=UI_TOPIC
+                    payload, reliable=False, topic=UI_TOPIC
                 )
             except Exception:
                 log.exception("failed to publish motion event")
