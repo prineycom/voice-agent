@@ -3,12 +3,29 @@
 // handle. The track already plays via the LiveKit <audio> element, so we connect
 // the source to the analyser ONLY — never to audioCtx.destination (that would
 // double the audio). Optional `log` mirrors vu.js's failure logging verbatim.
-// Map an RMS amplitude (0..~0.2 for speech) to a 0..1 mouth-open value.
-// Gain 4 scales the small RMS up to a usable range; the 0.05 noise gate snaps
-// quiet frames to a fully-closed mouth so silence reads as closed, not twitchy.
-export function computeMouthTarget(rms) {
-  const t = Math.min(1, Math.max(0, rms * 4));
-  return t < 0.05 ? 0 : t;
+// Map an RMS amplitude to a 0..1 mouth-open value with automatic gain control.
+//
+// A fixed gain (the old `rms * 4`) tied the mouth opening to the absolute signal
+// level, so a quieter agent / WebRTC track barely cracked the mouth open. Instead
+// we normalise each frame against a *running peak* of recent speech: the loudest
+// syllables open the mouth near-fully regardless of overall level. The peak decays
+// toward `floorPeak` so the mapper re-sensitises after a loud passage and the floor
+// stops faint background noise from reading as full-volume speech.
+//
+// - `gate`: absolute silence/noise floor — below it the mouth snaps fully closed.
+// - `curve` < 1: perceptual expansion so mid-level speech opens the mouth wide.
+// - `decayPerSec`: how fast the running peak falls back toward `floorPeak`.
+// Stateful, so it's a factory; pass the frame delta `dt` for frame-rate-independent decay.
+export function makeMouthMapper({ gate = 0.015, curve = 0.55, decayPerSec = 0.5, floorPeak = 0.08 } = {}) {
+  let peak = floorPeak;
+  return function computeMouthTarget(rms, dt = 1 / 60) {
+    // Decay the peak every frame (even during silence) so it tracks the current level.
+    peak = Math.max(floorPeak, peak - decayPerSec * dt * peak);
+    if (rms < gate) return 0;
+    peak = Math.max(peak, rms);            // instant attack: latch onto the loudest syllable
+    const norm = rms / peak;               // 0..1 relative to recent speech, level-independent
+    return Math.min(1, Math.max(0, Math.pow(norm, curve)));
+  };
 }
 
 export function createLipSync(avatar, { log } = {}) {
@@ -43,6 +60,7 @@ export function createLipSync(avatar, { log } = {}) {
       analyser.smoothingTimeConstant = 0.2;
       src.connect(analyser);
       const buf = new Float32Array(analyser.fftSize);
+      const computeMouthTarget = makeMouthMapper();
       const tick = () => {
         analyser.getFloatTimeDomainData(buf);
         let sum = 0;
@@ -50,7 +68,7 @@ export function createLipSync(avatar, { log } = {}) {
         const rms = Math.sqrt(sum / buf.length);
         const target = computeMouthTarget(rms);
         // Lerp toward the target to kill per-frame jitter (tuned for ~60fps).
-        cur += (target - cur) * 0.5;
+        cur += (target - cur) * 0.6;
         avatar.setMouthOpen(cur);
         raf = requestAnimationFrame(tick);
       };
