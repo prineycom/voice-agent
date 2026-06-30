@@ -15,6 +15,7 @@ export function createLipSync(avatar, { log } = {}) {
   let audioCtx = null;
   let raf = null;
   let cur = 0;
+  let sink = null;   // muted <audio> that keeps the remote stream flowing (see below)
 
   function start(mediaStreamTrack) {
     // Idempotent: tear down any prior stream first so a second TrackSubscribed
@@ -25,7 +26,18 @@ export function createLipSync(avatar, { log } = {}) {
       // Autoplay policy can hand back a suspended context; resume it so the
       // analyser reads real audio (the Connect click is the activating gesture).
       audioCtx.resume().catch(() => {});
-      const src = audioCtx.createMediaStreamSource(new MediaStream([mediaStreamTrack]));
+      const stream = new MediaStream([mediaStreamTrack]);
+      // Chromium/WebKit bug: a MediaStreamAudioSourceNode fed by a *remote* WebRTC
+      // track emits pure silence (analyser reads all-zeros, mouth never opens)
+      // unless the same stream is also sunk into a media element. The agent audio
+      // is audible via LiveKit's own <audio> element, but that uses a different
+      // MediaStream; our wrapper stream needs its own sink. Mute it so we don't
+      // double the audio, keep the reference alive so it isn't GC'd.
+      sink = new Audio();
+      sink.muted = true;
+      sink.srcObject = stream;
+      sink.play().catch(() => {});
+      const src = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 512;
       analyser.smoothingTimeConstant = 0.2;
@@ -46,6 +58,7 @@ export function createLipSync(avatar, { log } = {}) {
     } catch (e) {
       // Close the partially-built context so a mid-setup failure can't leak it.
       if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+      if (sink) { sink.pause(); sink.srcObject = null; sink = null; }
       if (log) log('lip-sync недоступен: ' + e.message);
     }
   }
@@ -54,6 +67,7 @@ export function createLipSync(avatar, { log } = {}) {
     if (raf) cancelAnimationFrame(raf);
     raf = null;
     if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+    if (sink) { sink.pause(); sink.srcObject = null; sink = null; }
     cur = 0;
     avatar.setMouthOpen(0);
   }
