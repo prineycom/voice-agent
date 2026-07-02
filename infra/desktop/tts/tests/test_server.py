@@ -144,3 +144,72 @@ def test_ws_missing_text_key_returns_error(loaded):
     with client.websocket_connect("/tts") as ws:
         ws.send_text(json.dumps({"voice": "default"}))
         assert ws.receive_json() == {"error": "empty text"}
+
+
+# --- /unload and /reload endpoint tests --- #
+
+
+@pytest.fixture
+def engine_loaded(monkeypatch):
+    """Load the (stubbed) TTS engine so unload/reload can operate on it."""
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    synthesize._engine = None
+    synthesize.load_model()
+    server.state["loaded"] = True
+    yield
+    synthesize._engine = None
+    server.state["loaded"] = False
+
+
+def test_unload_when_loaded(engine_loaded):
+    client = TestClient(server.app)
+    resp = client.post("/unload")
+    assert resp.status_code == 200
+    assert resp.json()["model_loaded"] is False
+    assert server.state["loaded"] is False
+    assert synthesize._engine._model is None
+
+
+def test_unload_idempotent_when_already_unloaded(not_loaded):
+    synthesize._engine = None
+    client = TestClient(server.app)
+    resp = client.post("/unload")
+    assert resp.status_code == 200
+    assert resp.json()["model_loaded"] is False
+
+
+def test_reload_when_unloaded(not_loaded, monkeypatch):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    synthesize._engine = None
+    client = TestClient(server.app)
+    resp = client.post("/reload")
+    assert resp.status_code == 200
+    assert resp.json()["model_loaded"] is True
+    assert server.state["loaded"] is True
+    assert synthesize.is_loaded() is True
+    synthesize._engine = None
+    server.state["loaded"] = False
+
+
+def test_reload_idempotent_when_already_loaded(engine_loaded):
+    client = TestClient(server.app)
+    resp = client.post("/reload")
+    assert resp.status_code == 200
+    assert resp.json()["model_loaded"] is True
+
+
+def test_unload_then_ws_rejects(engine_loaded):
+    client = TestClient(server.app)
+    assert client.post("/unload").status_code == 200
+    with client.websocket_connect("/tts") as ws:
+        assert ws.receive_json() == {"error": "model not loaded"}
+
+
+def test_unload_reload_cycle(engine_loaded):
+    client = TestClient(server.app)
+    assert client.post("/unload").json()["model_loaded"] is False
+    assert client.post("/reload").json()["model_loaded"] is True
+    # WS accepts again after reload — sending empty text proves we're past the not-loaded gate
+    with client.websocket_connect("/tts") as ws:
+        ws.send_text(json.dumps({"text": "  "}))
+        assert ws.receive_json() == {"error": "empty text"}

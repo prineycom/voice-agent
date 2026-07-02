@@ -28,6 +28,21 @@ PORT = int(os.getenv("TTS_PORT", "8002"))
 state = {"loaded": False}
 
 
+def _cuda_empty_cache() -> None:
+    """Best-effort VRAM cache flush after unloading a model.
+
+    Import is lazy so the server starts without torch and unit tests on
+    CPU-only machines don't fail.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 — cleanup hint, never fatal
+        log.debug("torch.cuda.empty_cache unavailable, skipped")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -59,6 +74,32 @@ async def health():
     # Engine-specific fields (speaker / ref_profiles / instruct, …).
     body.update(eng.health_fields())
     return JSONResponse(body, status_code=200 if state["loaded"] else 503)
+
+
+@app.post("/unload")
+async def unload_model():
+    """Unload the TTS model from VRAM. Idempotent."""
+    if not state["loaded"]:
+        return JSONResponse({"status": "unloaded", "service": "tts", "model_loaded": False}, status_code=200)
+    synthesize.unload_model()
+    state["loaded"] = False
+    _cuda_empty_cache()
+    log.info("TTS model unloaded")
+    return JSONResponse({"status": "unloaded", "service": "tts", "model_loaded": False}, status_code=200)
+
+
+@app.post("/reload")
+async def reload_model():
+    """Reload the TTS model into VRAM. Idempotent."""
+    try:
+        synthesize.load_model()
+        state["loaded"] = True
+        log.info("TTS model reloaded")
+        return JSONResponse({"status": "loaded", "service": "tts", "model_loaded": True}, status_code=200)
+    except Exception as e:
+        state["loaded"] = False
+        log.exception("Failed to reload TTS model")
+        return JSONResponse({"status": "error", "service": "tts", "model_loaded": False, "error": str(e)}, status_code=500)
 
 
 @app.websocket("/tts")

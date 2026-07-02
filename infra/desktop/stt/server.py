@@ -64,6 +64,24 @@ PARTIAL_INTERVAL_SEC = float(os.getenv("STT_PARTIAL_INTERVAL_SEC", "1.0"))
 state = {"model": None, "loaded": False}
 
 
+def _cuda_empty_cache() -> None:
+    """Best-effort VRAM cache flush after unloading a model.
+
+    faster-whisper backs onto CTranslate2 (not torch), so torch may not be
+    installed in this venv; releasing the `WhisperModel` object is what actually
+    frees its VRAM. This call only helps when torch allocated CUDA memory in the
+    same process, and is a no-op otherwise. Import is lazy so the server starts
+    without torch and so unit tests on CPU-only machines don't fail.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 — cleanup hint, never fatal
+        log.debug("torch.cuda.empty_cache unavailable, skipped")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -92,6 +110,33 @@ async def health():
         "model_loaded": state["loaded"],
     }
     return JSONResponse(body, status_code=200 if state["loaded"] else 503)
+
+
+@app.post("/unload")
+async def unload_model():
+    """Unload the STT model from VRAM. Idempotent."""
+    if not state["loaded"]:
+        return JSONResponse({"status": "unloaded", "service": "stt", "model_loaded": False}, status_code=200)
+    state["model"] = None
+    state["loaded"] = False
+    _cuda_empty_cache()
+    log.info("STT model unloaded")
+    return JSONResponse({"status": "unloaded", "service": "stt", "model_loaded": False}, status_code=200)
+
+
+@app.post("/reload")
+async def reload_model():
+    """Reload the STT model into VRAM. Idempotent."""
+    try:
+        log.info("Reloading Whisper %s (%s, %s)", MODEL_NAME, DEVICE, COMPUTE_TYPE)
+        state["model"] = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
+        state["loaded"] = True
+        log.info("STT model reloaded")
+        return JSONResponse({"status": "loaded", "service": "stt", "model_loaded": True}, status_code=200)
+    except Exception as e:
+        state["loaded"] = False
+        log.exception("Failed to reload STT model")
+        return JSONResponse({"status": "error", "service": "stt", "model_loaded": False, "error": str(e)}, status_code=500)
 
 
 def _transcribe(samples, final: bool) -> str:

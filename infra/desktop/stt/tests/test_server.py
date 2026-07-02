@@ -147,3 +147,58 @@ def test_ws_reports_error_and_keeps_serving(loaded_model):
         assert "gpu exploded" in msg["error"]
         # connection still alive: a reset is accepted without error
         ws.send_text(json.dumps({"event": "reset"}))
+
+
+# --- /unload and /reload endpoint tests --- #
+
+
+def test_unload_when_loaded(loaded_model):
+    client = TestClient(server.app)
+    resp = client.post("/unload")
+    assert resp.status_code == 200
+    assert resp.json()["model_loaded"] is False
+    assert server.state["loaded"] is False
+    assert server.state["model"] is None
+
+
+def test_unload_idempotent_when_already_unloaded(not_loaded):
+    client = TestClient(server.app)
+    resp = client.post("/unload")
+    assert resp.status_code == 200
+    assert resp.json()["model_loaded"] is False
+
+
+def test_reload_when_unloaded(not_loaded):
+    client = TestClient(server.app)
+    resp = client.post("/reload")
+    assert resp.status_code == 200
+    assert resp.json()["model_loaded"] is True
+    assert server.state["loaded"] is True
+    assert server.state["model"] is not None
+
+
+def test_reload_idempotent_when_already_loaded(loaded_model):
+    client = TestClient(server.app)
+    resp = client.post("/reload")
+    assert resp.status_code == 200
+    assert resp.json()["model_loaded"] is True
+
+
+def test_unload_then_ws_rejects(loaded_model):
+    client = TestClient(server.app)
+    client.post("/unload")
+    with client.websocket_connect("/stt") as ws:
+        msg = ws.receive_json()
+        assert msg == {"error": "model not loaded"}
+
+
+def test_unload_reload_cycle(loaded_model):
+    client = TestClient(server.app)
+    assert client.post("/unload").json()["model_loaded"] is False
+    assert client.post("/reload").json()["model_loaded"] is True
+    # WS accepts again after reload (no "model not loaded" error)
+    with client.websocket_connect("/stt") as ws:
+        ws.send_bytes(_pcm(50))
+        ws.send_text(json.dumps({"event": "end"}))
+        msg = ws.receive_json()
+    assert msg["is_final"] is True

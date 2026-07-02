@@ -43,6 +43,18 @@ def is_loaded() -> bool:
     return _engine is not None and getattr(_engine, "_model", None) is not None
 
 
+def unload_model():
+    """Release the engine's model from VRAM. Idempotent.
+
+    Sets the engine's `_model` to None so the GPU memory is freed when GC runs.
+    The engine instance itself is kept so `engine()` and health fields still work;
+    call `load_model()` to restore the model.
+    """
+    if _engine is not None:
+        _engine._model = None
+    return _engine
+
+
 def stream_pcm(text: str, voice: str = "default"):
     """Yield 24kHz mono int16 PCM byte chunks for `text`. Delegates to the engine."""
     eng = _ensure_engine()
