@@ -43,6 +43,7 @@ Desktop (RTX 4070)
 - Agent Worker is on Pi 5 (not Desktop) — zero latency on output routing, Hermes local
 - STT/TTS transport is WebSocket (not gRPC) — simpler, FastAPI native, LiveKit ecosystem pattern
 - LLM model is swappable via LiteLLM config (one line) — start with nemotron, upgrade to Gemini Flash
-- Live2D uses motion states only (idle/listening/thinking/speaking), no lip-sync
+- Live2D: motion states (idle/listening/thinking/speaking) + expressions, driven by authoritative agent motion events on the `voiceagent` data channel; expressions come from LLM inline emotion tags (enum neutral/happy/sad/surprised/thinking, stripped before TTS/transcript); volume-based lip-sync on the agent's WebRTC audio track (client-side, not phoneme/TTS-side) — see ADR 0008-0011
+- Frontend is vanilla JS as ES modules, no build step (no React/Vue overhead for Pi 5); served as static files by the stdlib http.server
 - Sound goes through LiveKit WebRTC in browser, not system speakers
-- Kiosk and web access share the same frontend (responsive)
+- Kiosk and web access share the same responsive frontend (kiosk-specific concerns are Epic 6)

@@ -25,6 +25,8 @@ checkpoints/
 # Environment
 .env
 .env.local
+.env.bak*
+*.bak
 *.secret
 
 # OS
