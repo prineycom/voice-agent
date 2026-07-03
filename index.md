@@ -42,8 +42,13 @@ Audio flows through a cascaded pipeline: STT → LLM → TTS. Each stage is a se
 | 5 | Web Frontend | Live2D + transcript + tool call visualization, kiosk + web access |
 | 6 | Kiosk Setup | Fullscreen browser on Pi 5, auto-launch |
 | 7 | End-to-End Testing | Latency measurement, quality validation |
+| 8 | Audio2Face → Live2D | AI-driven facial animation: Audio2Face-3D blendshapes → Live2D parameters |
 
 See [[epics-overview]] for detailed epic descriptions.
+
+## Research
+
+- [[research/2026-07-03-avatar-video-models]] — Real-time avatar & video models: SoulX-FlashHead, MuseTalk, Audio2Face-3D, EMAGE, ChatAnyone. Architecture options for adding visual avatar to voice-agent.
 
 ## Infrastructure
 

@@ -121,6 +121,27 @@ Detailed breakdown of implementation epics for the Voice Agent platform.
 
 ---
 
+## Epic 8: Audio2Face-3D → Live2D Facial Animation
+
+**Goal**: Replace volume-based lip sync with AI-driven phoneme-level facial animation using NVIDIA Audio2Face-3D (open source), mapped to Live2D standard parameters.
+
+**Scope**:
+- Deploy Audio2Face-3D NIM on Desktop (gRPC, 0.6 GB VRAM)
+- Python FastAPI WebSocket proxy (gRPC → browser)
+- ARKit blendshape → Live2D parameter mapping (~50 lines JS)
+- Replace volume-based lip sync with blendshape-driven mouth/eyes/brows
+- Stream blendshapes via LiveKit DataChannel (~6 KB/s)
+- Fallback to volume-based lip sync if Audio2Face is down
+- Keep existing motion states (idle/listening/thinking/speaking)
+
+**Research**: → [[research/2026-07-03-avatar-video-models]] (Section 9: ARKit → Live2D mapping)
+
+**GitHub**: [#33](https://github.com/prineycom/voice-agent/issues/33)
+
+**Estimate**: ~18-30 чч
+
+---
+
 ## Total Estimate
 
-~45 чч (человеко-часов)
+~63-75 чч (человеко-часов)
