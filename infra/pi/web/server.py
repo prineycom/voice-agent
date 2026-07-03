@@ -22,6 +22,7 @@ worker uses.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import timedelta
@@ -29,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from livekit.api import AccessToken, VideoGrants
+from livekit.api import AccessToken, DeleteRoomRequest, LiveKitAPI, VideoGrants
 
 HERE = Path(__file__).resolve().parent
 INDEX_HTML = HERE / "index.html"
@@ -49,6 +50,22 @@ _STATIC_CONTENT_TYPES = {
 ROOM = os.environ.get("LIVEKIT_ROOM", "test")
 BIND_HOST = os.environ.get("WEB_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("WEB_BIND_PORT", "8080"))
+
+# Reset the shared room on every /token request (i.e. on each fresh connect).
+# The harness reuses one fixed room, so a hung agent/participant session can
+# wedge it; deleting the room first forces LiveKit to recreate it clean and
+# re-dispatch the agent when the new participant joins. Default on; set
+# WEB_RESET_ROOM_ON_TOKEN=0 to disable.
+RESET_ROOM_ON_TOKEN = os.environ.get("WEB_RESET_ROOM_ON_TOKEN", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
+# Upper bound (seconds) on the room-reset API call, so a down LiveKit never
+# stalls token issuance / the join.
+RESET_ROOM_TIMEOUT = float(os.environ.get("WEB_RESET_ROOM_TIMEOUT", "3"))
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -86,6 +103,52 @@ def _cred(name: str) -> str:
 def _public_ws_url() -> str:
     """The WSS endpoint the browser connects to (tailscale-serve in front of LiveKit)."""
     return os.environ.get("LIVEKIT_WS_URL", "wss://rpi.darter-smoot.ts.net:8443")
+
+
+def _server_api_url() -> str:
+    """Internal LiveKit server URL for the management API (RoomService).
+
+    This is the on-Pi LiveKit address the worker uses (LIVEKIT_URL, default
+    ws://localhost:7880) — NOT the public tailscale wss the browser connects to.
+    LiveKitAPI speaks HTTP, so ws(s):// is rewritten to http(s)://.
+    """
+    url = os.environ.get("LIVEKIT_URL") or _ENV.get("LIVEKIT_URL") or "http://localhost:7880"
+    if url.startswith("ws://"):
+        url = "http://" + url[len("ws://") :]
+    elif url.startswith("wss://"):
+        url = "https://" + url[len("wss://") :]
+    return url
+
+
+async def _delete_room_async() -> None:
+    lkapi = LiveKitAPI(
+        _server_api_url(), _cred("LIVEKIT_API_KEY"), _cred("LIVEKIT_API_SECRET")
+    )
+    try:
+        await lkapi.room.delete_room(DeleteRoomRequest(room=ROOM))
+    finally:
+        await lkapi.aclose()
+
+
+def _reset_room() -> None:
+    """Delete the shared room so the next join starts from a clean state.
+
+    Best-effort and non-fatal: if the room doesn't exist or the LiveKit API is
+    briefly unreachable, the join still proceeds (LiveKit auto-creates the room
+    on join), so a reset failure must never block token issuance.
+    """
+    try:
+        # Bound the whole call so a down/unreachable LiveKit can never stall the
+        # join behind the aiohttp default timeout.
+        asyncio.run(asyncio.wait_for(_delete_room_async(), timeout=RESET_ROOM_TIMEOUT))
+        print(f"[web] reset room '{ROOM}' before issuing token", flush=True)
+    except Exception as exc:  # noqa: BLE001 — reset is best-effort, never fatal
+        # not_found = the room had no active session (already clean) — the normal
+        # case on a first/idle connect, not an error worth flagging.
+        if getattr(exc, "code", None) == "not_found":
+            print(f"[web] room '{ROOM}' already clean (no active session)", flush=True)
+        else:
+            print(f"[web] room reset skipped ({exc.__class__.__name__}: {exc})", flush=True)
 
 
 def _mint_token(identity: str) -> str:
@@ -134,6 +197,9 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/token":
             params = parse_qs(parsed.query)
             identity = (params.get("identity", ["guest"])[0] or "guest").strip()[:64]
+            # Fresh connect -> clear any wedged session so this join starts clean.
+            if RESET_ROOM_ON_TOKEN:
+                _reset_room()
             try:
                 payload = {
                     "token": _mint_token(identity),
