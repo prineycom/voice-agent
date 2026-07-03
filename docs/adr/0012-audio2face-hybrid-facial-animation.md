@@ -47,6 +47,9 @@ We therefore adopt a **hybrid** split and let A2F **replace** the emotion-tag ex
 - **Hybrid: local mouth + A2F loose-sync face** ✅ — sidesteps the hardest cross-transport sync
   problem entirely (the mouth, which most needs sync, never leaves the audio-synced path) while
   gaining A2F's blink/gaze/brow/emotion. A2F output for parameters a model lacks silently no-ops.
+  Both in-repo models (Hiyori, Natori) already expose the full necessary standard set (blink,
+  gaze, `ParamBrowLAngle`/`RAngle`, eye-squint, `ParamMouthForm`, `ParamCheek`); driving params
+  directly means Hiyori's lack of `.exp3.json` expression *files* no longer matters.
 - **Full A2F with timestamped blendshapes buffered against audio playout** ❌ — accurate mouth
   sync, but needs a shared clock/PTS across the WebRTC audio and the data-channel blendshapes and
   browser-side buffering. Large scope for a mouth we already animate acceptably.
@@ -64,5 +67,8 @@ We therefore adopt a **hybrid** split and let A2F **replace** the emotion-tag ex
   outage degrades gracefully rather than freezing the avatar.
 - Requires verifying the chosen A2F-3D build accepts an emotion-input vector; if it does not, the
   emotion enum has no effect and facial emotion is prosody-only until revisited.
-- Extended parameters (`ParamBrowLAngle`, `ParamCheek`, `ParamTongue`, …) are model-dependent;
-  the active Hiyori model lacks most of them, bounding expressivity until a richer model is used.
+- The full *necessary* facial set is already covered by both in-repo models (Hiyori active,
+  Natori richer), all under a non-commercial license that suits this project. No new model is
+  required. Only truly-extended params (`ParamTongue`, `ParamPuffCheeks`, `ParamMouthX`,
+  `ParamMouthSize`) are absent from every standard rig — they need a paid Perfect-Sync model and
+  A2F no-ops on them, so they are out of scope.
