@@ -20,17 +20,39 @@ One of exactly four whole-body animation states of the **Avatar**: `idle`, `list
 _Avoid_: status, mode, animation
 
 **Expression**:
-A facial **emotion** of the **Avatar**, rendered from a Live2D `.exp3.json` file. Orthogonal
-to **Motion state** — runs on a separate channel. Vocabulary is bounded by the expressions the
-chosen model ships with.
+A facial **emotion** of the **Avatar**. Historically rendered from a Live2D `.exp3.json` file
+driven by an **Emotion tag**. Under **Facial animation** (Epic 8) this `.exp3.json` path is
+**replaced**: facial emotion is produced by **Audio2Face** (from audio prosody plus the
+**Emotion tag** fed into A2F's emotion input), not by expression files. Still orthogonal to
+**Motion state**.
 _Avoid_: mood, face, emotion (reserve "emotion" for the source intent, see Emotion tag)
 
 **Lip-sync**:
 Volume-based mouth animation: the browser reads the RMS/peak of the **Avatar**'s incoming
 WebRTC audio track and writes it to the `ParamMouthOpenY` model parameter each frame. NOT
 phoneme/viseme-based and NOT computed on the TTS side. (Reverses the original "no lip-sync"
-decision — see ADR.)
+decision — see ADR.) Under **Facial animation** (Epic 8) the mouth *amplitude* stays on this
+local volume path — it is the audio-synchronised layer that A2F does not replace.
 _Avoid_: mouth-sync, viseme animation
+
+**Facial animation**:
+The Epic-8 enhancement that adds **Audio2Face** blink, gaze, brow, and mouth-*form* on top of
+the volume-based **Lip-sync**. A *hybrid*: mouth opening amplitude (`ParamMouthOpenY`) stays on
+the audio-synced volume path; A2F drives only the loose-sync facial parameters. Distinct from
+**Expression** (emotion-tag `.exp3.json`) and **Motion state** (whole-body).
+_Avoid_: face tracking, lip-sync (reserve "lip-sync" for the mouth-amplitude layer)
+
+**Blendshape**:
+One of the 52 ARKit face weights (0.0–1.0, e.g. `jawOpen`, `eyeBlinkLeft`, `browInnerUp`) that
+**Audio2Face** emits per frame from TTS audio. Mapped to Live2D standard parameters by
+`arkitToLive2D()`. The unit of the **Facial animation** data stream.
+_Avoid_: viseme, morph target
+
+**Audio2Face** (A2F):
+NVIDIA Audio2Face-3D running on the Desktop GPU; consumes TTS PCM audio and emits **Blendshape**
+frames (~30 FPS) that drive **Facial animation**. Face-only — never head/body/hands (those stay
+on **Motion state**).
+_Avoid_: A2F-2D, facial capture
 
 **Kiosk**:
 The frontend running fullscreen (1080p) in Chromium on the Pi 5. Same responsive codebase as
@@ -57,11 +79,12 @@ A message the Agent Worker publishes on the **UI topic** to authoritatively set 
 
 **Emotion tag**:
 An inline marker the LLM emits in its response (e.g. `[emotion:happy]`) to express intent.
-The Agent Worker parses it, strips it **before TTS and before the transcript**, and maps it to
-an **Expression** in a **Motion event**. The allowed values are a fixed small enum
-(`neutral | happy | sad | surprised | thinking`) — the single source of truth shared by SOUL.md
-and the frontend; the frontend maps each enum value to a model `.exp3.json`, and any unknown tag
-falls back to `neutral`.
+The Agent Worker parses it and strips it **before TTS and before the transcript**. Historically
+it mapped to an **Expression** (`.exp3.json`) in a **Motion event**; under **Facial animation**
+(Epic 8) the parsed emotion instead feeds **Audio2Face**'s emotion input so the same enum shapes
+A2F's facial output. The allowed values are a fixed small enum
+(`neutral | happy | sad | surprised | thinking`), the single source of truth shared by SOUL.md,
+the agent, and (via A2F) the avatar; any unknown tag falls back to `neutral`.
 _Avoid_: sentiment, emotion marker
 
 ## Example dialogue
