@@ -25,6 +25,9 @@ const toolfeedEl = document.getElementById('toolfeed');
 const sidebarBtn = document.getElementById('sidebarBtn');
 const asideEl = document.querySelector('aside');
 const scrimEl = document.getElementById('scrim');
+const composerEl = document.getElementById('composer');
+const composerInputEl = document.getElementById('composerInput');
+const composerSendEl = document.getElementById('composerSend');
 
 const logger = createLog(logEl);
 const agentState = createAgentState(agentStateEl);
@@ -73,12 +76,14 @@ const hooks = {
     connectBtn.className = 'danger';
     connectBtn.disabled = false;
     connectBtn.onclick = () => room.disconnect();
+    setComposerEnabled(true);
   },
   onDisconnectedUI() {
     connectBtn.textContent = 'Connect';
     connectBtn.className = 'primary';
     connectBtn.disabled = false;
     connectBtn.onclick = doConnect;
+    setComposerEnabled(false);
   },
   onAgentState: (state) => { lastAgentState = state; agentState.set(state); motion.setState(state); },
   watchAgentParticipant: agentState.watch,
@@ -98,6 +103,26 @@ function doConnect() {
 }
 
 connectBtn.onclick = doConnect;
+
+// Text composer: type a message and the agent reacts to it exactly like a
+// spoken turn (LiveKit 'lk.chat' text path → LLM → TTS). Enabled only while
+// connected. The user's line is echoed locally since the agent does not send
+// typed text back as a transcription.
+function setComposerEnabled(enabled) {
+  composerInputEl.disabled = !enabled;
+  composerSendEl.disabled = !enabled;
+  if (!enabled) composerInputEl.value = '';
+}
+
+composerEl.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = composerInputEl.value.trim();
+  if (!text || composerInputEl.disabled) return;
+  transcript.addLocalMessage(text);
+  room.sendText(text);
+  composerInputEl.value = '';
+  composerInputEl.focus();
+});
 
 function setSidebar(open) {
   asideEl.classList.toggle('open', open);

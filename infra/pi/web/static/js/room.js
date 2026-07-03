@@ -99,6 +99,22 @@ export function createRoomController({ log, onConn, onError }) {
     room = null;
   }
 
+  // Send a typed message to the agent. LiveKit Agents' RoomIO listens on the
+  // 'lk.chat' text-stream topic and turns each message into a user turn
+  // (generate_reply), so text and voice drive the same STT→LLM→TTS reply path.
+  // The agent does NOT echo the typed text back as a transcription, so the UI
+  // renders the user's line locally (see transcript.addLocalMessage).
+  async function sendText(text) {
+    if (!room || !room.localParticipant) return false;
+    try {
+      await room.localParticipant.sendText(text, { topic: 'lk.chat' });
+      return true;
+    } catch (e) {
+      log('отправка текста не удалась: ' + e.message);
+      return false;
+    }
+  }
+
   async function toggleMute() {
     if (!room) return muted;
     muted = !muted;
@@ -111,6 +127,7 @@ export function createRoomController({ log, onConn, onError }) {
     connect,
     disconnect,
     toggleMute,
+    sendText,
     isLocal,
     get room() { return room; },
   };

@@ -5,14 +5,17 @@ export function createTranscript(containerEl, { isLocal, onLatency, log }) {
   const lines = new Map();          // segment/stream id -> {el, textEl}
   let lastUserFinalAt = null;       // performance.now() when user finished speaking
   let emptyHintRemoved = false;     // query/remove the .empty hint at most once
+  let localSeq = 0;                 // unique keys for locally-echoed typed messages
 
-  function renderLine(key, identity, text, isFinal) {
+  // `mineOverride` forces the speaker side (used by addLocalMessage, since a
+  // typed message has no participant identity to resolve via isLocal).
+  function renderLine(key, identity, text, isFinal, mineOverride) {
     if (!emptyHintRemoved) {
       const hint = containerEl.querySelector('.empty');
       if (hint) hint.remove();
       emptyHintRemoved = true;
     }
-    const mine = isLocal(identity);
+    const mine = mineOverride !== undefined ? mineOverride : isLocal(identity);
     let line = lines.get(key);
     if (!line) {
       const el = document.createElement('div');
@@ -76,11 +79,19 @@ export function createTranscript(containerEl, { isLocal, onLatency, log }) {
     }
   }
 
+  // Echo a message the user typed into the composer. The agent replies via the
+  // 'lk.chat' text path but never sends the user's own text back as a
+  // transcription, so we render it here as a final "Вы" line (which also stamps
+  // the latency clock, so text turns get a voice-to-voice number too).
+  function addLocalMessage(text) {
+    renderLine(`local-${localSeq++}`, null, text, true, true);
+  }
+
   function reset() {
     lines.clear();
     lastUserFinalAt = null;
     emptyHintRemoved = false;
   }
 
-  return { wire, reset };
+  return { wire, reset, addLocalMessage };
 }
