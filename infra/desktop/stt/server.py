@@ -55,7 +55,11 @@ log = logging.getLogger("stt")
 MODEL_NAME = os.getenv("STT_MODEL", "large-v3-turbo")
 DEVICE = os.getenv("STT_DEVICE", "cuda")
 COMPUTE_TYPE = os.getenv("STT_COMPUTE_TYPE", "int8_float16")
-LANGUAGE = os.getenv("STT_LANGUAGE", "ru")
+# Recognition language. "auto" (or empty) → faster-whisper detects the language
+# per utterance, which a bilingual (RU/EN) agent needs. A concrete code like
+# "ru"/"en" forces that language (lower latency, no misdetect on short clips).
+_lang = os.getenv("STT_LANGUAGE", "ru").strip()
+LANGUAGE = None if _lang.lower() in ("", "auto") else _lang
 HOST = os.getenv("STT_HOST", "0.0.0.0")
 PORT = int(os.getenv("STT_PORT", "8001"))
 SAMPLE_RATE = 16000
