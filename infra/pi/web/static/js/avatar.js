@@ -3,6 +3,11 @@
 // pixi-live2d-display). Only `containerEl` is touched in the DOM; everything
 // else is framework-free. Optional `log` mirrors the failure-logging style of
 // the other harness modules.
+//
+// Which model to load comes from the active avatar profile (avatar-config.js),
+// so swapping/reverting the avatar is a one-line config change, not a code edit.
+import { activeProfile } from './avatar-config.js';
+
 export function createAvatar(containerEl, { log } = {}) {
   let app = null;
   let model = null;
@@ -52,7 +57,7 @@ export function createAvatar(containerEl, { log } = {}) {
     containerEl.appendChild(app.view);
 
     try {
-      model = await PIXI.live2d.Live2DModel.from('static/models/natori/Natori.model3.json');
+      model = await PIXI.live2d.Live2DModel.from(activeProfile.model);
     } catch (e) {
       log && log('загрузка модели не удалась: ' + e.message);
       teardown();
@@ -107,6 +112,9 @@ export function createAvatar(containerEl, { log } = {}) {
 
   function setExpression(name) {
     if (!ready || !model) return;
+    // Some models (e.g. Hiyori) ship no expression files; the profile maps
+    // their expressions to null, which we treat as an intentional no-op.
+    if (name == null) return;
     try {
       model.expression(name);
     } catch (e) {

@@ -1,15 +1,15 @@
 // Motion policy: maps an agent state to a Live2D motion + expression on the
 // injected avatar. No DOM, no globals — pure state -> motion mapping with
-// debounce on identical states.
-export function createMotionController(avatar) {
-  const table = {
-    idle:      { group: 'Idle',    index: 0, expression: 'Normal' },
-    listening: { group: 'Idle',    index: 1, expression: 'Normal' },
-    thinking:  { group: 'TapBody', index: 0, expression: 'Blushing' },
-    speaking:  { group: 'TapBody', index: 2, expression: 'Smile' },
-  };
+// debounce on identical states. The state->motion table and emotion->expression
+// map are model-specific, so they come from the active avatar profile (passed in
+// for testability, defaulting to the configured active avatar).
+import { activeProfile } from './avatar-config.js';
 
-  const EMOTION_EXPR = { neutral: 'Normal', happy: 'Smile', sad: 'Sad', surprised: 'Surprised', thinking: 'Blushing' };
+export function createMotionController(avatar, profile = activeProfile) {
+  const table = profile.motions;
+
+  const EMOTION_EXPR = profile.emotionExpr;
+  const FALLBACK_EXPR = profile.fallbackExpr;
 
   function resolve(state) {
     const key = String(state).toLowerCase();
@@ -42,7 +42,8 @@ export function createMotionController(avatar) {
       current = key;
       avatar.playMotion(entry.group, entry.index);
     }
-    avatar.setExpression(EMOTION_EXPR[String(evt && evt.emotion).toLowerCase()] || 'Normal');
+    const mapped = EMOTION_EXPR[String(evt && evt.emotion).toLowerCase()];
+    avatar.setExpression(mapped == null ? FALLBACK_EXPR : mapped);
     motionEventActive = true;
   }
 
