@@ -1,0 +1,11 @@
+# A2F WebSocket service. The Python layer is light — the heavy inference runs in
+# the compiled C++ a2f_stream helper (see a2f_stream/) against a TensorRT engine.
+fastapi
+uvicorn[standard]
+python-dotenv
+soxr        # 24kHz TTS PCM -> 16kHz float for the A2F model (helper backend)
+numpy
+# dev / smoke-test
+pytest
+httpx       # FastAPI TestClient
+websockets
