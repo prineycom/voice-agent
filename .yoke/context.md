@@ -28,19 +28,21 @@ driven by an **Emotion tag**. Under **Facial animation** (Epic 8) this `.exp3.js
 _Avoid_: mood, face, emotion (reserve "emotion" for the source intent, see Emotion tag)
 
 **Lip-sync**:
-Volume-based mouth animation: the browser reads the RMS/peak of the **Avatar**'s incoming
-WebRTC audio track and writes it to the `ParamMouthOpenY` model parameter each frame. NOT
-phoneme/viseme-based and NOT computed on the TTS side. (Reverses the original "no lip-sync"
-decision — see ADR.) Under **Facial animation** (Epic 8) the mouth *amplitude* stays on this
-local volume path — it is the audio-synchronised layer that A2F does not replace.
+Mouth-opening animation that writes `ParamMouthOpenY` each frame. It has two interchangeable
+providers behind one sink (`avatar.setMouthOpen`): the **A2F provider** (primary, Epic 8) drives
+the mouth from **Audio2Face**'s phoneme-level `JawOpen` **Blendshape**; the **volume provider**
+(fallback + toggle) reads the RMS/peak of the **Avatar**'s incoming WebRTC audio track (the
+original ADR-0008 path, which reverses the "no lip-sync" decision). The volume provider is the
+automatic fallback when no A2F stream is active and a runtime toggle to force the old behaviour.
+See ADR-0013 (reverses ADR-0012 decision #1). NOT computed on the TTS side.
 _Avoid_: mouth-sync, viseme animation
 
 **Facial animation**:
-The Epic-8 enhancement that adds **Audio2Face** blink, gaze, brow, and mouth-*form* on top of
-the volume-based **Lip-sync**. A *hybrid*: mouth opening amplitude (`ParamMouthOpenY`) stays on
-the audio-synced volume path; A2F drives only the loose-sync facial parameters. Distinct from
-**Expression** (emotion-tag `.exp3.json`) and **Motion state** (whole-body).
-_Avoid_: face tracking, lip-sync (reserve "lip-sync" for the mouth-amplitude layer)
+The Epic-8 enhancement where **Audio2Face** drives the **Avatar**'s face from TTS audio: blink,
+gaze, brow, mouth *form*, **and** (per ADR-0013) mouth *opening* via the A2F **Lip-sync** provider.
+The volume **Lip-sync** provider remains the fallback/toggle for mouth opening. Distinct from
+**Expression** (emotion-tag `.exp3.json`, now replaced by A2F) and **Motion state** (whole-body).
+_Avoid_: face tracking
 
 **Blendshape**:
 One of the 52 ARKit face weights (0.0–1.0, e.g. `jawOpen`, `eyeBlinkLeft`, `browInnerUp`) that
@@ -91,8 +93,9 @@ _Avoid_: sentiment, emotion marker
 
 > **Dev:** When the agent starts answering, the avatar should open its mouth, right?
 > **Domain:** Two separate things. The *motion state* flips to `speaking` from a motion event.
-> The mouth movement is *lip-sync* — driven client-side off the audio volume, independent of
-> the motion state.
+> The mouth movement is *lip-sync* — driven by Audio2Face's phoneme-level `JawOpen`, with the
+> client-side volume analyser kept as fallback/toggle. Either way it is independent of the
+> motion state.
 > **Dev:** And if the model "smiles"?
 > **Domain:** That's an *expression*. The LLM tagged its reply with an *emotion tag* like
 > `[emotion:happy]`; the agent stripped the tag before TTS and sent a *motion event* carrying

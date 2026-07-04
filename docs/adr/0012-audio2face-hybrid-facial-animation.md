@@ -4,9 +4,16 @@ tags:
   - adr
 status: accepted
 relates-to: "0008-client-volume-lipsync, 0009-agent-authoritative-motion-emotion"
+amended-by: "0013-a2f-driven-lipsync-volume-fallback"
 ---
 
 # Hybrid Audio2Face-3D Facial Animation (keeps volume lip-sync, replaces expressions)
+
+> **Amended by [ADR-0013](0013-a2f-driven-lipsync-volume-fallback.md) (2026-07-04):** decision #1 is
+> **reversed**. Mouth opening (`ParamMouthOpenY`) is now driven by **Audio2Face** (phoneme-level
+> `JawOpen`) as the primary source, with the volume analyser retained as a runtime-selectable
+> fallback and toggle. Everything else in this ADR — A2F drives the loose-sync face, replaces the
+> `.exp3.json` expressions, transport, idle release, emotion via `/tts` — **still stands**.
 
 Epic 8 adds NVIDIA Audio2Face-3D (A2F) to drive phoneme/prosody-level facial animation on the
 Live2D **Avatar** from TTS audio. The naive reading of the epic — send all 52 ARKit blendshapes
