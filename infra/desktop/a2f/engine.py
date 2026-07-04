@@ -7,8 +7,13 @@ Two backends, selected by ``A2F_BACKEND``:
   from the Audio2Face-3D-SDK against the batch-1 TensorRT engine (see
   ``a2f_stream/`` and ``build_engine.sh``). The helper reads PCM frames + an
   emotion vector on stdin and writes blendshape frames on stdout. VRAM ≈ 0.3 GB
-  (spike-measured), coexists with STT+TTS. **The helper's inference wiring is
-  still WIP** (SDK InteractiveExecutor + BlendshapeSolve) — see a2f_stream/README.
+  (spike-measured), coexists with STT+TTS. The helper is a **single long-lived
+  process**: it is spawned lazily on the first utterance and kept alive across
+  utterances (the engine loads once), so per-utterance latency ≈ inference. The
+  shared stdin/stdout pipe is guarded by a single-flight lock; a crash sets the
+  process back to ``None`` so the next call respawns lazily. **The helper's
+  inference wiring is still WIP** (SDK InteractiveExecutor + BlendshapeSolve) —
+  see a2f_stream/README.
 
 * ``mock`` (default / CI / no-GPU): a dependency-free synthetic generator that
   emits well-formed blendshape frames (a gentle idle + audio-envelope-driven
@@ -21,6 +26,7 @@ where each frame is ``{"frame": i, "t": seconds, "arkit": {name: value}}``.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 import struct
@@ -74,14 +80,22 @@ class HelperBackend:
     """Bridges to the compiled C++ ``a2f_stream`` helper, which runs the batch-1
     engine + blendshape solve and emits 68 ARKit coefficients per frame at 60 FPS.
 
-    Per utterance: resample the incoming 24 kHz PCM16 → 16 kHz float, spawn the
-    helper, write ``[emotion][audio][end]`` on its stdin (see a2f_stream/main.cpp
-    protocol), read framed float vectors from stdout, map to ARKit names, and
-    downsample 60 → ``A2F_FPS``.
+    The helper is a **single persistent process**: it is spawned lazily on the
+    first utterance (``_ensure_proc``) and kept alive across utterances so the
+    engine loads once and per-utterance latency ≈ inference. Its stdin/stdout is
+    one shared pipe, so the whole pipe-touching critical section runs under a
+    single-flight lock (``self._lock``) — bytes from concurrent/serial ``stream``
+    calls must not interleave. If the helper crashes (``IncompleteReadError`` or a
+    broken pipe) we drain stderr, kill it, and set ``self._proc = None`` so the
+    next call respawns lazily.
 
-    NOTE: currently spawns the helper per utterance (engine load ≈ a few seconds
-    of startup). A persistent helper (load-once, loop over utterances) is the
-    key latency optimisation — tracked in a2f_stream/README.md.
+    Per utterance (inside the lock): resample the incoming 24 kHz PCM16 → 16 kHz
+    float, write ``[emotion][audio][end]`` on the helper's stdin (see
+    a2f_stream/main.cpp protocol) WITHOUT closing stdin (the process persists),
+    read framed float vectors from stdout until the done marker, map to ARKit
+    names, and downsample 60 → ``A2F_FPS``. Frames are buffered inside the lock
+    and yielded after it is released, so a slow WS consumer can't stall the
+    shared pipe.
     """
 
     name = "helper"
@@ -89,11 +103,23 @@ class HelperBackend:
     def __init__(self) -> None:
         self.helper_path = os.getenv("A2F_HELPER", "/opt/a2f/a2f_stream")
         self.model_json = os.getenv("A2F_MODEL_JSON", "/opt/a2f/model.json")
+        self._proc: asyncio.subprocess.Process | None = None
+        self._lock = asyncio.Lock()
+
+    async def _ensure_proc(self) -> asyncio.subprocess.Process:
+        """Spawn the persistent helper if it isn't running (first call or after a
+        crash). Must be called under ``self._lock``."""
+        if self._proc is None or self._proc.returncode is not None:
+            self._proc = await asyncio.create_subprocess_exec(
+                self.helper_path,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "A2F_MODEL_JSON": self.model_json},
+            )
+        return self._proc
 
     async def stream(self, pcm: bytes, emotion: list[float] | None) -> AsyncGenerator[dict, None]:
-        import asyncio
-        import struct
-
         import numpy as np
         import soxr
 
@@ -105,39 +131,40 @@ class HelperBackend:
         audio16 = soxr.resample(x, SAMPLE_RATE_IN, 16000).astype("<f4")
         emo = emotion if emotion else [0.0] * 10
 
-        proc = await asyncio.create_subprocess_exec(
-            self.helper_path,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "A2F_MODEL_JSON": self.model_json},
-        )
-        assert proc.stdin and proc.stdout
-        proc.stdin.write(struct.pack("<I", len(emo)) + struct.pack(f"<{len(emo)}f", *emo))
-        proc.stdin.write(struct.pack("<I", audio16.size) + audio16.tobytes())
-        proc.stdin.write(struct.pack("<I", 0))
-        await proc.stdin.drain()
-        proc.stdin.close()
-
         stride = max(1, 60 // FPS)  # helper is 60 FPS; emit every `stride`th
-        src_i = out_i = 0
-        try:
-            while True:
-                hdr = await proc.stdout.readexactly(4)
-                (n,) = struct.unpack("<I", hdr)
-                if n == 0:
-                    break
-                data = await proc.stdout.readexactly(n * 4)
-                if src_i % stride == 0:
-                    vals = struct.unpack(f"<{n}f", data)
-                    yield {"frame": out_i, "t": round(out_i / FPS, 4), "arkit": dict(zip(ARKIT_68, vals))}
-                    out_i += 1
-                src_i += 1
-        except asyncio.IncompleteReadError:
-            err = (await proc.stderr.read()).decode() if proc.stderr else ""
-            raise RuntimeError(f"a2f_stream ended early: {err.strip()[:300]}")
-        finally:
-            await proc.wait()
+        frames: list[dict] = []
+        async with self._lock:
+            proc = await self._ensure_proc()
+            assert proc.stdin and proc.stdout
+            try:
+                proc.stdin.write(struct.pack("<I", len(emo)) + struct.pack(f"<{len(emo)}f", *emo))
+                proc.stdin.write(struct.pack("<I", audio16.size) + audio16.tobytes())
+                proc.stdin.write(struct.pack("<I", 0))
+                await proc.stdin.drain()
+
+                src_i = out_i = 0
+                while True:
+                    hdr = await proc.stdout.readexactly(4)
+                    (n,) = struct.unpack("<I", hdr)
+                    if n == 0:
+                        break
+                    data = await proc.stdout.readexactly(n * 4)
+                    if src_i % stride == 0:
+                        vals = struct.unpack(f"<{n}f", data)
+                        frames.append(
+                            {"frame": out_i, "t": round(out_i / FPS, 4), "arkit": dict(zip(ARKIT_68, vals))}
+                        )
+                        out_i += 1
+                    src_i += 1
+            except (asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError):
+                err = (await proc.stderr.read()).decode() if proc.stderr else ""
+                proc.kill()
+                await proc.wait()
+                self._proc = None  # lazily respawn on the next call
+                raise RuntimeError(f"a2f_stream ended early: {err.strip()[:300]}")
+
+        for frame in frames:  # yield outside the lock — a slow consumer must not stall the pipe
+            yield frame
 
 
 def make_backend():
