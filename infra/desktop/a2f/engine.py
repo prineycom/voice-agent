@@ -37,6 +37,15 @@ from arkit import ARKIT_52
 SAMPLE_RATE_IN = int(os.getenv("A2F_INPUT_RATE", "24000"))  # TTS PCM16 mono
 FPS = int(os.getenv("A2F_FPS", "30"))
 
+# I/O timeouts for the persistent helper (seconds). A hung — not crashed —
+# helper (GPU stall, deadlocked CUDA/TensorRT) would otherwise wedge the lock
+# forever, so every await in the critical section is bounded.
+HELPER_TIMEOUT = float(os.getenv("A2F_HELPER_TIMEOUT", "5"))  # per-utterance I/O
+# The FIRST call also pays the one-time engine load (~1.5 s) on top of spawn, so
+# it gets a wider budget.
+HELPER_FIRST_TIMEOUT = float(os.getenv("A2F_HELPER_FIRST_TIMEOUT", "30"))
+HELPER_KILL_TIMEOUT = float(os.getenv("A2F_HELPER_KILL_TIMEOUT", "5"))  # kill → reap
+
 
 def _pcm16_to_float(pcm: bytes) -> list[float]:
     n = len(pcm) // 2
@@ -74,6 +83,11 @@ class MockBackend:
             frame["MouthFrownLeft"] = frame["MouthFrownRight"] = 0.4 * sad
             frame["BrowInnerUp"] = 0.3 * sad
             yield {"frame": i, "t": round(i / FPS, 4), "arkit": frame}
+
+    async def close(self) -> None:
+        """No persistent resource to release — present so the server can call
+        ``close()`` uniformly across backends."""
+        return
 
 
 class HelperBackend:
@@ -119,11 +133,52 @@ class HelperBackend:
             )
         return self._proc
 
+    async def _terminate(self, proc: asyncio.subprocess.Process) -> None:
+        """Force-kill ``proc`` and reap it (bounded), tolerating an already-exited
+        child. Used on every failure exit so no orphan GPU process is left."""
+        try:
+            proc.kill()  # may already be reaped after a self-exit crash
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=HELPER_KILL_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _utterance_io(
+        self, proc: asyncio.subprocess.Process, emo: list[float], audio16, stride: int
+    ) -> list[dict]:
+        """Write one utterance and read its framed blendshapes until the done
+        marker. Runs entirely inside ``self._lock`` (via ``stream``). No cleanup
+        here — the caller kills + clears the process on ANY failure exit."""
+        from arkit import ARKIT_68
+
+        assert proc.stdin and proc.stdout
+        proc.stdin.write(struct.pack("<I", len(emo)) + struct.pack(f"<{len(emo)}f", *emo))
+        proc.stdin.write(struct.pack("<I", audio16.size) + audio16.tobytes())
+        proc.stdin.write(struct.pack("<I", 0))
+        await proc.stdin.drain()
+
+        frames: list[dict] = []
+        src_i = out_i = 0
+        while True:
+            hdr = await proc.stdout.readexactly(4)
+            (n,) = struct.unpack("<I", hdr)
+            if n == 0:
+                break
+            data = await proc.stdout.readexactly(n * 4)
+            if src_i % stride == 0:
+                vals = struct.unpack(f"<{n}f", data)
+                frames.append(
+                    {"frame": out_i, "t": round(out_i / FPS, 4), "arkit": dict(zip(ARKIT_68, vals))}
+                )
+                out_i += 1
+            src_i += 1
+        return frames
+
     async def stream(self, pcm: bytes, emotion: list[float] | None) -> AsyncGenerator[dict, None]:
         import numpy as np
         import soxr
-
-        from arkit import ARKIT_68
 
         x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         if x.size == 0:
@@ -134,40 +189,63 @@ class HelperBackend:
         stride = max(1, 60 // FPS)  # helper is 60 FPS; emit every `stride`th
         frames: list[dict] = []
         async with self._lock:
+            existing = self._proc
             proc = await self._ensure_proc()
-            assert proc.stdin and proc.stdout
+            # The first call after a (re)spawn also pays the one-time engine load.
+            timeout = HELPER_FIRST_TIMEOUT if proc is not existing else HELPER_TIMEOUT
             try:
-                proc.stdin.write(struct.pack("<I", len(emo)) + struct.pack(f"<{len(emo)}f", *emo))
-                proc.stdin.write(struct.pack("<I", audio16.size) + audio16.tobytes())
-                proc.stdin.write(struct.pack("<I", 0))
-                await proc.stdin.drain()
-
-                src_i = out_i = 0
-                while True:
-                    hdr = await proc.stdout.readexactly(4)
-                    (n,) = struct.unpack("<I", hdr)
-                    if n == 0:
-                        break
-                    data = await proc.stdout.readexactly(n * 4)
-                    if src_i % stride == 0:
-                        vals = struct.unpack(f"<{n}f", data)
-                        frames.append(
-                            {"frame": out_i, "t": round(out_i / FPS, 4), "arkit": dict(zip(ARKIT_68, vals))}
-                        )
-                        out_i += 1
-                    src_i += 1
-            except (asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError):
-                err = (await proc.stderr.read()).decode() if proc.stderr else ""
-                try:
-                    proc.kill()  # may already be reaped after a self-exit crash
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
-                self._proc = None  # lazily respawn on the next call
-                raise RuntimeError(f"a2f_stream ended early: {err.strip()[:300]}")
+                frames = await asyncio.wait_for(
+                    self._utterance_io(proc, emo, audio16, stride), timeout=timeout
+                )
+            except (
+                asyncio.IncompleteReadError,
+                BrokenPipeError,
+                ConnectionResetError,
+                asyncio.TimeoutError,
+            ) as exc:
+                # Helper crashed (pipe) or hung (timeout) → drain stderr (bounded,
+                # it may be hung too), kill, clear so the next call respawns clean.
+                err = ""
+                if proc.stderr is not None:
+                    try:
+                        err = (await asyncio.wait_for(proc.stderr.read(), timeout=1.0)).decode()
+                    except Exception:  # noqa: BLE001
+                        err = ""
+                await self._terminate(proc)
+                self._proc = None
+                reason = "timed out" if isinstance(exc, asyncio.TimeoutError) else "ended early"
+                raise RuntimeError(f"a2f_stream {reason}: {err.strip()[:300]}")
+            except BaseException:
+                # Cancellation (WS disconnect / wait_for timeout / task supersession)
+                # or any other error may leave stdin half-written or stdout
+                # half-drained → the wire is desynced. Kill + clear so the next
+                # call respawns, but let the original exception propagate (never
+                # swallow CancelledError into RuntimeError).
+                await self._terminate(proc)
+                self._proc = None
+                raise
 
         for frame in frames:  # yield outside the lock — a slow consumer must not stall the pipe
             yield frame
+
+    async def close(self) -> None:
+        """Cleanly stop the persistent helper on server shutdown: close its stdin
+        (EOF → the helper's documented clean exit), reap it (bounded), then
+        force-kill if it lingers. Prevents an orphan GPU process holding VRAM + a
+        TensorRT context after an ungraceful stop."""
+        async with self._lock:
+            proc, self._proc = self._proc, None
+            if proc is None or proc.returncode is not None:
+                return
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=HELPER_KILL_TIMEOUT)
+            except asyncio.TimeoutError:
+                await self._terminate(proc)
 
 
 def make_backend():

@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -50,7 +51,14 @@ def _emotion_vector(value) -> list[float] | None:
     return None
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Cleanly stop the persistent A2F helper so no orphan GPU process outlives us.
+    await backend.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")

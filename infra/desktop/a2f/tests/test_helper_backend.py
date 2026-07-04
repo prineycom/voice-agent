@@ -160,3 +160,40 @@ def test_crash_then_respawn():
     assert spawn.call_count == 2  # one spawn for the crash, one for the respawn
     assert proc_after is not None
     _assert_valid_frames(frames)
+
+
+def test_interrupt_midutterance_does_not_reuse_desynced_process():
+    """Regression for the reuse-after-interruption desync: if the task is
+    cancelled (or any non-pipe exception fires) inside the locked write/read
+    section, the process is killed and cleared — never reused with a
+    half-written stdin / half-drained stdout. The next utterance respawns a
+    fresh process and yields correct, non-garbled frames."""
+    backend = engine.HelperBackend()
+
+    async def scenario():
+        try:
+            # Force a CancelledError from inside the locked I/O section (stands in
+            # for a WS disconnect / wait_for timeout / task supersession). The real
+            # process has already been spawned by _ensure_proc at this point.
+            async def boom(self, proc, emo, audio16, stride):
+                raise asyncio.CancelledError()
+
+            with patch.object(engine.HelperBackend, "_utterance_io", boom):
+                with pytest.raises(asyncio.CancelledError):  # NOT swallowed into RuntimeError
+                    await _collect(backend, None)
+            cleared = backend._proc is None  # the interrupted process was cleared
+
+            # The next utterance must respawn a fresh process (not reuse a desynced
+            # one) and return correct frames.
+            frames = await _collect(backend, None)
+            return cleared, backend._proc, frames
+        finally:
+            await _shutdown(backend)
+
+    with patch("asyncio.create_subprocess_exec", wraps=asyncio.create_subprocess_exec) as spawn:
+        cleared, proc_after, frames = asyncio.run(scenario())
+
+    assert cleared is True  # interruption killed + cleared the process
+    assert spawn.call_count == 2  # one for the interrupted utterance, one for the respawn
+    assert proc_after is not None
+    _assert_valid_frames(frames)  # respawned wire is clean (not garbled/desynced)

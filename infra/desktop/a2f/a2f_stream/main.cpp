@@ -52,10 +52,32 @@ const char* modelJson() {
   return p ? p : "/opt/a2f/model.json";
 }
 
-bool readU32(std::uint32_t& out) { return std::fread(&out, sizeof(out), 1, stdin) == 1; }
+// A partial stdin read (fewer bytes than the wire protocol promised) means the
+// parent writer was interrupted mid-message — the child cannot recover its place
+// in the byte stream, so it aborts loudly rather than fabricating data.
+[[noreturn]] void fatalTruncated(const char* what, std::size_t got, std::size_t want) {
+  std::cerr << "a2f_stream: truncated stdin read (" << what << "): got " << got
+            << " of " << want << " bytes — parent writer desync, aborting\n";
+  std::exit(4);
+}
+
+// Reads a u32 length prefix. Returns false ONLY on a clean EOF exactly at a
+// message boundary (0 bytes read) — the legitimate shutdown path. A partial read
+// (1-3 bytes of the prefix) is a fatal stdin desync.
+bool readU32(std::uint32_t& out) {
+  const std::size_t got = std::fread(&out, 1, sizeof(out), stdin);
+  if (got == sizeof(out)) return true;
+  if (got == 0) return false;  // clean EOF at boundary — shutdown path
+  fatalTruncated("u32 length prefix", got, sizeof(out));
+}
 std::vector<float> readFloats(std::uint32_t n) {
   std::vector<float> v(n);
-  if (n) { if (std::fread(v.data(), sizeof(float), n, stdin) != n) v.clear(); }
+  if (n) {
+    const std::size_t got = std::fread(v.data(), sizeof(float), n, stdin);
+    if (got != n)
+      fatalTruncated("float payload", got * sizeof(float),
+                     static_cast<std::size_t>(n) * sizeof(float));
+  }
   return v;
 }
 void writeFrame(const float* data, std::uint32_t n) {
