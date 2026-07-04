@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+import a2f_fork
 import synthesize
 
 load_dotenv()
@@ -109,6 +110,8 @@ async def tts_ws(ws: WebSocket):
         await ws.send_json({"error": "model not loaded"})
         await ws.close()
         return
+    # Best-effort A2F forks opened on this connection, reaped when it closes.
+    forks: list = []
     try:
         while True:
             msg = await ws.receive()
@@ -119,6 +122,9 @@ async def tts_ws(ws: WebSocket):
             req = json.loads(msg["text"])
             text = (req.get("text") or "").strip()
             voice = req.get("voice", "default")
+            emotion = req.get("emotion")
+            if not isinstance(emotion, (str, list)):
+                emotion = None
             if not text:
                 await ws.send_json({"error": "empty text"})
                 continue
@@ -141,17 +147,32 @@ async def tts_ws(ws: WebSocket):
 
             producer_task = asyncio.create_task(asyncio.to_thread(produce))
 
+            # Tee this utterance into the co-located A2F service (best-effort;
+            # a fork failure must never affect the client stream or barge-in).
+            fork = None
+            try:
+                fork = a2f_fork.maybe_start_fork(emotion)
+            except Exception:  # noqa: BLE001
+                log.warning("Failed to start A2F fork", exc_info=True)
+                fork = None
+            if fork:
+                forks.append(fork)
+
             try:
                 completed = False
                 while True:
                     item = await queue.get()
                     if item is None:
                         completed = True
+                        if fork:
+                            fork.end()
                         break
                     if isinstance(item, Exception):
                         await ws.send_json({"error": str(item)})
                         break
                     await ws.send_bytes(item)
+                    if fork:
+                        fork.feed(item)
                 if completed:
                     try:
                         await ws.send_json({"done": True})
@@ -160,6 +181,8 @@ async def tts_ws(ws: WebSocket):
             finally:
                 cancel.set()
                 await asyncio.gather(producer_task, return_exceptions=True)
+                if fork and not completed:
+                    await fork.close()
     except WebSocketDisconnect:
         pass
     except Exception as e:  # noqa: BLE001
@@ -168,6 +191,9 @@ async def tts_ws(ws: WebSocket):
             await ws.send_json({"error": str(e)})
         except Exception:
             pass
+    finally:
+        for f in forks:
+            await f.close()
 
 
 if __name__ == "__main__":
