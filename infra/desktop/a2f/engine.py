@@ -158,7 +158,10 @@ class HelperBackend:
                     src_i += 1
             except (asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError):
                 err = (await proc.stderr.read()).decode() if proc.stderr else ""
-                proc.kill()
+                try:
+                    proc.kill()  # may already be reaped after a self-exit crash
+                except ProcessLookupError:
+                    pass
                 await proc.wait()
                 self._proc = None  # lazily respawn on the next call
                 raise RuntimeError(f"a2f_stream ended early: {err.strip()[:300]}")
