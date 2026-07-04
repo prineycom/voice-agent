@@ -1,22 +1,33 @@
 // a2f_stream — streaming Audio2Face helper for the A2F WS service (`helper` backend).
 //
-// Reads an utterance on stdin, writes ARKit blendshape frames on stdout, running
-// the batch-1 TensorRT engine via the Audio2Face-3D-SDK (libaudio2x). Uses the
-// regression *blendshape-solve* executor bundle, whose executor emits solved
-// blendshape weights (ARKit coefficients) — not raw geometry.
+// Loads the bs1 TensorRT engine ONCE and serves N utterances from one long-lived
+// process, running the Audio2Face-3D-SDK (libaudio2x) *Interactive* executors: a
+// regression geometry interactive executor feeding a Device (GPU) blendshape-solve
+// interactive executor, which emits solved blendshape weights (ARKit coefficients).
 //
-// Protocol (stdin/stdout, little-endian):
+// Protocol (stdin/stdout, little-endian) — one utterance per iteration:
 //   stdin :  [u32 emotionLen][emotionLen*f32 emotion]
 //            then repeated [u32 nSamples][nSamples*f32 audio @16kHz mono]
 //            then [u32 0]  == end-of-utterance
-//   stdout:  first frame is prefixed by [u32 nCoeffs] once; then per frame
-//            [u32 nCoeffs][nCoeffs*f32 weights]; then [u32 0] == done.
+//   stdout:  per frame [u32 nCoeffs][nCoeffs*f32 weights]; then [u32 0] == done.
+//   The trailing [u32 0] is a PER-UTTERANCE boundary — the process stays alive and
+//   the engine stays loaded, then loops back to read the next utterance's emotion.
+//   EOF at the emotion-length read = clean shutdown.
+//
+// The interactive executor computes frames only from a CLOSED audio accumulator,
+// so a utterance's frames are emitted right after its end-of-utterance flush
+// (the accumulator is Reset()/re-opened for the next utterance).
 //
 // Build: ../build_helper.sh (inside nvcr.io/nvidia/tensorrt:25.08-py3).
 
 #include "audio2face/audio2face.h"
 #include "audio2face/executor.h"
 #include "audio2face/executor_blendshapesolve.h"
+#include "audio2face/interactive_executor.h"
+#include "audio2face/parse_helper.h"
+#include "audio2x/audio_accumulator.h"
+#include "audio2x/emotion_accumulator.h"
+#include "audio2x/cuda_stream.h"
 #include "audio2x/cuda_utils.h"
 #include "audio2x/tensor_float.h"
 #include "audio2x/io.h"
@@ -69,58 +80,103 @@ bool onResults(void* ud, const nva2f::IBlendshapeExecutor::DeviceResults& r) {
 int main() {
   if (nva2x::SetCudaDeviceIfNeeded(0)) { std::cerr << "cuda init failed\n"; return 1; }
 
-  // Single-track regression blendshape-solve bundle on the batch-1 engine.
-  // GPU solver; 60 fps native (the service downsamples to A2F_FPS).
-  auto bundle = ToUniquePtr(nva2f::ReadRegressionBlendshapeSolveExecutorBundle(
-      /*nbTracks=*/1, modelJson(),
-      nva2f::IGeometryExecutor::ExecutionOption::SkinTongue,
-      /*useGpuSolver=*/true, /*frameRateNumerator=*/60, /*frameRateDenominator=*/1,
-      /*outModelInfo=*/nullptr, /*outBlendshapeSolveModelInfo=*/nullptr));
-  if (!bundle) { std::cerr << "failed to load bundle: " << modelJson() << "\n"; return 2; }
+  // ---- one-time setup: load the bs1 engine ONCE, build persistent executors ----
+  auto cudaStream = ToUniquePtr(nva2x::CreateCudaStream());
+  if (!cudaStream) { std::cerr << "cuda stream failed\n"; return 2; }
+  auto stream = cudaStream->Data();
 
-  // Pinned host buffer to receive each frame's device-side weights.
-  auto hostWeights = ToUniquePtr(nva2x::CreateHostPinnedTensorFloat(bundle->GetExecutor().GetWeightCount()));
-  if (bundle->GetExecutor().SetResultsCallback(onResults, hostWeights.get())) {
+  // Model info loads the network (bs1 TensorRT engine) + blendshape-solver data.
+  auto geomInfo = ToUniquePtr(nva2f::ReadRegressionModelInfo(modelJson()));
+  if (!geomInfo) { std::cerr << "failed to read model info: " << modelJson() << "\n"; return 2; }
+  auto bsInfo = ToUniquePtr(nva2f::ReadRegressionBlendshapeSolveModelInfo(modelJson()));
+  if (!bsInfo) { std::cerr << "failed to read blendshape solve model info\n"; return 2; }
+
+  const std::size_t emotionSize = geomInfo->GetNetworkInfo().GetEmotionsCount();
+
+  // Shared accumulators — persist across utterances (Reset() per utterance).
+  auto audioAcc = ToUniquePtr(nva2x::CreateAudioAccumulator(16000, 0));
+  auto emoAcc = ToUniquePtr(nva2x::CreateEmotionAccumulator(emotionSize, 300, 0));
+  if (!audioAcc || !emoAcc) { std::cerr << "accumulator alloc failed\n"; return 2; }
+
+  // Geometry interactive executor on the batch-1 engine (60 fps native; the
+  // service downsamples to A2F_FPS). Full geometry (All): the Device
+  // blendshape-solve interactive executor requires the geometry executor to run
+  // all outputs — a SkinTongue-only geometry executor crashes the device solve.
+  // The extra jaw/eyes geometry doesn't change the solved skin+tongue weights.
+  nva2f::GeometryExecutorCreationParameters geomParams;
+  geomParams.cudaStream = stream;
+  geomParams.nbTracks = 1;
+  const nva2x::IAudioAccumulator* audioAccPtr = audioAcc.get();
+  geomParams.sharedAudioAccumulators = &audioAccPtr;
+  const nva2x::IEmotionAccumulator* emoAccPtr = emoAcc.get();
+  geomParams.sharedEmotionAccumulators = &emoAccPtr;
+
+  const auto regressionParams = geomInfo->GetExecutorCreationParameters(
+      nva2f::IGeometryExecutor::ExecutionOption::All, /*frameRateNumerator=*/60,
+      /*frameRateDenominator=*/1);
+
+  auto geomExec = ToUniquePtr(nva2f::CreateRegressionGeometryInteractiveExecutor(
+      geomParams, regressionParams, /*batchSize=*/1));
+  if (!geomExec) { std::cerr << "failed to create geometry interactive executor\n"; return 2; }
+
+  // Device (GPU) blendshape-solve interactive executor. Device/GPU is mandatory:
+  // the CPU solver is a ~184k×68 least-squares per frame (~150 s/utterance). It
+  // takes ownership of the geometry executor (destroyed together at exit).
+  const auto bsParams0 = bsInfo->GetExecutorCreationParameters(
+      nva2f::IGeometryExecutor::ExecutionOption::All);
+  nva2f::DeviceBlendshapeSolveExecutorCreationParameters bsParams;
+  bsParams.initializationSkinParams = bsParams0.initializationSkinParams;
+  bsParams.initializationTongueParams = bsParams0.initializationTongueParams;
+
+  auto bsExec = ToUniquePtr(nva2f::CreateDeviceBlendshapeSolveInteractiveExecutor(
+      geomExec.release(), bsParams));  // ownership of geomExec transferred here
+  if (!bsExec) { std::cerr << "failed to create device blendshape solve interactive executor\n"; return 3; }
+
+  // Pinned host buffer + device-results callback — set ONCE.
+  auto hostWeights = ToUniquePtr(nva2x::CreateHostPinnedTensorFloat(bsExec->GetWeightCount()));
+  if (bsExec->SetResultsCallback(onResults, hostWeights.get())) {
     std::cerr << "set callback failed\n"; return 3;
   }
 
-  // One utterance per process invocation. Feed emotion + the full utterance's
-  // audio, Close (TTS gives us the whole utterance at once, so Close flushes the
-  // executor's ~0.5s lookahead → all frames), drain, emit a done marker, exit.
-  //
-  // NOTE: this batch executor can't be cleanly reused for a second utterance in
-  // one process — Close is terminal, and the accumulators' Reset() does not reset
-  // the executor's read position (verified: utterance 2 yields 0 frames), while a
-  // no-Close continuous stream delays/mis-attributes frames by the lookahead. A
-  // persistent (load-engine-once) service should use the SDK's *Interactive*
-  // executors (CreateRegression...InteractiveExecutor / ...BlendshapeSolveInteractive),
-  // which are built for streaming. Until then HelperBackend spawns per utterance.
-  auto& audioAcc = bundle->GetAudioAccumulator(0);
-  auto& emoAcc = bundle->GetEmotionAccumulator(0);
-  auto stream = bundle->GetCudaStream().Data();
-  auto drain = [&]() {
-    while (nva2x::GetNbReadyTracks(bundle->GetExecutor()) > 0)
-      bundle->GetExecutor().Execute(nullptr);
-  };
+  auto& exec = *bsExec;
+  using Layers = nva2f::IGeometryInteractiveExecutor;
 
+  // ---- per-utterance loop; the process and the loaded engine persist ----
   std::uint32_t emoLen = 0;
-  if (!readU32(emoLen)) return 0;
-  std::vector<float> emotion = readFloats(emoLen);
-  emotion.resize(emoAcc.GetEmotionSize(), 0.0f);
-  emoAcc.Accumulate(0, nva2x::HostTensorFloatConstView{emotion.data(), emotion.size()}, stream);
-  emoAcc.Close();
+  while (readU32(emoLen)) {  // EOF here == clean shutdown
+    std::vector<float> emotion = readFloats(emoLen);
+    emotion.resize(emotionSize, 0.0f);
+    emoAcc->Reset();
+    emoAcc->Accumulate(0, nva2x::HostTensorFloatConstView{emotion.data(), emotion.size()}, stream);
+    emoAcc->Close();
 
-  std::uint32_t n = 0;
-  while (readU32(n) && n != 0) {
-    std::vector<float> chunk = readFloats(n);
-    audioAcc.Accumulate(nva2x::HostTensorFloatConstView{chunk.data(), chunk.size()}, stream);
-    drain();
+    // Fresh audio stream for this utterance (Reset re-opens the accumulator).
+    audioAcc->Reset();
+
+    // Push each audio chunk incrementally into the shared accumulator.
+    std::uint32_t n = 0;
+    while (readU32(n) && n != 0) {
+      std::vector<float> chunk = readFloats(n);
+      audioAcc->Accumulate(nva2x::HostTensorFloatConstView{chunk.data(), chunk.size()}, stream);
+    }
+
+    // Per-utterance NON-terminal flush: the interactive executor only computes
+    // frames from a CLOSED accumulator, and Close reveals the ~0.5 s
+    // centered-window lookahead tail. The executor itself is never destroyed
+    // and the accumulator is Reset() next iteration, so Close is a per-utterance
+    // boundary, not terminal (unlike the old batch executor). Invalidate drops
+    // all cached state so this utterance's frames are computed from scratch.
+    audioAcc->Close();
+    exec.Invalidate(Layers::kLayerAll);
+
+    // Pop every frame for this utterance; ComputeAllFrames fires the results
+    // callback (→ writeFrame) once per frame in ascending timestamp order.
+    exec.ComputeAllFrames();
+
+    // Per-utterance done marker — does NOT exit the process.
+    std::uint32_t done = 0;
+    std::fwrite(&done, sizeof(done), 1, stdout);
+    std::fflush(stdout);
   }
-  audioAcc.Close();
-  drain();
-
-  std::uint32_t done = 0;
-  std::fwrite(&done, sizeof(done), 1, stdout);
-  std::fflush(stdout);
   return 0;
 }
