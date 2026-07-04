@@ -71,25 +71,73 @@ class MockBackend:
 
 
 class HelperBackend:
-    """Bridges to the compiled C++ ``a2f_stream`` helper (WIP). Kept import-safe
-    so the module loads without the helper present; ``stream`` raises until the
-    helper binary + engine exist."""
+    """Bridges to the compiled C++ ``a2f_stream`` helper, which runs the batch-1
+    engine + blendshape solve and emits 68 ARKit coefficients per frame at 60 FPS.
+
+    Per utterance: resample the incoming 24 kHz PCM16 → 16 kHz float, spawn the
+    helper, write ``[emotion][audio][end]`` on its stdin (see a2f_stream/main.cpp
+    protocol), read framed float vectors from stdout, map to ARKit names, and
+    downsample 60 → ``A2F_FPS``.
+
+    NOTE: currently spawns the helper per utterance (engine load ≈ a few seconds
+    of startup). A persistent helper (load-once, loop over utterances) is the
+    key latency optimisation — tracked in a2f_stream/README.md.
+    """
 
     name = "helper"
 
     def __init__(self) -> None:
         self.helper_path = os.getenv("A2F_HELPER", "/opt/a2f/a2f_stream")
-        self.engine_path = os.getenv("A2F_ENGINE", "/opt/a2f/network.trt")
+        self.model_json = os.getenv("A2F_MODEL_JSON", "/opt/a2f/model.json")
 
     async def stream(self, pcm: bytes, emotion: list[float] | None) -> AsyncGenerator[dict, None]:
-        # TODO(Phase 1): spawn the helper (asyncio subprocess), write the emotion
-        # vector + resampled-to-16k float PCM to stdin, parse blendshape frames
-        # from stdout. Blocked on the helper's SDK inference wiring — see
-        # a2f_stream/README.md. Until then, fail loudly rather than silently mock.
-        raise NotImplementedError(
-            "A2F helper backend not wired yet; run with A2F_BACKEND=mock or build a2f_stream"
+        import asyncio
+        import struct
+
+        import numpy as np
+        import soxr
+
+        from arkit import ARKIT_68
+
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if x.size == 0:
+            return
+        audio16 = soxr.resample(x, SAMPLE_RATE_IN, 16000).astype("<f4")
+        emo = emotion if emotion else [0.0] * 10
+
+        proc = await asyncio.create_subprocess_exec(
+            self.helper_path,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "A2F_MODEL_JSON": self.model_json},
         )
-        yield  # pragma: no cover — makes this an async generator
+        assert proc.stdin and proc.stdout
+        proc.stdin.write(struct.pack("<I", len(emo)) + struct.pack(f"<{len(emo)}f", *emo))
+        proc.stdin.write(struct.pack("<I", audio16.size) + audio16.tobytes())
+        proc.stdin.write(struct.pack("<I", 0))
+        await proc.stdin.drain()
+        proc.stdin.close()
+
+        stride = max(1, 60 // FPS)  # helper is 60 FPS; emit every `stride`th
+        src_i = out_i = 0
+        try:
+            while True:
+                hdr = await proc.stdout.readexactly(4)
+                (n,) = struct.unpack("<I", hdr)
+                if n == 0:
+                    break
+                data = await proc.stdout.readexactly(n * 4)
+                if src_i % stride == 0:
+                    vals = struct.unpack(f"<{n}f", data)
+                    yield {"frame": out_i, "t": round(out_i / FPS, 4), "arkit": dict(zip(ARKIT_68, vals))}
+                    out_i += 1
+                src_i += 1
+        except asyncio.IncompleteReadError:
+            err = (await proc.stderr.read()).decode() if proc.stderr else ""
+            raise RuntimeError(f"a2f_stream ended early: {err.strip()[:300]}")
+        finally:
+            await proc.wait()
 
 
 def make_backend():

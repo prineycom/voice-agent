@@ -47,9 +47,9 @@ per frame, then `{"done": true}` (or `{"error":"…"}`).
 - **`mock`** (default) — synthetic, well-formed blendshapes; no GPU. Lets the WS
   contract, agent wiring, and frontend be built/tested now. `pytest tests/` covers it.
 - **`helper`** — the compiled C++ `a2f_stream` helper on the batch-1 TensorRT
-  engine. **Inference core is WIP** (`a2f_stream/`): the SDK regression executor +
-  audio/emotion accumulators + stdin/stdout protocol are scaffolded; the
-  geometry→ARKit blendshape extraction still needs wiring and on-GPU verification.
+  engine (`a2f_stream/`). **Built + verified on the box**: regression geometry → GPU
+  blendshape solve → 68 ARKit coefficients/frame at 60 FPS. Remaining work is making
+  the helper *persistent* (load the engine once) to avoid per-utterance reload.
 
 ## Run / test
 
@@ -72,6 +72,7 @@ dir=in action=allow protocol=TCP localport=8003`.
 
 - [x] FastAPI service, `/health`, WS `/a2f` contract, emotion mapping, mock backend, tests
 - [x] `build_engine.sh` — reproducible batch-1 engine (verified in the spike)
-- [~] `a2f_stream/` C++ helper — scaffolded; inference core (blendshape extraction) WIP
-- [ ] wire `helper` backend subprocess bridge in `engine.py` once the helper emits frames
+- [x] `a2f_stream/` C++ helper — **built + working on the box**: 68 ARKit coeffs/frame (52 skin+16 tongue), GPU blendshape solve, verified vs a test WAV
+- [x] `helper` backend subprocess bridge in `engine.py` (resample 24→16k, feed, map, 60→30 fps)
+- [ ] make the helper **persistent** (load engine once) to cut per-utterance startup latency
 - [ ] TTS-side PCM fork + `emotion` field plumbing; agent-side `/a2f` forward to `voiceagent`

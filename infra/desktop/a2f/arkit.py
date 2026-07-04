@@ -27,6 +27,17 @@ ARKIT_52 = [
     "TongueOut",
 ]
 
+# The A2F James model / SDK blendshape solve emits 68 coefficients: the 52 above
+# (skin) + 16 extended tongue shapes, in this order (matches the NIM's
+# animation_frames.csv header). a2f_stream writes these 68 floats per frame.
+TONGUE_16 = [
+    "TongueTipUp", "TongueTipDown", "TongueTipLeft", "TongueTipRight",
+    "TongueRollUp", "TongueRollDown", "TongueRollLeft", "TongueRollRight",
+    "TongueUp", "TongueDown", "TongueLeft", "TongueRight",
+    "TongueIn", "TongueStretch", "TongueWide", "TongueNarrow",
+]
+ARKIT_68 = ARKIT_52 + TONGUE_16
+
 # Emotion enum shared with SOUL.md / the agent (decision #5). Mapped to the A2F
 # emotion input vector by `emotion.py`.
 EMOTIONS = ["neutral", "happy", "sad", "surprised", "thinking"]

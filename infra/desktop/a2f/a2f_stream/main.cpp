@@ -1,84 +1,90 @@
-// a2f_stream — streaming Audio2Face helper for the A2F WS service.
+// a2f_stream — streaming Audio2Face helper for the A2F WS service (`helper` backend).
 //
-// STATUS: WIP skeleton. The service (../server.py) runs today on the `mock`
-// backend; this helper is the `helper` backend's inference core. It compiles
-// against the Audio2Face-3D-SDK (libaudio2x) and is structured around the real
-// SDK API, but the geometry->ARKit blendshape extraction (marked TODO) still
-// needs to be wired against the SDK headers and verified on the GPU box.
+// Reads an utterance on stdin, writes ARKit blendshape frames on stdout, running
+// the batch-1 TensorRT engine via the Audio2Face-3D-SDK (libaudio2x). Uses the
+// regression *blendshape-solve* executor bundle, whose executor emits solved
+// blendshape weights (ARKit coefficients) — not raw geometry.
 //
-// Protocol (stdin/stdout, length-prefixed little-endian):
+// Protocol (stdin/stdout, little-endian):
 //   stdin :  [u32 emotionLen][emotionLen*f32 emotion]
-//            then repeated [u32 nSamples][nSamples*f32 audio @16kHz]
+//            then repeated [u32 nSamples][nSamples*f32 audio @16kHz mono]
 //            then [u32 0]  == end-of-utterance
-//   stdout:  repeated [u32 nCoeffs][nCoeffs*f32 arkit]   one message per frame
-//            then [u32 0]  == done
+//   stdout:  first frame is prefixed by [u32 nCoeffs] once; then per frame
+//            [u32 nCoeffs][nCoeffs*f32 weights]; then [u32 0] == done.
 //
-// Build: see ../build_helper.sh (runs inside nvcr.io/nvidia/tensorrt:25.08-py3).
+// Build: ../build_helper.sh (inside nvcr.io/nvidia/tensorrt:25.08-py3).
 
 #include "audio2face/audio2face.h"
-#include "audio2face/executor_regression.h"
+#include "audio2face/executor.h"
 #include "audio2face/executor_blendshapesolve.h"
-#include "audio2face/emotion.h"
 #include "audio2x/cuda_utils.h"
+#include "audio2x/tensor_float.h"
+#include "audio2x/io.h"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <vector>
 
-using nva2f::UniquePtr;
-
 namespace {
 
-// model.json for the batch-1 engine produced by ../build_engine.sh, copied next
-// to the helper at deploy time (A2F_ENGINE dir).
-const char* kModelJson = std::getenv("A2F_MODEL_JSON")
-    ? std::getenv("A2F_MODEL_JSON")
-    : "/opt/a2f/model.json";
+struct Destroyer { template <typename T> void operator()(T* o) const { o->Destroy(); } };
+template <typename T> using UniquePtr = std::unique_ptr<T, Destroyer>;
+template <typename T> UniquePtr<T> ToUniquePtr(T* p) { return UniquePtr<T>(p); }
 
-bool readU32(std::uint32_t& out) {
-  return std::fread(&out, sizeof(out), 1, stdin) == 1;
+const char* modelJson() {
+  const char* p = std::getenv("A2F_MODEL_JSON");
+  return p ? p : "/opt/a2f/model.json";
 }
+
+bool readU32(std::uint32_t& out) { return std::fread(&out, sizeof(out), 1, stdin) == 1; }
 std::vector<float> readFloats(std::uint32_t n) {
   std::vector<float> v(n);
-  if (n) std::fread(v.data(), sizeof(float), n, stdin);
+  if (n) { if (std::fread(v.data(), sizeof(float), n, stdin) != n) v.clear(); }
   return v;
 }
-void writeFrame(const std::vector<float>& coeffs) {
-  std::uint32_t n = static_cast<std::uint32_t>(coeffs.size());
+void writeFrame(const float* data, std::uint32_t n) {
   std::fwrite(&n, sizeof(n), 1, stdout);
-  if (n) std::fwrite(coeffs.data(), sizeof(float), n, stdout);
+  if (n) std::fwrite(data, sizeof(float), n, stdout);
   std::fflush(stdout);
+}
+
+// Per-frame blendshape-solve result → stdout. The GPU solver returns weights in
+// device memory; copy to a pinned host buffer (passed as userdata), sync, emit.
+// weights are the ARKit coefficients (skin + tongue solved).
+bool onResults(void* ud, const nva2f::IBlendshapeExecutor::DeviceResults& r) {
+  auto* host = static_cast<nva2x::IHostTensorFloat*>(ud);
+  if (nva2x::CopyDeviceToHost(host->View(0, host->Size()), r.weights, r.cudaStream)) return false;
+  cudaStreamSynchronize(r.cudaStream);
+  writeFrame(host->Data(), static_cast<std::uint32_t>(host->Size()));
+  return true;
 }
 
 }  // namespace
 
 int main() {
-  constexpr int deviceID = 0;
-  if (nva2x::SetCudaDeviceIfNeeded(deviceID)) { std::cerr << "cuda init failed\n"; return 1; }
+  if (nva2x::SetCudaDeviceIfNeeded(0)) { std::cerr << "cuda init failed\n"; return 1; }
 
-  // Single-track regression executor bundle on the batch-1 engine + skin/tongue
-  // blendshape solve (60 fps native; the service downsamples to A2F_FPS).
-  auto bundle = nva2f::ToUniquePtr(nva2f::ReadRegressionGeometryExecutorBundle(
-      /*nbTracks=*/1, kModelJson,
+  // Single-track regression blendshape-solve bundle on the batch-1 engine.
+  // GPU solver; 60 fps native (the service downsamples to A2F_FPS).
+  auto bundle = ToUniquePtr(nva2f::ReadRegressionBlendshapeSolveExecutorBundle(
+      /*nbTracks=*/1, modelJson(),
       nva2f::IGeometryExecutor::ExecutionOption::SkinTongue,
-      /*fps=*/60, /*stride=*/1, /*progress=*/nullptr));
-  if (!bundle) { std::cerr << "failed to load model bundle: " << kModelJson << "\n"; return 2; }
+      /*useGpuSolver=*/true, /*frameRateNumerator=*/60, /*frameRateDenominator=*/1,
+      /*outModelInfo=*/nullptr, /*outBlendshapeSolveModelInfo=*/nullptr));
+  if (!bundle) { std::cerr << "failed to load bundle: " << modelJson() << "\n"; return 2; }
 
-  // Result callback: one Results per produced frame. TODO: extract the ARKit
-  // blendshape coefficients from `results` here (the SDK routes geometry through
-  // the skin/tongue blendshape solver — confirm the coefficient accessor in
-  // audio2face/executor_blendshapesolve.h) and hand them to writeFrame().
-  auto callback = [](void* /*ud*/, const nva2f::IGeometryExecutor::Results& results) -> bool {
-    std::vector<float> arkit;  // TODO: fill from results (skin + tongue coeffs)
-    (void)results;
-    writeFrame(arkit);
-    return true;
-  };
-  bundle->GetExecutor().SetResultsCallback(callback, nullptr);
+  // Pinned host buffer to receive each frame's device-side weights.
+  auto hostWeights = ToUniquePtr(nva2x::CreateHostPinnedTensorFloat(bundle->GetExecutor().GetWeightCount()));
+  if (bundle->GetExecutor().SetResultsCallback(onResults, hostWeights.get())) {
+    std::cerr << "set callback failed\n"; return 3;
+  }
 
-  // Emotion (first message). Applied to track 0 for the whole utterance.
+  // Emotion (first stdin message) → track 0 for the whole utterance.
   std::uint32_t emoLen = 0;
   if (!readU32(emoLen)) return 0;
   std::vector<float> emotion = readFloats(emoLen);
@@ -88,7 +94,7 @@ int main() {
                     bundle->GetCudaStream().Data());
   emoAcc.Close();
 
-  // Stream audio chunks -> accumulate -> execute -> callback emits frames.
+  // Stream audio chunks → accumulate → execute → callback emits frames.
   auto& audioAcc = bundle->GetAudioAccumulator(0);
   std::uint32_t n = 0;
   while (readU32(n) && n != 0) {
