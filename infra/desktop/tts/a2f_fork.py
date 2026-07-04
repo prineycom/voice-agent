@@ -48,6 +48,13 @@ class A2FFork:
         self._ended = False
         self._task = asyncio.create_task(self._run())
 
+    @property
+    def done(self) -> bool:
+        """True once the background task has finished (drained, failed, or closed)
+        — safe to drop the reference. Lets the caller prune completed forks so a
+        long-lived `/tts` connection doesn't retain one per utterance."""
+        return self._task is None or self._task.done()
+
     def feed(self, pcm: bytes) -> None:
         """Enqueue a PCM chunk for A2F. No-op after failure or end. Never raises."""
         if self._failed or self._ended:

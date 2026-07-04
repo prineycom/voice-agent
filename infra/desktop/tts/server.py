@@ -147,6 +147,11 @@ async def tts_ws(ws: WebSocket):
 
             producer_task = asyncio.create_task(asyncio.to_thread(produce))
 
+            # Prune forks whose background drain already finished, so a long-lived
+            # connection (the agent pipelines many sentences over one socket) does
+            # not retain a completed A2FFork per utterance.
+            forks = [f for f in forks if not f.done]
+
             # Tee this utterance into the co-located A2F service (best-effort;
             # a fork failure must never affect the client stream or barge-in).
             fork = None
