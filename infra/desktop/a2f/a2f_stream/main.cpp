@@ -84,29 +84,40 @@ int main() {
     std::cerr << "set callback failed\n"; return 3;
   }
 
-  // Emotion (first stdin message) → track 0 for the whole utterance.
+  // One utterance per process invocation. Feed emotion + the full utterance's
+  // audio, Close (TTS gives us the whole utterance at once, so Close flushes the
+  // executor's ~0.5s lookahead → all frames), drain, emit a done marker, exit.
+  //
+  // NOTE: this batch executor can't be cleanly reused for a second utterance in
+  // one process — Close is terminal, and the accumulators' Reset() does not reset
+  // the executor's read position (verified: utterance 2 yields 0 frames), while a
+  // no-Close continuous stream delays/mis-attributes frames by the lookahead. A
+  // persistent (load-engine-once) service should use the SDK's *Interactive*
+  // executors (CreateRegression...InteractiveExecutor / ...BlendshapeSolveInteractive),
+  // which are built for streaming. Until then HelperBackend spawns per utterance.
+  auto& audioAcc = bundle->GetAudioAccumulator(0);
+  auto& emoAcc = bundle->GetEmotionAccumulator(0);
+  auto stream = bundle->GetCudaStream().Data();
+  auto drain = [&]() {
+    while (nva2x::GetNbReadyTracks(bundle->GetExecutor()) > 0)
+      bundle->GetExecutor().Execute(nullptr);
+  };
+
   std::uint32_t emoLen = 0;
   if (!readU32(emoLen)) return 0;
   std::vector<float> emotion = readFloats(emoLen);
-  auto& emoAcc = bundle->GetEmotionAccumulator(0);
   emotion.resize(emoAcc.GetEmotionSize(), 0.0f);
-  emoAcc.Accumulate(0, nva2x::HostTensorFloatConstView{emotion.data(), emotion.size()},
-                    bundle->GetCudaStream().Data());
+  emoAcc.Accumulate(0, nva2x::HostTensorFloatConstView{emotion.data(), emotion.size()}, stream);
   emoAcc.Close();
 
-  // Stream audio chunks → accumulate → execute → callback emits frames.
-  auto& audioAcc = bundle->GetAudioAccumulator(0);
   std::uint32_t n = 0;
   while (readU32(n) && n != 0) {
     std::vector<float> chunk = readFloats(n);
-    audioAcc.Accumulate(nva2x::HostTensorFloatConstView{chunk.data(), chunk.size()},
-                        bundle->GetCudaStream().Data());
-    while (nva2x::GetNbReadyTracks(bundle->GetExecutor()) > 0)
-      bundle->GetExecutor().Execute(nullptr);
+    audioAcc.Accumulate(nva2x::HostTensorFloatConstView{chunk.data(), chunk.size()}, stream);
+    drain();
   }
   audioAcc.Close();
-  while (nva2x::GetNbReadyTracks(bundle->GetExecutor()) > 0)
-    bundle->GetExecutor().Execute(nullptr);
+  drain();
 
   std::uint32_t done = 0;
   std::fwrite(&done, sizeof(done), 1, stdout);

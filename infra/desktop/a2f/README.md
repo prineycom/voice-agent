@@ -74,5 +74,5 @@ dir=in action=allow protocol=TCP localport=8003`.
 - [x] `build_engine.sh` — reproducible batch-1 engine (verified in the spike)
 - [x] `a2f_stream/` C++ helper — **built + working on the box**: 68 ARKit coeffs/frame (52 skin+16 tongue), GPU blendshape solve, verified vs a test WAV
 - [x] `helper` backend subprocess bridge in `engine.py` (resample 24→16k, feed, map, 60→30 fps)
-- [ ] make the helper **persistent** (load engine once) to cut per-utterance startup latency
+- [ ] make the helper **persistent** — needs a port to the SDK *Interactive* executors (streaming); the batch executor can't be reused across utterances (see a2f_stream/README.md)
 - [ ] TTS-side PCM fork + `emotion` field plumbing; agent-side `/a2f` forward to `voiceagent`

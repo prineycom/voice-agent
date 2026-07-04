@@ -12,10 +12,22 @@ values (max ≈ 0.31, ~22 non-zero). `HelperBackend` in `../engine.py` drives it
 
 Build: `../build_helper.sh` (g++ against `libaudio2x.so`, run in the TRT container).
 
-**Latency optimisation (open):** the helper currently loads the TensorRT engine on
-every spawn (a few seconds). Make it **persistent** — load once, loop over
-utterances (reset the audio accumulator between them) — so per-utterance latency is
-just inference (~1.3 ms/frame). Then flip `HelperBackend` to reuse one process.
+**Latency optimisation (open):** the helper loads the TensorRT engine on every
+spawn (a few seconds), so `HelperBackend` spawns it per utterance. Making it
+**persistent** (load once) is NOT a simple loop with the batch executor — verified
+on the box:
+- `Close()` is required to flush A2F's ~0.5 s lookahead (→ all frames), but it is
+  terminal (can't accept a second utterance).
+- the accumulators' `Reset()` clears data but does **not** reset the executor's
+  read position (`GetNextAudioSampleToRead`), so utterance 2 yields 0 frames.
+- a no-`Close` continuous stream delays/mis-attributes frames by the lookahead
+  (`[1, 58]` for two utterances).
+
+The correct persistent path is the SDK's **Interactive** executors
+(`CreateRegressionGeometryInteractiveExecutor` + `CreateHostBlendshapeSolveInteractiveExecutor`,
+`IFaceInteractiveExecutor`), which are designed for streaming (push audio
+incrementally, pop frames, no per-utterance Close/Reset). Port `main.cpp` to those,
+then keep one long-lived process in `HelperBackend`.
 
 ## Build
 
