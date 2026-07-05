@@ -14,6 +14,7 @@ export function createAvatar(containerEl, { log } = {}) {
   let ready = false;
   let ro = null;
   let mouthOpen = 0;
+  let faceParams = null;
 
   function teardown() {
     ro && ro.disconnect();
@@ -31,6 +32,7 @@ export function createAvatar(containerEl, { log } = {}) {
     ro = null;
     ready = false;
     mouthOpen = 0;
+    faceParams = null;
   }
 
   async function init() {
@@ -78,6 +80,12 @@ export function createAvatar(containerEl, { log } = {}) {
       try {
         model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpen);
       } catch (e) { /* unknown param id silently no-ops */ }
+      if (faceParams) {
+        for (const id in faceParams) {
+          try { model.internalModel.coreModel.setParameterValueById(id, faceParams[id]); }
+          catch (e) { /* unknown param id silently no-ops */ }
+        }
+      }
     });
 
     const layout = () => {
@@ -110,6 +118,12 @@ export function createAvatar(containerEl, { log } = {}) {
     mouthOpen = Math.max(0, Math.min(1, Number(v) || 0));
   }
 
+  // Absolute face-param sink for A2F-driven facial animation. A map of
+  // {paramId: value} is pinned every frame in the beforeModelUpdate hook so it
+  // overrides idle-motion keyframes; null releases the params so Live2D's own
+  // auto-blink / idle motion runs (don't hold a stale pose between turns).
+  function setFaceParams(map) { faceParams = map || null; }
+
   function setExpression(name) {
     if (!ready || !model) return;
     // Some models (e.g. Hiyori) ship no expression files; the profile maps
@@ -127,6 +141,7 @@ export function createAvatar(containerEl, { log } = {}) {
     playMotion,
     setExpression,
     setMouthOpen,
+    setFaceParams,
     dispose: teardown,
     get ready() { return ready; },
   };
