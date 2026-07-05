@@ -103,6 +103,9 @@ async def reload_model():
         return JSONResponse({"status": "error", "service": "tts", "model_loaded": False, "error": str(e)}, status_code=500)
 
 
+OUT_QUEUE_MAX = 256
+
+
 @app.websocket("/tts")
 async def tts_ws(ws: WebSocket):
     await ws.accept()
@@ -110,6 +113,35 @@ async def tts_ws(ws: WebSocket):
         await ws.send_json({"error": "model not loaded"})
         await ws.close()
         return
+
+    loop = asyncio.get_running_loop()
+
+    # Single-writer outbound queue: every frame to the client — PCM, the audio
+    # {"done": true}, forwarded A2F blendshapes, and {"type": "a2f_done"} — is
+    # enqueued here and drained by exactly one writer task, so a fork's callbacks
+    # (which run from the fork's task) never race a concurrent ws.send_*.
+    out_queue: asyncio.Queue = asyncio.Queue(maxsize=OUT_QUEUE_MAX)
+    write_failed = asyncio.Event()
+
+    async def writer():
+        while True:
+            item = await out_queue.get()
+            if item is None:
+                break
+            if write_failed.is_set():
+                # Client gone: keep draining so producers never block on put().
+                continue
+            tag, payload = item
+            try:
+                if tag == "bin":
+                    await ws.send_bytes(payload)
+                else:
+                    await ws.send_json(payload)
+            except Exception:  # noqa: BLE001 — client disconnected mid-stream
+                write_failed.set()
+
+    writer_task = asyncio.create_task(writer())
+
     # Best-effort A2F forks opened on this connection, reaped when it closes.
     forks: list = []
     try:
@@ -126,12 +158,10 @@ async def tts_ws(ws: WebSocket):
             if not isinstance(emotion, (str, list)):
                 emotion = None
             if not text:
-                await ws.send_json({"error": "empty text"})
+                await out_queue.put(("json", {"error": "empty text"}))
                 continue
 
-            queue: asyncio.Queue = asyncio.Queue()
-            loop = asyncio.get_running_loop()
-
+            producer_queue: asyncio.Queue = asyncio.Queue()
             cancel = threading.Event()
 
             def produce():
@@ -139,11 +169,11 @@ async def tts_ws(ws: WebSocket):
                     for chunk in synthesize.stream_pcm(text, voice):
                         if cancel.is_set():
                             break
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                        loop.call_soon_threadsafe(producer_queue.put_nowait, chunk)
                 except Exception as e:  # noqa: BLE001
-                    loop.call_soon_threadsafe(queue.put_nowait, e)
+                    loop.call_soon_threadsafe(producer_queue.put_nowait, e)
                 finally:
-                    loop.call_soon_threadsafe(queue.put_nowait, None)
+                    loop.call_soon_threadsafe(producer_queue.put_nowait, None)
 
             producer_task = asyncio.create_task(asyncio.to_thread(produce))
 
@@ -152,11 +182,39 @@ async def tts_ws(ws: WebSocket):
             # not retain a completed A2FFork per utterance.
             forks = [f for f in forks if not f.done]
 
+            # Per-sentence gate: the a2f_done marker must land AFTER this
+            # sentence's audio {"done": true}. The fork's on_done may fire early
+            # (e.g. a fast connect failure), so hold the marker until the handler
+            # has enqueued {"done": true}.
+            audio_done = asyncio.Event()
+
+            def on_frame(frame):
+                # Blendshapes are drop-on-full: A2F backpressure must never stall
+                # the audio path, so never block here.
+                try:
+                    out_queue.put_nowait(("json", frame))
+                except asyncio.QueueFull:
+                    pass
+
+            def on_done(gate=audio_done):
+                # Fires from the fork's task (drain, failure, or cancel). Enqueue
+                # exactly one a2f_done, ordered after this sentence's audio done.
+                # `gate` is bound per sentence so a later utterance can't rebind it.
+                async def _emit():
+                    await gate.wait()
+                    marker = ("json", {"type": "a2f_done"})
+                    try:
+                        out_queue.put_nowait(marker)
+                    except asyncio.QueueFull:
+                        await out_queue.put(marker)
+
+                loop.create_task(_emit())
+
             # Tee this utterance into the co-located A2F service (best-effort;
             # a fork failure must never affect the client stream or barge-in).
             fork = None
             try:
-                fork = a2f_fork.maybe_start_fork(emotion)
+                fork = a2f_fork.maybe_start_fork(emotion, on_frame=on_frame, on_done=on_done)
             except Exception:  # noqa: BLE001
                 log.warning("Failed to start A2F fork", exc_info=True)
                 fork = None
@@ -166,39 +224,50 @@ async def tts_ws(ws: WebSocket):
             try:
                 completed = False
                 while True:
-                    item = await queue.get()
+                    item = await producer_queue.get()
                     if item is None:
                         completed = True
                         if fork:
                             fork.end()
                         break
                     if isinstance(item, Exception):
-                        await ws.send_json({"error": str(item)})
+                        await out_queue.put(("json", {"error": str(item)}))
                         break
-                    await ws.send_bytes(item)
+                    await out_queue.put(("bin", item))
                     if fork:
                         fork.feed(item)
+                    if write_failed.is_set():
+                        break
                 if completed:
-                    try:
-                        await ws.send_json({"done": True})
-                    except Exception:  # noqa: BLE001
-                        pass
+                    await out_queue.put(("json", {"done": True}))
+                    # No fork means on_done never fires; emit the marker ourselves
+                    # so the client always sees exactly one a2f_done per sentence.
+                    if fork is None:
+                        await out_queue.put(("json", {"type": "a2f_done"}))
             finally:
                 cancel.set()
+                # Release any gated a2f_done emitter (the fork's on_done may fire
+                # after audio done, or never having connected).
+                audio_done.set()
                 await asyncio.gather(producer_task, return_exceptions=True)
                 if fork and not completed:
                     await fork.close()
+            if write_failed.is_set():
+                break
     except WebSocketDisconnect:
         pass
     except Exception as e:  # noqa: BLE001
         log.exception("TTS websocket error")
         try:
-            await ws.send_json({"error": str(e)})
+            await out_queue.put(("json", {"error": str(e)}))
         except Exception:
             pass
     finally:
         for f in forks:
             await f.close()
+        # Stop the single writer after forks are closed, then drain it.
+        await out_queue.put(None)
+        await writer_task
 
 
 if __name__ == "__main__":

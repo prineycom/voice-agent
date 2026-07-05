@@ -282,6 +282,17 @@ async def entrypoint(ctx: JobContext) -> None:
     #   turn_handling=TurnHandlingOptions(interruption=InterruptionOptions(...))
     # Do NOT use the deprecated flat kwargs allow_interruptions= /
     # min_interruption_* — they were removed in 1.6.x.
+    # Hoisted so the entrypoint can wire the voiceagent publisher + emotion source
+    # after the agent is constructed (the streaming path forwards re-based A2F
+    # blendshape frames and one reply-level {"done": true} through the publisher,
+    # and reads the current emotion at each sentence flush).
+    desktop_tts = DesktopTTS(
+        ws_url=cfg.tts_ws_url,
+        voice=cfg.tts_voice,
+        sample_rate=cfg.tts_sample_rate,
+        streaming=cfg.tts_streaming,
+    )
+
     session = AgentSession(
         stt=DesktopSTT(
             ws_url=cfg.stt_ws_url,
@@ -297,12 +308,7 @@ async def entrypoint(ctx: JobContext) -> None:
             # custom LiteLLM alias needs it explicit. NOT_GIVEN omits it.
             reasoning_effort=cfg.llm_reasoning_effort or NOT_GIVEN,
         ),
-        tts=DesktopTTS(
-            ws_url=cfg.tts_ws_url,
-            voice=cfg.tts_voice,
-            sample_rate=cfg.tts_sample_rate,
-            streaming=cfg.tts_streaming,
-        ),
+        tts=desktop_tts,
         vad=vad,
         turn_detection="vad",
         userdata=hermes_manager,
@@ -362,6 +368,14 @@ async def entrypoint(ctx: JobContext) -> None:
         greeting=cfg.agent_greeting,
         publish_motion=publish_motion,
     )
+
+    # Wire the TTS plugin to the voiceagent data channel now that the agent (and
+    # its current_emotion) exists. The streaming path forwards re-based A2F
+    # blendshape frames and one reply-level {"done": true} through publish_motion
+    # (same lossy UI_TOPIC channel), and reads the current emotion at each flush.
+    desktop_tts.set_publisher(publish_motion)
+    desktop_tts.set_emotion_source(lambda: agent.current_emotion)
+
     await session.start(
         agent=agent,
         room=ctx.room,

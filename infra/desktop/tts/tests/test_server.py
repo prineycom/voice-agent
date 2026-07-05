@@ -106,9 +106,15 @@ def test_ws_streams_multiple_messages_on_one_connection(loaded, monkeypatch):
             msg = ws.receive()
             if "bytes" in msg and msg["bytes"] is not None:
                 received.append(msg["bytes"])
-            elif "text" in msg and msg["text"] is not None:
-                assert json.loads(msg["text"]) == {"done": True}
-                break
+                continue
+            if "text" in msg and msg["text"] is not None:
+                data = json.loads(msg["text"])
+                if data == {"done": True}:
+                    break
+                # The /tts stream now multiplexes A2F markers onto the same socket
+                # (exactly one {"type": "a2f_done"} per sentence, plus any
+                # blendshape frames); tolerate them between sentences.
+                assert data.get("type") in ("a2f_done", "blendshapes")
         return received
 
     with client.websocket_connect("/tts") as ws:
