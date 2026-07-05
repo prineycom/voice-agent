@@ -1,0 +1,51 @@
+// Zero-dependency Node ESM test for the pure ARKit→Live2D mapper in arkit-map.js.
+// Run: node infra/pi/web/static/js/arkit-map.test.mjs
+import assert from 'node:assert/strict';
+import { arkitToLive2D } from './arkit-map.js';
+
+let assertions = 0;
+function eq(actual, expected, msg) {
+  assert.equal(actual, expected, msg);
+  assertions++;
+}
+function ok(value, msg) {
+  assert.ok(value, msg);
+  assertions++;
+}
+function approx(actual, expected, msg, eps = 1e-9) {
+  assert.ok(Math.abs(actual - expected) < eps, `${msg} (got ${actual}, want ~${expected})`);
+  assertions++;
+}
+
+// Neutral frame: eyes fully open, everything else at rest.
+const neutral = arkitToLive2D({});
+eq(neutral.ParamEyeLOpen, 1, 'neutral -> ParamEyeLOpen 1');
+eq(neutral.ParamEyeROpen, 1, 'neutral -> ParamEyeROpen 1');
+for (const [k, v] of Object.entries(neutral)) {
+  if (k === 'ParamEyeLOpen' || k === 'ParamEyeROpen') continue;
+  eq(v, 0, `neutral -> ${k} 0`);
+}
+
+// Left blink closes only the left eye.
+const blink = arkitToLive2D({ EyeBlinkLeft: 1 });
+eq(blink.ParamEyeLOpen, 0, 'EyeBlinkLeft:1 -> ParamEyeLOpen 0');
+eq(blink.ParamEyeROpen, 1, 'EyeBlinkLeft:1 -> ParamEyeROpen 1');
+
+// Look-left frame maps gaze X toward +1.
+const lookLeft = arkitToLive2D({ EyeLookOutLeft: 1, EyeLookInRight: 1 });
+approx(lookLeft.ParamEyeBallX, 1, 'look-left -> ParamEyeBallX ~+1');
+
+// Smile vs frown drive mouth form to the extremes.
+approx(arkitToLive2D({ MouthSmileLeft: 1, MouthSmileRight: 1 }).ParamMouthForm, 1, 'smile -> ParamMouthForm ~+1');
+approx(arkitToLive2D({ MouthFrownLeft: 1, MouthFrownRight: 1 }).ParamMouthForm, -1, 'frown -> ParamMouthForm ~-1');
+
+// Brow-down sets the angle to -1 and clamps the (negative) height to -1.
+const browDown = arkitToLive2D({ BrowDownLeft: 1 });
+eq(browDown.ParamBrowLAngle, -1, 'BrowDownLeft:1 -> ParamBrowLAngle -1');
+eq(browDown.ParamBrowLY, -1, 'BrowDownLeft:1 -> ParamBrowLY clamps to -1');
+
+// Mouth *opening* is never emitted here — it stays on the volume analyser.
+ok(!('ParamMouthOpenY' in neutral), 'ParamMouthOpenY is not a returned key');
+
+console.log(`arkit-map.js: all ${assertions} assertions passed`);
+process.exit(0);
