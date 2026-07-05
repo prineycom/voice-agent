@@ -42,7 +42,7 @@ Desktop (RTX 4070)
 
 - Agent Worker is on Pi 5 (not Desktop) — zero latency on output routing, Hermes local
 - STT/TTS transport is WebSocket (not gRPC) — simpler, FastAPI native, LiveKit ecosystem pattern
-- LLM model is swappable via LiteLLM config (one line) — start with nemotron, upgrade to Gemini Flash
+- LLM model is swappable via LiteLLM config (one line) — now a local Qwen3.5-4B-MTP on the Desktop GPU (llama.cpp, `voice-agent-llm` NSSM on :8004), replacing cloud (ADR 0014). Non-thinking via `LLAMA_CHAT_TEMPLATE_KWARGS` env; MTP self-speculative decoding for speed; `-ub` (not context) is the VRAM lever
 - Live2D: motion states (idle/listening/thinking/speaking) + expressions, driven by authoritative agent motion events on the `voiceagent` data channel; expressions come from LLM inline emotion tags (enum neutral/happy/sad/surprised/thinking, stripped before TTS/transcript); volume-based lip-sync on the agent's WebRTC audio track (client-side, not phoneme/TTS-side) — see ADR 0008-0011
 - Frontend is vanilla JS as ES modules, no build step (no React/Vue overhead for Pi 5); served as static files by the stdlib http.server
 - Sound goes through LiveKit WebRTC in browser, not system speakers

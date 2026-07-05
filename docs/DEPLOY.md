@@ -11,9 +11,10 @@ at boot and auto-restarts on failure.
 | Pi (`priney`) | `voice-agent-worker` | systemd | 8090 | LiveKit Agents worker (`python -m agent start`) |
 | Pi | `voice-agent-web` | systemd | 8095 | Test-harness (token server + page), bound to `127.0.0.1` |
 | Pi | LiveKit SFU | Docker (`voice-agent-livekit`, `restart=unless-stopped`) | 7880 / 8443 | TLS via tailscale-serve |
-| Pi | LiteLLM proxy | Docker | 4000 | LLM gateway |
+| Pi | LiteLLM proxy | Docker | 4000 | LLM gateway; alias `voice-agent` → Desktop `llama-server` (ADR 0014) |
 | Desktop (Windows, RTX 4070) | `voice-agent-stt` | NSSM (LocalSystem) | 8001 | faster-whisper large-v3-turbo |
 | Desktop | `voice-agent-tts` | NSSM (LocalSystem) | 8002 | Qwen3-TTS, multi-engine |
+| Desktop | `voice-agent-llm` | NSSM (LocalSystem) | 8004 | llama.cpp — Qwen3.5-4B-MTP (ADR 0014); manual restart (not in deploy.sh) |
 
 Desktop services run as **LocalSystem** so they start at boot **without login**
 (verified: CUDA is reachable from session 0 on this box). HF model cache and the

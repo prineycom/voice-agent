@@ -19,9 +19,11 @@ def test_litellm_model_swap_point():
     data = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
     entry = data["model_list"][0]
-    assert entry["model_name"] == "voice-agent"
+    assert entry["model_name"] == "qwen3.5-4b"
 
     params = entry["litellm_params"]
-    assert params["model"] == "openai/nemotron-3-super:cloud"
-    assert params["api_base"] == "https://ollama.com/v1"
-    assert params["api_key"] == "os.environ/OLLAMA_API_KEY"
+    # Local Qwen3.5-4B-MTP served by llama.cpp on the Desktop GPU (ADR 0014),
+    # reached over Tailscale, replacing the former Ollama Cloud nemotron MVP (ADR 0004).
+    assert params["model"] == "openai/qwen3.5-4b"
+    assert params["api_base"] == "http://100.75.88.35:8004/v1"
+    assert params["api_key"] == "os.environ/LLM_LOCAL_API_KEY"
