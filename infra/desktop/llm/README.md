@@ -65,7 +65,7 @@ if you drop the A2F helper and want faster long-prompt prefill.
 ## Run manually (for tuning / debugging)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File E:\voice-agent\desktop\llm\start_llm.ps1
+powershell -ExecutionPolicy Bypass -File E:\voice-agent-repo\infra\desktop\llm\start_llm.ps1
 # health / smoke:
 curl http://localhost:8004/health
 curl http://localhost:8004/v1/models

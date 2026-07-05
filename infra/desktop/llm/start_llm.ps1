@@ -14,7 +14,7 @@ $ErrorActionPreference = "Continue"
 
 $server = "E:\AI\llama.cpp\bin\llama-server.exe"
 $model  = "E:\AI\models\qwen3.5\Qwen3.5-4B-Q4_K_M.gguf"
-$logDir = "E:\voice-agent\desktop\llm"
+$logDir = "E:\voice-agent-repo\infra\desktop\llm"   # the git checkout the NSSM service runs from (git pull deploys updates)
 $log    = "$logDir\server.log"
 
 # --- tunables (finalized in the VRAM/context tuning step; see README.md) -------
