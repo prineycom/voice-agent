@@ -118,7 +118,10 @@ class A2FFork:
                     if isinstance(msg, str):
                         data = json.loads(msg)
                         if data.get("type") == "blendshapes":
-                            self._on_frame(data)
+                            try:
+                                self._on_frame(data)
+                            except Exception:  # noqa: BLE001 — a raising consumer must not kill the drain loop
+                                log.debug("A2F fork on_frame callback raised", exc_info=True)
                         elif data.get("done") or "error" in data:
                             break
         except Exception:  # noqa: BLE001 — best-effort; A2F must not break /tts

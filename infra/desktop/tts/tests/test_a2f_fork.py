@@ -158,6 +158,43 @@ def test_blendshape_frames_forwarded_verbatim():
     assert all("done" not in f for f in frames)
 
 
+def test_raising_on_frame_does_not_kill_drain_loop():
+    fake = FakeA2F().start()
+    received = []
+    done_calls = []
+
+    def spy(frame):
+        received.append(frame)
+        # Raise on the FIRST frame only; subsequent frames must still forward.
+        if len(received) == 1:
+            raise RuntimeError("boom in consumer")
+
+    async def run():
+        fork = a2f_fork.A2FFork(
+            fake.url,
+            "happy",
+            on_frame=spy,
+            on_done=lambda: done_calls.append(1),
+        )
+        fork.feed(b"\x01\x02")
+        fork.end()
+        await fork.close()
+        return fork
+
+    try:
+        fork = asyncio.run(run())
+        assert _wait_for(lambda: len(received) >= 2)
+    finally:
+        fake.stop()
+
+    # A raising on_frame must NOT mark the fork failed nor drop remaining frames.
+    assert fork._failed is False
+    # Both frames reached the consumer (the raise on frame 0 did not abort frame 1).
+    assert len(received) == 2
+    # on_done still fires exactly once after a graceful drain.
+    assert done_calls == [1]
+
+
 def test_on_done_fires_once_on_normal_end():
     fake = FakeA2F().start()
     done_calls = []
