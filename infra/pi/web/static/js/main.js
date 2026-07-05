@@ -10,6 +10,9 @@ import { createRoomController } from './room.js';
 import { createAvatar } from './avatar.js';
 import { createMotionController } from './motion.js';
 import { createLipSync } from './lipsync.js';
+import { createMouth } from './mouth.js';
+import { createFacial } from './facial.js';
+import { createBlendshapes } from './blendshapes.js';
 
 const connectBtn = document.getElementById('connectBtn');
 const muteBtn = document.getElementById('muteBtn');
@@ -36,7 +39,17 @@ const vu = createVuMeter(vuBarEl, { log: logger.log });
 const avatarEl = document.getElementById('avatar');
 const avatar = createAvatar(avatarEl, { log: logger.log });
 const motion = createMotionController(avatar);
-const lipsync = createLipSync(avatar, { log: logger.log });
+// Mouth-opening controller: the single caller of avatar.setMouthOpen(). A2F
+// blendshapes drive the mouth by default; `?lipsync=volume` forces the old volume
+// analyser (ADR-0013 toggle / retreat). The volume analyser (lipsync.js) is reused
+// verbatim by feeding it mouth.volumeSink instead of the avatar directly.
+const forceVolume = new URLSearchParams(location.search).get('lipsync') === 'volume';
+const mouth = createMouth(avatar, { log: logger.log, forceVolume });
+const lipsync = createLipSync(mouth.volumeSink, { log: logger.log });
+// A2F loose-sync face (eyes/gaze/brows/squint/mouth-form) + the DataChannel
+// consumer that drives both face and mouth from `voiceagent` blendshape frames.
+const facial = createFacial(avatar);
+const blendshapes = createBlendshapes({ facial, mouth, log: logger.log });
 
 let lastAgentState = null;
 
@@ -96,6 +109,7 @@ const hooks = {
   ops,
   vu,
   lipsync,
+  blendshapes,
 };
 
 function doConnect() {

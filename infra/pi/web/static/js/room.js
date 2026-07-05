@@ -29,6 +29,7 @@ export function createRoomController({ log, onConn, onError }) {
       opts.vu.setMuted(false);  // sync the vu cache to room.js's authoritative state
       opts.transcript.wire(room);
       opts.ops.wire(room);
+      if (opts.blendshapes) opts.blendshapes.wire(room);  // A2F face/mouth frames on `voiceagent`
       opts.ops.startTick();  // live-tick the running-task seconds
 
       room.on(RoomEvent.ConnectionStateChanged, (s) => log('состояние: ' + s));
@@ -85,6 +86,7 @@ export function createRoomController({ log, onConn, onError }) {
     hooks.onMicInactive();   // mic label -> inactive, VU bar -> 0%
     hooks.vu.stop();
     if (hooks.lipsync) hooks.lipsync.stop();
+    if (hooks.blendshapes) hooks.blendshapes.endStream();  // release the face if a stream was mid-flight
     hooks.ops.stopTick();
     hooks.ops.reset();
     hooks.transcript.reset();
