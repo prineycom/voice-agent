@@ -3,8 +3,8 @@
 Local LLM inference for the voice agent: **`llama.cpp` (`llama-server`)** serving
 **`Qwen3.5-4B-Q4_K_M` (MTP)** on the Desktop RTX 4070, OpenAI-compatible `/v1` on
 **port 8004**. The Pi agent reaches it through the LiteLLM proxy (alias
-`voice-agent` → `http://192.168.1.5:8004/v1`). Replaces the cloud LLM — see
-[ADR 0014](../../../docs/adr/0014-local-llm-qwen35-mtp.md).
+`qwen3.5-4b` → `http://100.75.88.35:8004/v1`, over Tailscale). Replaces the cloud
+LLM — see [ADR 0014](../../../docs/adr/0014-local-llm-qwen35-mtp.md).
 
 ## Why a dedicated server (not the tray on :8080)
 

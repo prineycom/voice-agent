@@ -22,7 +22,7 @@ $nssm = "E:\voice-agent\tools\nssm.exe"
 netsh advfirewall firewall add rule name=voiceagent-llm dir=in action=allow protocol=TCP localport=8004
 ```
 
-Health: `curl http://192.168.1.5:8004/health` (from the Pi) or
+Health: `curl http://100.75.88.35:8004/health` (from the Pi, over Tailscale) or
 `curl http://localhost:8004/health` (on the Desktop).
 
 The launch script (`start_llm.ps1`) lives in the repo under

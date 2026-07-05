@@ -23,9 +23,11 @@ state kills the pipeline regardless; a separate cloud LLM added no resilience.
   port **8004** (8001 STT, 8002 TTS, 8003 A2F-reserved). Dedicated + always-on,
   separate from the interactive llama.cpp tray server on :8080 so model-switching
   there never takes the agent's LLM down.
-- **Transport:** agent → LiteLLM (`:4000/v1`, unchanged) → `http://192.168.1.5:8004/v1`
-  (Desktop LAN; tailnet `100.75.88.35:8004` is the fallback). One-line model swap
-  preserved (ADR 0004 principle).
+- **Transport:** agent → LiteLLM (`:4000/v1`, unchanged) → `http://100.75.88.35:8004/v1`
+  (Desktop over **Tailscale** — canonical; the server binds 0.0.0.0 so LAN
+  `192.168.1.5:8004` also works). LiteLLM alias = `qwen3.5-4b` (matches the
+  operator proxy's concrete-model-name convention). One-line model swap preserved
+  (ADR 0004 principle).
 - **No cloud fallback.** Full replacement — consistent with STT/TTS already being
   hard Desktop dependencies.
 - **Model:** `unsloth/Qwen3.5-4B-MTP-GGUF`, `Q4_K_M` (2.83 GB). MTP heads are
