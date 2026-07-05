@@ -26,7 +26,7 @@ function makeRing(windowMs) {
 }
 
 export function a2fMouthOpen(arkit) {
-  // MouthFunnel is reserved for future shaping (Phase 3) — read but unused here.
+  // MouthFunnel is reserved for future shaping (Phase 3); not yet read.
   const g = k => arkit[k] || 0;
   return clamp01(g('JawOpen') * (1 - g('MouthClose')));
 }
@@ -48,17 +48,20 @@ export function crossCorrelateOffset(a, b) {
   demean(ga);
   demean(gb);
   const maxLag = Math.floor(maxLagMs / gridMs);
+  // Require a healthy overlap per lag so a large shift with only a few surviving
+  // samples can't score spuriously high and bias the reported offset.
+  const minOverlap = Math.max(8, Math.floor(n / 2));
   let bestLag = 0;
   let bestScore = -Infinity;
   for (let lag = -maxLag; lag <= maxLag; lag++) {
-    let dot = 0, ea = 0, eb = 0;
+    let dot = 0, ea = 0, eb = 0, count = 0;
     for (let i = 0; i < n; i++) {
       const j = i + lag;
       if (j < 0 || j >= n) continue;
       const x = ga[i], y = gb[j];
-      dot += x * y; ea += x * x; eb += y * y;
+      dot += x * y; ea += x * x; eb += y * y; count++;
     }
-    if (ea === 0 || eb === 0) continue;
+    if (count < minOverlap || ea === 0 || eb === 0) continue;
     const score = dot / Math.sqrt(ea * eb);     // normalised so lags compare fairly
     if (score > bestScore) { bestScore = score; bestLag = lag; }
   }

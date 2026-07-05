@@ -85,8 +85,12 @@ export function createRoomController({ log, onConn, onError }) {
     hooks.onAgentState(null);
     hooks.onMicInactive();   // mic label -> inactive, VU bar -> 0%
     hooks.vu.stop();
+    // Order matters: end any in-flight A2F stream FIRST (clears a2fActive) so the
+    // subsequent lipsync.stop()'s final setMouthOpen(0) routes through the volume
+    // provider and actually closes the mouth. Reversed, the 0 is swallowed by the
+    // A2F gate and the mouth freezes open (no volume tick left to reclaim it).
+    if (hooks.blendshapes) hooks.blendshapes.endStream();
     if (hooks.lipsync) hooks.lipsync.stop();
-    if (hooks.blendshapes) hooks.blendshapes.endStream();  // release the face if a stream was mid-flight
     hooks.ops.stopTick();
     hooks.ops.reset();
     hooks.transcript.reset();

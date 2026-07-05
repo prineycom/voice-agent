@@ -124,6 +124,10 @@ export function createAvatar(containerEl, { log } = {}) {
   // auto-blink / idle motion runs (don't hold a stale pose between turns).
   function setFaceParams(map) { faceParams = map || null; }
 
+  // Retained intentionally: the active Hiyori profile ships no expressions and
+  // ADR-0012 removed the frontend emotion→expression path, so this has no caller
+  // today. It stays for the one-line `natori` revert (avatar-config.js), whose
+  // profile still drives .exp3.json expressions.
   function setExpression(name) {
     if (!ready || !model) return;
     // Some models (e.g. Hiyori) ship no expression files; the profile maps
