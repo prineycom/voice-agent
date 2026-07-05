@@ -3,10 +3,12 @@
 Each `/tts` utterance is teed into the A2F `/a2f` WebSocket (loopback) so A2F
 produces ARKit blendshapes bound to the exact audio that reached the client.
 
-In Phase 1 the fork PUSHES emotion + PCM16@24k + {"end": true} and DRAINS/DISCARDS
-the returned blendshape frames. It is strictly best-effort: any A2F failure is
-logged at WARNING and swallowed — it must NEVER affect the `/tts` client stream
-or barge-in.
+The fork PUSHES emotion + PCM16@24k + {"end": true} and FORWARDS the returned
+blendshape frames verbatim via an injected `on_frame` callback; A2F's own
+{"done": true} is suppressed and instead signalled once via `on_done` when the
+stream ends for any reason (drain, failure, or cancel). It is strictly
+best-effort: any A2F failure is logged at WARNING and swallowed — it must NEVER
+affect the `/tts` client stream or barge-in.
 
 Protocol mirrored from infra/desktop/a2f/server.py (per utterance, in order):
     1. optional JSON {"emotion": "happy"} or {"emotion": [10 floats]}
@@ -40,9 +42,12 @@ class A2FFork:
     :meth:`close`. Never blocks or raises to the caller.
     """
 
-    def __init__(self, url: str, emotion) -> None:
+    def __init__(self, url: str, emotion, on_frame=None, on_done=None) -> None:
         self.url = url
         self.emotion = emotion
+        self._on_frame = on_frame if on_frame is not None else (lambda frame: None)
+        self._on_done = on_done if on_done is not None else (lambda: None)
+        self._done_fired = False
         self._queue: asyncio.Queue = asyncio.Queue()
         self._failed = False
         self._ended = False
@@ -106,19 +111,34 @@ class A2FFork:
                         break
                     await a2f.send(item)
                 await a2f.send(json.dumps({"end": True}))
-                # Drain and discard the blendshape frames until done/error.
+                # Forward each blendshape frame; stop on A2F's done/error without
+                # forwarding it (on_done marks the end of the stream instead).
                 while True:
                     msg = await a2f.recv()
                     if isinstance(msg, str):
                         data = json.loads(msg)
-                        if data.get("done") or "error" in data:
+                        if data.get("type") == "blendshapes":
+                            self._on_frame(data)
+                        elif data.get("done") or "error" in data:
                             break
         except Exception:  # noqa: BLE001 — best-effort; A2F must not break /tts
             self._failed = True
             log.warning("A2F fork failed; dropping blendshapes for this utterance", exc_info=True)
+        finally:
+            self._fire_done()
+
+    def _fire_done(self) -> None:
+        """Invoke on_done exactly once (on drain, failure, or cancel)."""
+        if self._done_fired:
+            return
+        self._done_fired = True
+        try:
+            self._on_done()
+        except Exception:  # noqa: BLE001 — best-effort; never surface to caller
+            log.debug("A2F fork on_done callback raised", exc_info=True)
 
 
-def maybe_start_fork(emotion) -> "A2FFork | None":
+def maybe_start_fork(emotion, on_frame=None, on_done=None) -> "A2FFork | None":
     """Create an :class:`A2FFork` if enabled and configured, else return None.
 
     Must be called from within a running event loop (the `/tts` handler is async).
@@ -128,4 +148,4 @@ def maybe_start_fork(emotion) -> "A2FFork | None":
     url = os.getenv("A2F_WS_URL", DEFAULT_A2F_WS_URL).strip()
     if not url:
         return None
-    return A2FFork(url, emotion)
+    return A2FFork(url, emotion, on_frame=on_frame, on_done=on_done)
