@@ -31,6 +31,7 @@ Exactly ONE reply-level {"done": true} is published per reply.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 
@@ -354,7 +355,14 @@ class DesktopSynthesizeStream(tts.SynthesizeStream):
                     seen_a2f_done = 0
                     reply_offset_s = 0.0
                     sentence_bytes = 0  # PCM bytes pushed for the in-flight sentence
-                    last_sentence_dur_s = 0.0  # finalized at `done`, applied at a2f_done
+                    # FIFO of finalized per-sentence audio durations: each audio
+                    # `done` APPENDS its sentence's duration, each `a2f_done` POPS the
+                    # oldest and adds it to reply_offset_s. Pairing by FIFO order (not
+                    # a single shared variable) keeps the offset correct even when a
+                    # sentence's `a2f_done` arrives out of order — after a later
+                    # sentence's audio `done` — because a background A2F fork drains
+                    # independently of the audio stream.
+                    sentence_durs_s: "collections.deque[float]" = collections.deque()
                     recv_task: asyncio.Task | None = None
                     send_done_task = asyncio.ensure_future(send_done.wait())
                     try:
@@ -400,25 +408,38 @@ class DesktopSynthesizeStream(tts.SynthesizeStream):
                             msg_type = data.get("type")
                             if msg_type == "blendshapes":
                                 # Re-base sentence-relative `t` to reply-relative and
-                                # forward on the `voiceagent` channel (lossy). Never
-                                # let a publish failure break audio.
-                                self._publish_frame(
-                                    json.dumps(
+                                # forward on the `voiceagent` channel (lossy). A
+                                # malformed frame (missing/None key) must NEVER break
+                                # audio — build the payload defensively and drop the
+                                # frame on any error, exactly like a failed publish.
+                                try:
+                                    t = data["t"]
+                                    payload = json.dumps(
                                         {
                                             "type": "blendshapes",
                                             "frame": data["frame"],
-                                            "t": data["t"] + reply_offset_s,
+                                            "t": t + reply_offset_s,
                                             "arkit": data["arkit"],
                                         }
                                     ).encode()
-                                )
+                                except (KeyError, TypeError):
+                                    # Malformed A2F frame — skip it; never touches the
+                                    # audio path or reply_offset_s accounting.
+                                    log.debug("dropping malformed blendshape frame")
+                                    continue
+                                self._publish_frame(payload)
                                 continue
                             if msg_type == "a2f_done":
                                 # Per-sentence A2F-stream end: advance the reply offset
-                                # by this sentence's finalized audio duration so the
-                                # next sentence's `t` stays monotonic. Internal only.
+                                # by the OLDEST unpaired sentence's finalized duration
+                                # (FIFO pop) so the next sentence's `t` stays monotonic
+                                # even under out-of-order fork completion. Empty FIFO →
+                                # advance by 0.0 (defensive; must never raise).
+                                # Internal only.
                                 seen_a2f_done += 1
-                                reply_offset_s += last_sentence_dur_s
+                                reply_offset_s += (
+                                    sentence_durs_s.popleft() if sentence_durs_s else 0.0
+                                )
                                 continue
 
                             if data.get("done"):
@@ -430,9 +451,12 @@ class DesktopSynthesizeStream(tts.SynthesizeStream):
                                     )
                                     leftover = b""
                                 output_emitter.flush()
-                                # Finalize this sentence's audio duration for the
-                                # matching `a2f_done` to apply. Internal only.
-                                last_sentence_dur_s = sentence_bytes / 2 / SAMPLE_RATE
+                                # Finalize this sentence's audio duration and queue it
+                                # for the matching `a2f_done` (FIFO order) to apply.
+                                # Internal only.
+                                sentence_durs_s.append(
+                                    sentence_bytes / 2 / SAMPLE_RATE
+                                )
                                 sentence_bytes = 0
                                 seen_done += 1
                     finally:

@@ -73,6 +73,12 @@ class FakeTTSServer:
     (``loop``) shape — so the plugin's a2f-aware drain completes — and OFF for the
     one-shot shape (the ChunkedStream never reads it). Pass ``a2f=False`` to model
     a total A2F outage (no marker at all).
+
+    ``a2f_reorder`` (``loop`` only, exactly two sentences) models an out-of-order
+    background A2F fork: sentence 0's ``a2f_done`` is DEFERRED past sentence 1's
+    audio ``done`` and emitted just before sentence 1's blendshape frames, so the
+    plugin must pair each ``a2f_done`` with its own sentence's duration (not the
+    last-finalized one) to keep reply-relative ``t`` correct.
     """
 
     def __init__(
@@ -84,6 +90,7 @@ class FakeTTSServer:
         loop=False,
         blendshapes=None,
         a2f=None,
+        a2f_reorder=False,
     ):
 
         self.chunks = chunks
@@ -92,6 +99,7 @@ class FakeTTSServer:
         self.loop = loop
         self.blendshapes = blendshapes
         self.a2f = a2f
+        self.a2f_reorder = a2f_reorder
         self.received = []  # request JSON dicts, one per received message
         self.connections = 0  # cumulative count of accepted connections
         self.active = 0  # currently-open connections (drains to 0 on no leak)
@@ -178,12 +186,44 @@ class FakeTTSServer:
         except Exception:
             pass
 
+    async def _serve_loop_reorder(self, ws):
+        """Two-sentence loop that emits sentence 0's ``a2f_done`` OUT OF ORDER.
+
+        Wire order (models a background A2F fork finishing late):
+            S0: PCM, S0 frames, audio done            (S0 a2f_done DEFERRED)
+            S1: PCM, audio done, [S0 a2f_done], S1 frames, S1 a2f_done
+        So sentence 0's ``a2f_done`` lands AFTER sentence 1's audio ``done`` and
+        just before sentence 1's frames — the interleaving the FIFO pairing fixes.
+        """
+        index = 0
+        async for msg in ws:
+            self.received.append(json.loads(msg))
+            for chunk in self._chunks_for(index):
+                await ws.send(chunk)
+            frames = self._blendshapes_for(index)
+            if index == 0:
+                for frame in frames or ():
+                    await ws.send(json.dumps(frame))
+                await ws.send(json.dumps({"done": True}))
+                # DEFER sentence 0's a2f_done (emitted during sentence 1 below).
+            else:
+                await ws.send(json.dumps({"done": True}))
+                # Sentence 0's deferred marker arrives now — after S1's audio done.
+                await ws.send(json.dumps({"type": "a2f_done"}))
+                for frame in frames or ():
+                    await ws.send(json.dumps(frame))
+                await ws.send(json.dumps({"type": "a2f_done"}))
+            index += 1
+
     async def _serve_loop(self, ws):
         """Many requests over one persistent socket (the streaming contract).
 
         Mirrors the Desktop /tts per-message contract: read each text message,
         stream that message's PCM, then send one terminal frame for it.
         """
+        if self.a2f_reorder:
+            await self._serve_loop_reorder(ws)
+            return
         index = 0
         async for msg in ws:
             self.received.append(json.loads(msg))
@@ -224,7 +264,14 @@ async def tts_server_factory():
     servers = []
 
     async def _make(
-        chunks, *, mode="done", error="boom", loop=False, blendshapes=None, a2f=None
+        chunks,
+        *,
+        mode="done",
+        error="boom",
+        loop=False,
+        blendshapes=None,
+        a2f=None,
+        a2f_reorder=False,
     ):
         srv = FakeTTSServer(
             chunks,
@@ -233,6 +280,7 @@ async def tts_server_factory():
             loop=loop,
             blendshapes=blendshapes,
             a2f=a2f,
+            a2f_reorder=a2f_reorder,
         )
         await srv.start()
         servers.append(srv)

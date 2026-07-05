@@ -546,6 +546,80 @@ async def test_blendshape_t_rebased_monotonic_across_reply(tts_server_factory):
 
 
 @pytest.mark.asyncio
+async def test_blendshape_t_rebased_under_out_of_order_a2f_done(tts_server_factory):
+    # Out-of-order background A2F fork: sentence-1's a2f_done arrives AFTER
+    # sentence-2's audio {"done"}, then sentence-2's frames follow. The plugin must
+    # pair each a2f_done with ITS OWN sentence's finalized duration (via the FIFO),
+    # not the last-finalized one, so sentence-2's frames are offset by sentence-1's
+    # duration — never skewed by sentence-2's own (different) duration.
+    pcm1 = b"\x33" * 4800  # 2400 samples @24kHz = exactly 0.1s
+    pcm2 = b"\x33" * 9600  # 4800 samples @24kHz = exactly 0.2s (distinct from d1)
+    s1_frames = [_bs_frame(0, 0.0), _bs_frame(1, 0.04), _bs_frame(2, 0.08)]
+    s2_frames = [_bs_frame(0, 0.0), _bs_frame(1, 0.05), _bs_frame(2, 0.1)]
+    srv = await tts_server_factory(
+        lambda i: [pcm1] if i == 0 else [pcm2],
+        loop=True,
+        blendshapes=lambda i: s1_frames if i == 0 else s2_frames,
+        a2f_reorder=True,
+    )
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, published = _publish_spy()
+    tts_impl.set_publisher(publish)
+
+    await _drive(tts_impl.stream(), "First sentence here. Second sentence now.")
+
+    forwarded = [p for p in published if p.get("type") == "blendshapes"]
+    ts = [p["t"] for p in forwarded]
+    assert len(forwarded) == 6
+    # Monotonic across the sentence boundary despite the reordered a2f_done.
+    assert ts == sorted(ts)
+    # Sentence-1 keeps offset 0; sentence-2 is offset by sentence-1's 0.1s duration
+    # (NOT by sentence-2's own 0.2s — that skew is exactly the fixed bug).
+    assert ts[:3] == pytest.approx([0.0, 0.04, 0.08])
+    assert ts[3:] == pytest.approx([0.1, 0.15, 0.2])
+    # Exactly one reply-level done; no internal markers leak.
+    assert published.count({"done": True}) == 1
+    assert not any(p.get("type") == "a2f_done" for p in published)
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_blendshape_frame_never_breaks_audio(tts_server_factory):
+    # A2F/facial data must NEVER break audio: a blendshape frame missing a key (or
+    # carrying a None `t`) must be dropped harmlessly — the reply's AUDIO still
+    # completes and exactly one reply-level {"done": true} is still published (no
+    # _drop_ws, no APIError propagating out of _drive).
+    malformed = [
+        {"type": "blendshapes", "frame": 0, "arkit": {"jawOpen": 0.5}},  # no "t"
+        {"type": "blendshapes", "frame": 1, "t": None, "arkit": {}},  # None t
+        {"type": "blendshapes", "frame": 2, "t": 0.0},  # no "arkit"
+    ]
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM] if i == 0 else [_S2_PCM],
+        loop=True,
+        blendshapes=lambda i: malformed,
+    )
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, published = _publish_spy()
+    tts_impl.set_publisher(publish)
+
+    _, _, data = await _drive(
+        tts_impl.stream(), "First sentence here. Second sentence now."
+    )
+
+    # Audio completed intact and in order despite every A2F frame being malformed.
+    assert data.rstrip(b"\x00") == _S1_PCM + _S2_PCM
+    # The malformed frames were dropped (never forwarded), and exactly one reply
+    # done still reached the channel — audio path unbroken.
+    assert not any(p.get("type") == "blendshapes" for p in published)
+    assert published.count({"done": True}) == 1
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
 async def test_exactly_one_reply_done_per_reply(tts_server_factory):
     # Two sentences → two per-sentence a2f_done markers server-side, but the browser
     # must see exactly ONE reply-level {"done": true} (not one per sentence), and
