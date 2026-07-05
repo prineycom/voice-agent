@@ -14,12 +14,32 @@ unambiguously isolates the real audio from the framework marker.
 """
 
 import asyncio
+import json
 
 import pytest
 import websockets
 from livekit.agents import APIConnectOptions, APIError
 
 from tts_plugin import NUM_CHANNELS, SAMPLE_RATE, DesktopTTS
+
+
+def _publish_spy():
+    """A synchronous publisher spy → (publish callable, list of decoded dicts).
+
+    The plugin's ``voiceagent`` publisher is a plain ``bytes`` sink; the spy
+    decodes each payload so tests can assert forwarded blendshape/`done` frames.
+    """
+    published = []
+
+    def publish(payload):
+        published.append(json.loads(payload.decode()))
+
+    return publish, published
+
+
+def _bs_frame(index, t):
+    """A deterministic A2F blendshape frame with sentence-relative ``t``."""
+    return {"type": "blendshapes", "frame": index, "t": t, "arkit": {"jawOpen": 0.5}}
 
 
 async def _collect(stream):
@@ -62,8 +82,11 @@ async def test_request_json_and_audio_format(tts_server_factory):
     tts_impl = DesktopTTS(ws_url=srv.url, voice="narrator")
     frames, total_samples, data = await _collect(tts_impl.synthesize("hello world"))
 
-    # The server saw exactly the request the plugin promised.
-    assert srv.received == [{"text": "hello world", "voice": "narrator"}]
+    # The server saw exactly the request the plugin promised (emotion defaults to
+    # "neutral" when no emotion source is wired).
+    assert srv.received == [
+        {"text": "hello world", "voice": "narrator", "emotion": "neutral"}
+    ]
 
     # Emitted audio is 24kHz mono.
     assert frames, "expected at least one emitted frame"
@@ -143,8 +166,8 @@ async def test_websocket_torn_down_per_utterance(tts_server_factory):
 
     assert srv.connections == 2
     assert srv.received == [
-        {"text": "first", "voice": "default"},
-        {"text": "second", "voice": "default"},
+        {"text": "first", "voice": "default", "emotion": "neutral"},
+        {"text": "second", "voice": "default", "emotion": "neutral"},
     ]
 
 
@@ -274,8 +297,8 @@ async def test_streaming_two_sentences_one_connection(tts_server_factory):
 
     assert srv.connections == 1
     assert srv.received == [
-        {"text": "First sentence here.", "voice": "narrator"},
-        {"text": "Second sentence now.", "voice": "narrator"},
+        {"text": "First sentence here.", "voice": "narrator", "emotion": "neutral"},
+        {"text": "Second sentence now.", "voice": "narrator", "emotion": "neutral"},
     ]
     # Both PCM runs survive intact and in order (sentence-1 audio precedes
     # sentence-2 audio), recovered by stripping the trailing silence marker.
@@ -342,6 +365,8 @@ async def test_streaming_bargein_drops_socket_then_reconnects(tts_server_factory
     )
 
     tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, published = _publish_spy()
+    tts_impl.set_publisher(publish)
     stream = tts_impl.stream()
     stream.push_text("interrupt me now.")
     stream.end_input()
@@ -358,6 +383,10 @@ async def test_streaming_bargein_drops_socket_then_reconnects(tts_server_factory
     await asyncio.wait_for(srv.disconnected_event.wait(), timeout=2)
     assert srv.disconnected is True
     assert srv.connections == 1
+
+    # Barge-in emits exactly one reply-level {"done": true} on the voiceagent
+    # channel (so the browser ends this reply's A2F stream) and nothing else.
+    assert published == [{"done": True}]
 
     # The next turn reconnects (second connection accepted) and completes cleanly.
     stream2 = tts_impl.stream()
@@ -429,11 +458,206 @@ async def test_streaming_midstream_flush_separate_sentences(tts_server_factory):
     # One persistent connection carried both sentences as separate requests.
     assert srv.connections == 1
     assert srv.received == [
-        {"text": "First sentence here.", "voice": "narrator"},
-        {"text": "Second sentence now.", "voice": "narrator"},
+        {"text": "First sentence here.", "voice": "narrator", "emotion": "neutral"},
+        {"text": "Second sentence now.", "voice": "narrator", "emotion": "neutral"},
     ]
     # Both PCM runs survive intact and in order, recovered by stripping the
     # framework's trailing end-of-segment silence marker.
     assert data.rstrip(b"\x00") == _S1_PCM + _S2_PCM
+
+    await tts_impl.aclose()
+
+
+# --- A2F demux: emotion routing, blendshape re-basing, reply-level done ------
+#
+# The Desktop reply now interleaves, per sentence: PCM, blendshape frames, the
+# audio {"done"}, then one {"a2f_done"}. The plugin forwards re-based blendshapes
+# on the `voiceagent` channel, threads the current emotion into each request, and
+# emits exactly ONE reply-level {"done": true} — never leaking the internal
+# audio-`done`/`a2f_done` markers.
+
+
+@pytest.mark.asyncio
+async def test_emotion_threaded_per_sentence(tts_server_factory):
+    # The emotion getter is read once per sentence AT FLUSH TIME, so consecutive
+    # sentences in one reply can carry different emotions (latest-before-flush wins).
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM] if i == 0 else [_S2_PCM], loop=True
+    )
+    tts_impl = DesktopTTS(ws_url=srv.url)
+
+    emotions = iter(["happy", "sad"])
+    tts_impl.set_emotion_source(lambda: next(emotions, "neutral"))
+
+    await _drive(tts_impl.stream(), "First sentence here. Second sentence now.")
+    assert [r["emotion"] for r in srv.received] == ["happy", "sad"]
+
+    # Unknown/falsy values clamp to the default emotion.
+    tts_impl.set_emotion_source(lambda: "ecstatic")
+    srv.received.clear()
+    await _drive(tts_impl.stream(), "Another one here.")
+    assert srv.received[0]["emotion"] == "neutral"
+
+    await tts_impl.aclose()
+
+    # With no source wired at all, requests still default to neutral.
+    srv2 = await tts_server_factory(lambda i: [_S1_PCM], loop=True)
+    plain = DesktopTTS(ws_url=srv2.url)
+    await _drive(plain.stream(), "No source here.")
+    assert srv2.received[0]["emotion"] == "neutral"
+    await plain.aclose()
+
+
+@pytest.mark.asyncio
+async def test_blendshape_t_rebased_monotonic_across_reply(tts_server_factory):
+    # Each sentence's PCM is 4800 bytes = 2400 samples @24kHz = exactly 0.1s of
+    # audio, so sentence-2's frames must be offset by 0.1s from their sentence-
+    # relative t (which stays below the 0.1s duration to keep `t` monotonic).
+    pcm = b"\x33" * 4800
+    s1_frames = [_bs_frame(0, 0.0), _bs_frame(1, 0.04), _bs_frame(2, 0.08)]
+    s2_frames = [_bs_frame(0, 0.0), _bs_frame(1, 0.04), _bs_frame(2, 0.08)]
+    srv = await tts_server_factory(
+        lambda i: [pcm],
+        loop=True,
+        blendshapes=lambda i: s1_frames if i == 0 else s2_frames,
+    )
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, published = _publish_spy()
+    tts_impl.set_publisher(publish)
+
+    await _drive(tts_impl.stream(), "First sentence here. Second sentence now.")
+
+    forwarded = [p for p in published if p.get("type") == "blendshapes"]
+    ts = [p["t"] for p in forwarded]
+    # Two sentences × three frames, forwarded in order.
+    assert len(forwarded) == 6
+    # Reply-relative t is non-decreasing across the sentence boundary.
+    assert ts == sorted(ts)
+    # Sentence-1 keeps its sentence-relative t (offset 0); sentence-2 is offset by
+    # sentence-1's audio duration (0.1s).
+    assert ts[:3] == pytest.approx([0.0, 0.04, 0.08])
+    assert ts[3:] == pytest.approx([0.1, 0.14, 0.18])
+    # Frame index and arkit payload are forwarded untouched.
+    assert [p["frame"] for p in forwarded] == [0, 1, 2, 0, 1, 2]
+    assert all(p["arkit"] == {"jawOpen": 0.5} for p in forwarded)
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_exactly_one_reply_done_per_reply(tts_server_factory):
+    # Two sentences → two per-sentence a2f_done markers server-side, but the browser
+    # must see exactly ONE reply-level {"done": true} (not one per sentence), and
+    # the internal audio-`done`/`a2f_done` markers are never forwarded.
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM] if i == 0 else [_S2_PCM],
+        loop=True,
+        blendshapes=lambda i: [_bs_frame(0, 0.0)],
+    )
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, published = _publish_spy()
+    tts_impl.set_publisher(publish)
+
+    await _drive(tts_impl.stream(), "First sentence here. Second sentence now.")
+
+    assert published.count({"done": True}) == 1
+    assert not any(p.get("type") == "a2f_done" for p in published)
+    # Only blendshapes and the single reply done ever reach the channel.
+    assert all(
+        p == {"done": True} or p.get("type") == "blendshapes" for p in published
+    )
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_never_blocks_audio(tts_server_factory):
+    # A publisher that raises on every call must never stop PCM from being emitted:
+    # blendshape forwarding (and the reply done) are lossy fire-and-forget.
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM] if i == 0 else [_S2_PCM],
+        loop=True,
+        blendshapes=lambda i: [_bs_frame(0, 0.0), _bs_frame(1, 0.01)],
+    )
+    tts_impl = DesktopTTS(ws_url=srv.url)
+
+    def boom(_payload):
+        raise RuntimeError("publish exploded")
+
+    tts_impl.set_publisher(boom)
+
+    _, _, data = await _drive(
+        tts_impl.stream(), "First sentence here. Second sentence now."
+    )
+    # Every raising publish is swallowed; audio is emitted intact and in order.
+    assert data.rstrip(b"\x00") == _S1_PCM + _S2_PCM
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a2f_absent_audio_and_bargein_unaffected(tts_server_factory):
+    # Total A2F outage: the server sends PCM + audio done but NO blendshapes and NO
+    # a2f_done marker. The audio path and barge-in must be completely unaffected —
+    # audio still flows, and barge-in still emits exactly one reply-level done.
+    srv = await tts_server_factory([], mode="hang", loop=True, a2f=False)
+    srv.chunks = lambda i: [_BIG_CHUNK]
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, published = _publish_spy()
+    tts_impl.set_publisher(publish)
+
+    stream = tts_impl.stream()
+    stream.push_text("no a2f here.")
+    stream.end_input()
+
+    aiter = stream.__aiter__()
+    # Audio still flows even with A2F entirely absent.
+    first = await asyncio.wait_for(aiter.__anext__(), timeout=2)
+    assert first.frame is not None
+    assert srv.disconnected is False
+
+    # Barge-in still works: the socket is dropped and exactly one reply-level
+    # {"done": true} is emitted, with no blendshapes ever forwarded.
+    await asyncio.wait_for(stream.aclose(), timeout=2)
+    await asyncio.wait_for(srv.disconnected_event.wait(), timeout=2)
+    assert srv.disconnected is True
+    assert published == [{"done": True}]
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bargein_stops_forwarding_and_emits_done(tts_server_factory):
+    # Barge-in mid-forwarding: the server streams a big PCM chunk plus blendshape
+    # frames, then hangs. On cancel, forwarding stops and exactly one reply-level
+    # {"done": true} is emitted as the LAST frame on the channel.
+    srv = await tts_server_factory(
+        [], mode="hang", loop=True, blendshapes=lambda i: [_bs_frame(0, 0.0)]
+    )
+    srv.chunks = lambda i: [_BIG_CHUNK]
+
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, published = _publish_spy()
+    tts_impl.set_publisher(publish)
+
+    stream = tts_impl.stream()
+    stream.push_text("interrupt me now.")
+    stream.end_input()
+
+    aiter = stream.__aiter__()
+    first = await asyncio.wait_for(aiter.__anext__(), timeout=2)
+    assert first.frame is not None
+
+    # Barge-in mid-synthesis.
+    await asyncio.wait_for(stream.aclose(), timeout=2)
+    await asyncio.wait_for(srv.disconnected_event.wait(), timeout=2)
+
+    # Exactly one reply-level done, and it is the LAST thing published — forwarding
+    # stops at the barge-in. The internal a2f_done marker never leaks.
+    assert published.count({"done": True}) == 1
+    assert published[-1] == {"done": True}
+    assert not any(p.get("type") == "a2f_done" for p in published)
 
     await tts_impl.aclose()

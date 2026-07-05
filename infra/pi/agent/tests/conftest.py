@@ -59,14 +59,39 @@ class FakeTTSServer:
                          barge-in cancels it. Reconnected turns complete normally,
                          so a dropped-then-reconnected stream can be exercised on
                          a single server.
+
+    ``blendshapes`` models the interleaved A2F frame stream: ``None`` (default) →
+    no blendshape frames; a flat ``list[dict]`` or a callable ``index ->
+    list[dict]`` → those A2F frames are emitted per request AFTER the PCM and
+    BEFORE the audio {"done": true}, matching production ordering so re-basing can
+    be exercised.
+
+    ``a2f`` controls the per-sentence {"type": "a2f_done"} marker sent AFTER the
+    audio {"done": true} (production sends exactly one per sentence, always). It is
+    decoupled from ``blendshapes`` since a sentence may carry zero frames yet still
+    close its A2F stream. ``None`` (default) auto-selects: ON for the streaming
+    (``loop``) shape — so the plugin's a2f-aware drain completes — and OFF for the
+    one-shot shape (the ChunkedStream never reads it). Pass ``a2f=False`` to model
+    a total A2F outage (no marker at all).
     """
 
-    def __init__(self, chunks, *, mode="done", error="boom", loop=False):
+    def __init__(
+        self,
+        chunks,
+        *,
+        mode="done",
+        error="boom",
+        loop=False,
+        blendshapes=None,
+        a2f=None,
+    ):
 
         self.chunks = chunks
         self.mode = mode
         self.error = error
         self.loop = loop
+        self.blendshapes = blendshapes
+        self.a2f = a2f
         self.received = []  # request JSON dicts, one per received message
         self.connections = 0  # cumulative count of accepted connections
         self.active = 0  # currently-open connections (drains to 0 on no leak)
@@ -82,6 +107,36 @@ class FakeTTSServer:
     def _chunks_for(self, index):
         """PCM chunks for the ``index``-th request (callable or flat list)."""
         return self.chunks(index) if callable(self.chunks) else self.chunks
+
+    def _blendshapes_for(self, index):
+        """A2F frames for the ``index``-th request (callable, flat list, or None).
+
+        ``None`` → no blendshape frames for this request. Otherwise the frames are
+        emitted before the audio ``done``.
+        """
+        if self.blendshapes is None:
+            return None
+        return (
+            self.blendshapes(index)
+            if callable(self.blendshapes)
+            else self.blendshapes
+        )
+
+    def _emit_a2f(self, default):
+        """Whether to send the ``a2f_done`` marker (auto when ``a2f`` is None)."""
+        return default if self.a2f is None else self.a2f
+
+    async def _send_a2f_and_done(self, ws, frames, send_a2f):
+        """Emit [A2F frames...] {"done": true} [{"a2f_done"}] for one request.
+
+        Frames (if any) precede the audio ``done``; the ``a2f_done`` marker follows
+        it when ``send_a2f`` is set.
+        """
+        for frame in frames or ():
+            await ws.send(json.dumps(frame))
+        await ws.send(json.dumps({"done": True}))
+        if send_a2f:
+            await ws.send(json.dumps({"type": "a2f_done"}))
 
     async def _handler(self, ws):
         self.connections += 1
@@ -113,7 +168,9 @@ class FakeTTSServer:
             await ws.close()
             return
         else:
-            await ws.send(json.dumps({"done": True}))
+            await self._send_a2f_and_done(
+                ws, self._blendshapes_for(0), self._emit_a2f(False)
+            )
         # Keep the handler alive so the client controls teardown; this lets
         # the test assert per-utterance client-side disconnect.
         try:
@@ -132,11 +189,15 @@ class FakeTTSServer:
             self.received.append(json.loads(msg))
             for chunk in self._chunks_for(index):
                 await ws.send(chunk)
+            frames = self._blendshapes_for(index)
             index += 1
             if self.mode == "hang" and self.connections == 1:
-                # First turn is left in progress (no terminal frame); idle until
-                # the client drops the socket (barge-in). Reconnected turns
-                # (connections > 1) fall through to the normal "done" path.
+                # First turn is left in progress: stream any configured A2F frames
+                # (so a barge-in can interrupt mid-forwarding) but NO terminal
+                # frame, idling until the client drops the socket (barge-in).
+                # Reconnected turns (connections > 1) fall through to "done".
+                for frame in frames or ():
+                    await ws.send(json.dumps(frame))
                 await ws.wait_closed()
                 return
             if self.mode == "error":
@@ -145,7 +206,7 @@ class FakeTTSServer:
                 await ws.close()
                 return
             else:
-                await ws.send(json.dumps({"done": True}))
+                await self._send_a2f_and_done(ws, frames, self._emit_a2f(True))
 
     async def start(self):
         self._server = await websockets.serve(self._handler, "127.0.0.1", 0)
@@ -162,8 +223,17 @@ async def tts_server_factory():
     """Yield a factory that starts FakeTTSServers and tears them all down."""
     servers = []
 
-    async def _make(chunks, *, mode="done", error="boom", loop=False):
-        srv = FakeTTSServer(chunks, mode=mode, error=error, loop=loop)
+    async def _make(
+        chunks, *, mode="done", error="boom", loop=False, blendshapes=None, a2f=None
+    ):
+        srv = FakeTTSServer(
+            chunks,
+            mode=mode,
+            error=error,
+            loop=loop,
+            blendshapes=blendshapes,
+            a2f=a2f,
+        )
         await srv.start()
         servers.append(srv)
         return srv
