@@ -3,8 +3,9 @@
 The Audio2Face model outputs these named ARKit face coefficients (0.0–1.0). The
 order matches the SDK / NIM `animation_frames.csv` header. The browser maps these
 to Live2D parameters via `arkitToLive2D()` (see Epic 8 / research doc §9); the
-mouth-*open* coefficient (`JawOpen`) is intentionally NOT used on the client — the
-mouth amplitude stays on the volume analyser (ADR-0008, hybrid decision #1).
+mouth-*open* coefficient (`JawOpen`) now drives client mouth opening via the
+pluggable `A2FLipSync` provider (A2F primary, volume analyser as fallback/toggle)
+per ADR-0013.
 """
 
 # 52 standard ARKit blendshapes, in canonical order. The A2F James model also

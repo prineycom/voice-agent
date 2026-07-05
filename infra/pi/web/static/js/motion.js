@@ -1,15 +1,16 @@
-// Motion policy: maps an agent state to a Live2D motion + expression on the
-// injected avatar. No DOM, no globals — pure state -> motion mapping with
-// debounce on identical states. The state->motion table and emotion->expression
-// map are model-specific, so they come from the active avatar profile (passed in
-// for testability, defaulting to the configured active avatar).
+// Motion policy: maps an agent state to a Live2D motion on the injected avatar.
+// No DOM, no globals — pure state -> motion mapping with debounce on identical
+// states. The state->motion table is model-specific, so it comes from the active
+// avatar profile (passed in for testability, defaulting to the configured active
+// avatar).
+//
+// Per ADR-0012 the frontend no longer drives `.exp3.json` expressions (Hiyori
+// ships none); A2F now drives the face (Epic 8), so the emotion->expression path
+// is gone and only the motion-state half remains here.
 import { activeProfile } from './avatar-config.js';
 
 export function createMotionController(avatar, profile = activeProfile) {
   const table = profile.motions;
-
-  const EMOTION_EXPR = profile.emotionExpr;
-  const FALLBACK_EXPR = profile.fallbackExpr;
 
   function resolve(state) {
     const key = String(state).toLowerCase();
@@ -27,14 +28,13 @@ export function createMotionController(avatar, profile = activeProfile) {
     current = key;
     const entry = table[key];
     avatar.playMotion(entry.group, entry.index);
-    avatar.setExpression(entry.expression);
   }
 
   // Authoritative agent-published motion event: takes precedence over the
-  // lk.agent.state-derived motion. The expression always updates (emotion-only
-  // changes), but the motion only restarts on an actual state change — the agent
-  // emits a fresh event per inline emotion tag during one reply, so restarting
-  // the same motion every time would stutter the animation back to frame 0.
+  // lk.agent.state-derived motion. The motion only restarts on an actual state
+  // change — the agent emits a fresh event per inline emotion tag during one
+  // reply, so restarting the same motion every time would stutter the animation
+  // back to frame 0. The emotion field is ignored here (A2F drives the face).
   function applyMotionEvent(evt) {
     const key = resolve(evt && evt.state);
     const entry = table[key];
@@ -42,8 +42,6 @@ export function createMotionController(avatar, profile = activeProfile) {
       current = key;
       avatar.playMotion(entry.group, entry.index);
     }
-    const mapped = EMOTION_EXPR[String(evt && evt.emotion).toLowerCase()];
-    avatar.setExpression(mapped == null ? FALLBACK_EXPR : mapped);
     motionEventActive = true;
   }
 
