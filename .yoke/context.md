@@ -22,9 +22,10 @@ _Avoid_: status, mode, animation
 **Expression**:
 A facial **emotion** of the **Avatar**. Historically rendered from a Live2D `.exp3.json` file
 driven by an **Emotion tag**. Under **Facial animation** (Epic 8) this `.exp3.json` path is
-**replaced**: facial emotion is produced by **Audio2Face** (from audio prosody plus the
-**Emotion tag** fed into A2F's emotion input), not by expression files. Still orthogonal to
-**Motion state**.
+**replaced**: facial emotion is produced by **Audio2Face** from its **Emotion vector** input.
+Today that vector comes only from the **Emotion tag** (zeros when `neutral`); per ADR-0016 the
+baseline source becomes **Audio2Emotion** with the tag as an additive boost. Still orthogonal
+to **Motion state**.
 _Avoid_: mood, face, emotion (reserve "emotion" for the source intent, see Emotion tag)
 
 **Lip-sync**:
@@ -51,10 +52,24 @@ One of the 52 ARKit face weights (0.0–1.0, e.g. `jawOpen`, `eyeBlinkLeft`, `br
 _Avoid_: viseme, morph target
 
 **Audio2Face** (A2F):
-NVIDIA Audio2Face-3D running on the Desktop GPU; consumes TTS PCM audio and emits **Blendshape**
-frames (~30 FPS) that drive **Facial animation**. Face-only — never head/body/hands (those stay
-on **Motion state**).
+NVIDIA Audio2Face-3D running on the Desktop GPU; consumes TTS PCM audio plus an **Emotion
+vector** and emits **Blendshape** frames (~30 FPS) that drive **Facial animation**. Face-only —
+never head/body/hands (those stay on **Motion state**).
 _Avoid_: A2F-2D, facial capture
+
+**Audio2Emotion** (A2E):
+The emotion-inference half of the A2F stack: infers an **Emotion vector** from the audio's
+prosody. The full NVIDIA NIM always blends it in; our slim helper does not run it yet — per
+ADR-0016 it becomes the baseline emotion source, with the **Emotion tag** as an additive boost.
+_Avoid_: sentiment analysis, emotion recognition (too generic)
+
+**Emotion vector**:
+The 10-dimensional A2E-vocabulary input to **Audio2Face**
+(`grief, joy, disgust, outofbreath, pain, anger, amazement, cheekiness, sadness, fear`,
+each 0.0–1.0) that colors the emitted **Blendshapes**. Today built sparsely from the
+**Emotion tag** enum; all-zeros (the `neutral` case) yields near-pure phoneme articulation —
+"just lip-sync".
+_Avoid_: emotion state, mood vector
 
 **Kiosk**:
 The frontend running fullscreen (1080p) in Chromium on the Pi 5. Same responsive codebase as
@@ -98,5 +113,7 @@ _Avoid_: sentiment, emotion marker
 > motion state.
 > **Dev:** And if the model "smiles"?
 > **Domain:** That's an *expression*. The LLM tagged its reply with an *emotion tag* like
-> `[emotion:happy]`; the agent stripped the tag before TTS and sent a *motion event* carrying
-> the expression. The browser plays the matching `.exp3.json`.
+> `[emotion:happy]`; the agent strips the tag before TTS and it becomes part of the *emotion
+> vector* fed to Audio2Face, which shapes the emitted blendshapes. No `.exp3.json` is involved
+> anymore — and once ADR-0016 lands, *Audio2Emotion* infers the baseline vector from the voice
+> itself, the tag only boosting it.
