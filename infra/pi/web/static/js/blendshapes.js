@@ -16,9 +16,10 @@
 //
 // Stream-boundary rule (DD-5 / ADR-0013): the scheduler opens the stream on the
 // first APPLIED frame (mouth.beginA2FStream + facial handoff) and ends it on the
-// first of an explicit {done:true} played out, a barge-in grace cap, or an idle
-// safety net for a {done} dropped on the lossy channel — see schedule.js for the
-// timings (lag 100ms, idle 250ms, barge-in grace 250ms). endStream() is idempotent.
+// first of an explicit {done:true} played out, an audio-stopped grace cap (agent
+// state leaves 'speaking' — playout end or barge-in), or an idle safety net for
+// a {done} dropped on the lossy channel — see schedule.js for the timings (lag
+// 100ms, idle 250ms, audio-stop grace 500ms). endStream() is idempotent.
 //
 // Phase 3 is what actually forwards these frames from the agent over the channel.
 // Until then, the dev injector (window.__a2fInject) drives the exact same consumer
@@ -73,6 +74,11 @@ export function createBlendshapes({
     if (raf !== null) { cancelRaf(raf); raf = null; }
   }
 
+  // Called by main.js when the agent state leaves 'speaking' (audio playout
+  // ended or barge-in); the loop must run so the grace-capped teardown fires
+  // even if no further frames arrive.
+  function audioStopped() { sched.audioStopped(); ensureLoop(); }
+
   function handle(evt) {
     if (evt.type === 'blendshapes') { sched.push(evt); ensureLoop(); }
     else if (evt.done) { sched.markDone(); ensureLoop(); }  // loop must run to drain/teardown
@@ -95,5 +101,5 @@ export function createBlendshapes({
   function inject(frame) { handle(frame); }
   if (typeof window !== 'undefined') window.__a2fInject = inject;
 
-  return { wire, inject, endStream };
+  return { wire, inject, endStream, audioStopped };
 }

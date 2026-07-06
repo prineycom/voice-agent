@@ -1,6 +1,7 @@
 // Zero-dependency Node ESM test for the A2F playback scheduler in schedule.js.
 // Fake wall clock + stub sink; every case drives the public API only
-// (push / markDone / tick / flush / active). Run: node infra/pi/web/static/js/schedule.test.mjs
+// (push / markDone / audioStopped / tick / flush / active).
+// Run: node infra/pi/web/static/js/schedule.test.mjs
 import assert from 'node:assert/strict';
 import { createScheduler } from './schedule.js';
 
@@ -27,7 +28,7 @@ function makeSched() {
     apply(frame) { log.push({ ev: 'apply', t: frame.t, clock }); },
     onReplyEnd() { log.push({ ev: 'end', clock }); },
   };
-  // Defaults under test: lagMs=100, idleMs=250, doneGraceMs=250, resetEpsMs=500.
+  // Defaults under test: lagMs=100, idleMs=250, audioStopGraceMs=500, resetEpsMs=500.
   return { sched: createScheduler({ now, sink }), log };
 }
 
@@ -38,8 +39,8 @@ const count = (log, ev) => log.filter((e) => e.ev === ev).length;
 
 // (a) Big burst played out in real time: 30 frames (t=0..0.957) arrive within
 // a few ms; the drain must spread them across ~1s of wall clock, not flash
-// through. Done is marked near end of playout (done == "audio stopped", so an
-// early done would legitimately trip the barge-in cap — see case e).
+// through. Done marks delivery-complete only; here it lands near end of playout
+// (an early done must not truncate either — see case e1).
 {
   const { sched, log } = makeSched();
   for (let k = 0; k < 30; k++) { sched.push(f(k * G)); clock += 0.1; } // burst in ~3ms
@@ -49,7 +50,7 @@ const count = (log, ev) => log.filter((e) => e.ev === ev).length;
   let doneMarked = false;
   while (clock < 1300 && last) {
     clock += 16;
-    if (clock >= 960 && !doneMarked) { sched.markDone(); doneMarked = true; } // audio ends with playout
+    if (clock >= 960 && !doneMarked) { sched.markDone(); doneMarked = true; } // delivery complete
     const before = applies(log).length;
     last = sched.tick();
     maxPerTick = Math.max(maxPerTick, applies(log).length - before);
@@ -79,7 +80,7 @@ const count = (log, ev) => log.filter((e) => e.ev === ev).length;
   while (clock < 600) { clock += 16; sched.tick(); }
   eq(count(log, 'start'), 1, 'b: exactly one onReplyStart across both bursts');
   eq(count(log, 'end'), 0, 'b: no onReplyEnd before done');
-  sched.markDone();                                           // deadline 850 > playout end 694
+  sched.markDone();                                           // delivery complete; playout end 694
   while (clock < 750) { clock += 16; sched.tick(); }
   const a = applies(log);
   eq(a.length, 19, 'b: every frame of both bursts applied');
@@ -126,23 +127,79 @@ const count = (log, ev) => log.filter((e) => e.ev === ev).length;
   sched.flush();
 }
 
-// (e) Barge-in cap: done arrives early (audio stopped) while the buffer still
-// holds a long tail — the face over-run is capped at doneGraceMs and the stale
-// tail is discarded, not played out.
+// (e1) Early done does NOT truncate: {done} is sent at synthesis-complete,
+// which on a long reply lands mid-playout with seconds of correctly-scheduled
+// frames still buffered — every one must still play out at its own time.
+{
+  const { sched, log } = makeSched();
+  for (let k = 0; k <= 60; k++) sched.push(f(k * G));         // t=0..1.980, playout end 2080
+  sched.markDone();                                           // synthesis done, audio still playing
+  let last = true;
+  while (clock < 2300 && last) { clock += 16; last = sched.tick(); }
+  eq(applies(log).length, 61, 'e1: all frames applied despite the early done');
+  const a = applies(log);
+  ok(a[a.length - 1].clock >= 2080, `e1: last apply at its scheduled time (got ${a[a.length - 1].clock})`);
+  eq(count(log, 'end'), 1, 'e1: onReplyEnd fired exactly once');
+  ok(log[log.length - 1].clock >= 2080, 'e1: teardown only after the full playout');
+  eq(sched.active, false, 'e1: idle after the normal end');
+}
+
+// (e2) audioStopped caps a stale tail: the agent state left `speaking`
+// (barge-in) while the buffer still holds a long tail — the face over-run is
+// capped at audioStopGraceMs and the stale tail is discarded, not played out.
 {
   const { sched, log } = makeSched();
   for (let k = 0; k <= 60; k++) sched.push(f(k * G));         // t=0..1.980, one burst
   while (clock < 200) { clock += 16; sched.tick(); }          // only early frames applied
-  const doneClock = clock;
-  sched.markDone();                                           // deadline = doneClock + 250
+  const stopClock = clock;
+  sched.audioStopped();                                       // deadline = stopClock + 500
+  let last = true;
+  while (clock < 1200 && last) { clock += 16; last = sched.tick(); }
+  ok(applies(log).length < 61, `e2: stale tail discarded (${applies(log).length}/61 applied)`);
+  eq(count(log, 'end'), 1, 'e2: onReplyEnd fired despite frames left in the buffer');
+  const endClock = log[log.length - 1].clock;
+  ok(endClock - stopClock >= 500 && endClock - stopClock <= 516,
+    `e2: teardown within ~audioStopGraceMs of audioStopped (got +${endClock - stopClock}ms)`);
+  eq(sched.active, false, 'e2: idle after the cap');
+}
+
+// (e3) audioStopped when idle is a no-op: agent-state transitions also fire
+// between replies (and before the first one) — they must not touch anything.
+{
+  const { sched, log } = makeSched();
+  sched.audioStopped();                                       // before any reply
+  eq(sched.active, false, 'e3: still idle before any push');
+  eq(sched.tick(), false, 'e3: tick() stays false');
+  eq(log.length, 0, 'e3: no sink calls');
+  sched.push(f(0));
+  clock = 100; sched.tick();                                  // applied at anchor+lag
+  sched.markDone();
+  clock = 120; sched.tick();                                  // done + drained + played out
+  eq(count(log, 'end'), 1, 'e3: reply completed normally');
+  sched.audioStopped();                                       // after a completed reply
+  clock = 700;
+  eq(sched.tick(), false, 'e3: no reactivation from a late audioStopped');
+  eq(count(log, 'end'), 1, 'e3: no extra sink calls after the reply ended');
+}
+
+// (e4) Normal end wins over an unexpired grace: burst delivered (done) and
+// audio stops right around playout end — the tail drains fully within the
+// grace and teardown is the clean normal end, exactly once (idempotent paths).
+{
+  const { sched, log } = makeSched();
+  for (let k = 0; k <= 9; k++) sched.push(f(k * G));          // t=0..0.297, playout end 397
+  sched.markDone();                                           // delivery complete
+  while (clock < 200) { clock += 16; sched.tick(); }
+  sched.audioStopped();                                       // deadline ~708, beyond playout end
   let last = true;
   while (clock < 800 && last) { clock += 16; last = sched.tick(); }
-  ok(applies(log).length < 61, `e: stale tail discarded (${applies(log).length}/61 applied)`);
-  eq(count(log, 'end'), 1, 'e: onReplyEnd fired despite frames left in the buffer');
-  const endClock = log[log.length - 1].clock;
-  ok(endClock - doneClock >= 250 && endClock - doneClock <= 266,
-    `e: teardown within ~doneGraceMs of markDone (got +${endClock - doneClock}ms)`);
-  eq(sched.active, false, 'e: idle after the cap');
+  eq(applies(log).length, 10, 'e4: full drain — the grace did not truncate a live tail');
+  eq(count(log, 'end'), 1, 'e4: clean single onReplyEnd');
+  ok(log[log.length - 1].clock >= 397 && log[log.length - 1].clock < 700,
+    `e4: normal end at playout, not at the grace deadline (got ${log[log.length - 1].clock})`);
+  sched.audioStopped();                                       // late state event after teardown
+  eq(sched.tick(), false, 'e4: still idle');
+  eq(count(log, 'end'), 1, 'e4: no double-end');
 }
 
 // (f) Idle net exactness: after drain-complete with no done, teardown must not

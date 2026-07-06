@@ -107,7 +107,14 @@ const hooks = {
     connectBtn.onclick = doConnect;
     setComposerEnabled(false);
   },
-  onAgentState: (state) => { lastAgentState = state; agentState.set(state); motion.setState(state); },
+  onAgentState: (state) => {
+    // Leaving 'speaking' = agent audio stopped (playout done or barge-in):
+    // bound the A2F face tail instead of playing out a stale buffer.
+    if (lastAgentState === 'speaking' && state !== 'speaking') blendshapes.audioStopped();
+    lastAgentState = state;
+    agentState.set(state);
+    motion.setState(state);
+  },
   watchAgentParticipant: agentState.watch,
   attachAudio: (el) => document.body.appendChild(el),
   onMicActive() { micLabelEl.textContent = 'активен'; },

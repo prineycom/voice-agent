@@ -12,14 +12,20 @@
 // the next sentence burst re-anchors to now, so no freeze and no wait.
 //
 // Teardown triggers (in tick()):
-//   1. Barge-in cap    — done arrived but frames remain past doneDeadline:
-//                        discard the stale tail (audio stopped; cap the face
-//                        over-run to doneGraceMs).
-//   2. Normal end      — done arrived, buffer drained, last frame played out.
+//   1. Normal end       — done arrived (all frames delivered), buffer drained,
+//                         last frame played out.
+//   2. Audio-stop cap   — audioStopped() (agent state left `speaking`: playout
+//                         ended or barge-in) armed a bounded drain grace; past
+//                         it, discard whatever is still buffered and end.
 //   3. Dropped-done net — no done, buffer drained, played out, and no frame
-//                        arrived for idleMs.
+//                         arrived for idleMs.
+//   4. flush()          — synchronous teardown (e.g. disconnect).
+//
+// The wire {done} means "all frames delivered": TTS sends it at synthesis
+// complete, which on long replies is seconds before audio playout ends — so it
+// must never cut a correctly-scheduled tail. Only audioStopped() bounds one.
 
-export function createScheduler({ now, sink, lagMs = 100, idleMs = 250, doneGraceMs = 250, resetEpsMs = 500 } = {}) {
+export function createScheduler({ now, sink, lagMs = 100, idleMs = 250, audioStopGraceMs = 500, resetEpsMs = 500 } = {}) {
   now = now || (() => performance.now());
 
   let anchorWall = null;      // wall ms where reply t=0 plays; null = idle
@@ -28,7 +34,7 @@ export function createScheduler({ now, sink, lagMs = 100, idleMs = 250, doneGrac
   let replyDone = false;      // reply-level {done} received
   let faceStarted = false;    // sink.onReplyStart() fired for this reply
   let lastArrivalWall = 0;    // wall ms of the last push, for the idle net
-  let doneDeadline = null;    // wall ms cap on draining after done (barge-in)
+  let stopDeadline = null;    // wall ms cap on draining after audio stopped
 
   function teardown() {
     if (faceStarted) sink.onReplyEnd();
@@ -37,7 +43,7 @@ export function createScheduler({ now, sink, lagMs = 100, idleMs = 250, doneGrac
     lastTms = 0;
     replyDone = false;
     faceStarted = false;
-    doneDeadline = null;
+    stopDeadline = null;
   }
 
   function push(evt) {
@@ -56,10 +62,19 @@ export function createScheduler({ now, sink, lagMs = 100, idleMs = 250, doneGrac
     lastTms = Math.max(lastTms, evt.t * 1000);
   }
 
+  // Wire {done}: all frames delivered (synthesis complete). Playout may still
+  // have seconds to run, so this never arms a teardown deadline by itself.
   function markDone() {
     if (anchorWall === null) return;
     replyDone = true;
-    doneDeadline = now() + doneGraceMs;
+  }
+
+  // Agent state left `speaking` — audio playout ended or barge-in. Give the
+  // buffered tail one bounded grace to drain, then discard whatever is stale.
+  // No-op when idle (state transitions also fire between replies).
+  function audioStopped() {
+    if (anchorWall === null) return;
+    stopDeadline = now() + audioStopGraceMs;
   }
 
   // Returns true while a reply is active (caller keeps its rAF), false when idle.
@@ -75,8 +90,12 @@ export function createScheduler({ now, sink, lagMs = 100, idleMs = 250, doneGrac
       sink.apply(frame);
     }
     const playedOut = t >= anchorWall + lastTms + lagMs;
-    if (replyDone && buffer.length && t >= doneDeadline) {
-      teardown();                                       // barge-in cap
+    if (stopDeadline !== null && t >= stopDeadline) {
+      // Audio-stop cap: grace elapsed — discard any stale tail and end the
+      // reply. Must work without a wire done too (buffered tail on barge-in,
+      // or an empty buffer when the done was dropped: audio stopped, nothing
+      // left to play).
+      teardown();
     } else if (replyDone && buffer.length === 0 && playedOut) {
       teardown();                                       // normal end
     } else if (!replyDone && buffer.length === 0 && playedOut && (t - lastArrivalWall) > idleMs) {
@@ -88,5 +107,5 @@ export function createScheduler({ now, sink, lagMs = 100, idleMs = 250, doneGrac
   // Synchronous teardown right now (e.g. on disconnect).
   function flush() { teardown(); }
 
-  return { push, markDone, tick, flush, get active() { return anchorWall !== null; } };
+  return { push, markDone, audioStopped, tick, flush, get active() { return anchorWall !== null; } };
 }
