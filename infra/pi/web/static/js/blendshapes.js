@@ -21,7 +21,7 @@
 
 const IDLE_MS = 250;
 
-export function createBlendshapes({ facial, mouth, log }) {
+export function createBlendshapes({ facial, mouth, log, debug }) {
   let active = false;
   let idleTimer = null;
 
@@ -29,8 +29,10 @@ export function createBlendshapes({ facial, mouth, log }) {
     if (!active) {
       active = true;
       mouth.beginA2FStream();
+      if (debug) debug.onStart();
       if (log) log('a2f stream start');
     }
+    if (debug) debug.onFrame(evt);
     facial.apply(evt.arkit);
     mouth.ingestA2FFrame(evt);
     // Reset the idle safety net: a dropped {done} or a barge-in truncation still
@@ -45,6 +47,7 @@ export function createBlendshapes({ facial, mouth, log }) {
     active = false;
     facial.release();
     mouth.endA2FStream();
+    if (debug) debug.onEnd();
     if (log) log('a2f stream end');
   }
 

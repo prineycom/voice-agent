@@ -104,12 +104,33 @@ export function createAvatar(containerEl, { log } = {}) {
     return true;
   }
 
+  let motionsFrozen = false;
+
   function playMotion(group, index) {
-    if (!ready || !model) return;
+    if (!ready || !model || motionsFrozen) return;
     try {
       model.motion(group, index, window.PIXI.live2d.MotionPriority.FORCE);
     } catch (e) {
       log && log('воспроизведение движения не удалось: ' + e.message);
+    }
+  }
+
+  // Debug/isolation: stop all playing motions and suppress the library's
+  // auto-idle so ONLY the A2F face params (applied in beforeModelUpdate) move.
+  // Best-effort against pixi-live2d-display internals; guarded throughout.
+  function stopMotions() {
+    motionsFrozen = true;
+    if (!model) return;
+    try {
+      const mm = model.internalModel.motionManager;
+      mm.stopAllMotions && mm.stopAllMotions();
+      // Point the idle group at a non-existent name so auto-idle finds nothing.
+      if (mm.groups) mm.groups.idle = '__facedebug_none__';
+      if (mm.settings && mm.settings.motions && mm.settings.motions.Idle) {
+        mm.settings.motions.Idle = [];
+      }
+    } catch (e) {
+      log && log('stopMotions: ' + e.message);
     }
   }
 
@@ -143,6 +164,7 @@ export function createAvatar(containerEl, { log } = {}) {
   return {
     init,
     playMotion,
+    stopMotions,
     setExpression,
     setMouthOpen,
     setFaceParams,

@@ -13,6 +13,7 @@ import { createLipSync } from './lipsync.js';
 import { createMouth } from './mouth.js';
 import { createFacial } from './facial.js';
 import { createBlendshapes } from './blendshapes.js';
+import { createFaceDebug } from './facedebug.js';
 
 const connectBtn = document.getElementById('connectBtn');
 const muteBtn = document.getElementById('muteBtn');
@@ -38,7 +39,14 @@ const vu = createVuMeter(vuBarEl, { log: logger.log });
 
 const avatarEl = document.getElementById('avatar');
 const avatar = createAvatar(avatarEl, { log: logger.log });
-const motion = createMotionController(avatar);
+// Face-debug mode (?facedebug=1): raw A2F blendshapes drawn on a canvas overlay,
+// bypassing Live2D, and all state-driven motions suppressed so ONLY the face
+// moves. Used to bisect "no facial animation" (data-arrival vs Live2D rig).
+const faceDebug = new URLSearchParams(location.search).get('facedebug') === '1';
+const debugFace = faceDebug ? createFaceDebug() : null;
+const motion = faceDebug
+  ? { setState() {}, applyMotionEvent() {} }
+  : createMotionController(avatar);
 // Mouth-opening controller: the single caller of avatar.setMouthOpen(). A2F
 // blendshapes drive the mouth by default; `?lipsync=volume` forces the old volume
 // analyser (ADR-0013 toggle / retreat). The volume analyser (lipsync.js) is reused
@@ -49,7 +57,7 @@ const lipsync = createLipSync(mouth.volumeSink, { log: logger.log });
 // A2F loose-sync face (eyes/gaze/brows/squint/mouth-form) + the DataChannel
 // consumer that drives both face and mouth from `voiceagent` blendshape frames.
 const facial = createFacial(avatar);
-const blendshapes = createBlendshapes({ facial, mouth, log: logger.log });
+const blendshapes = createBlendshapes({ facial, mouth, log: logger.log, debug: debugFace });
 
 let lastAgentState = null;
 
@@ -57,7 +65,8 @@ avatar.init().then((ok) => {
   if (ok) {
     const h = document.getElementById('avatarHint');
     if (h) h.remove();
-    motion.setState(lastAgentState);
+    if (faceDebug) { avatar.stopMotions(); logger.log('face-debug: motions frozen, A2F overlay on'); }
+    else motion.setState(lastAgentState);
   }
 }).catch((e) => logger.log('аватар: ' + e.message));
 
