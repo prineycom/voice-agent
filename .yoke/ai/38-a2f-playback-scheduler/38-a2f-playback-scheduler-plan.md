@@ -31,14 +31,20 @@
 **Rationale:** `t` is reply-relative and monotone across sentences (`tts_plugin.py:410,433-442`), so a continuation burst keeps animating forward. Re-anchoring is self-correcting: if an inter-sentence gap tears the clock down (DD-5) and sentence 2 arrives with `t=2.4`, `anchorWall = now − 2400` makes the playhead ≈ 2.4 immediately — sentence-2 frames play forward from now, re-synced to the fresh audio, no multi-second freeze. A `t` reset to ~0 means a genuinely new reply (covers a dropped `{done}`): teardown the old, re-anchor.
 **Alternative:** Single fixed anchor for the whole reply held across idle gaps — needs "keep clock alive but release face" bookkeeping; the re-anchor is simpler and more robust to A2F/audio latency drift between sentences.
 
-### DD-5: Idle / end / flush semantics
+### DD-5: Idle / end / flush semantics (REVISED during execution — see DD-8)
 
-**Decision:** Teardown driven by three bounded triggers, never on frames-pending:
-- **Normal end:** `replyDone && buffer empty && playhead ≥ lastT` → `sink.onReplyEnd()` (face → idle). Exactly one reply-level `{done:true}` per reply arrives, on both normal completion and barge-in (`tts_plugin.py:28,477-483`).
-- **Barge-in cap:** on `markDone`, `doneDeadline = now + DONE_GRACE_MS` (250). If `replyDone && buffer non-empty && now ≥ doneDeadline` → force teardown, discard the stale tail. Caps face over-run after barge-in to ≤250 ms.
+**Decision:** Teardown driven by bounded triggers, never on frames-pending:
+- **Normal end:** `replyDone && buffer empty && playhead ≥ lastT` → `sink.onReplyEnd()` (face → idle). Exactly one reply-level `{done:true}` per reply arrives, on both normal completion and barge-in (`tts_plugin.py:28,477-483`). `markDone()` means only "all frames delivered; end when drained" — it does NOT arm any force-teardown (revision: the wire `done` fires at synthesis-complete, `tts_plugin.py:477-478` after `asyncio.gather`, which on long replies is seconds BEFORE playout ends; a grace cap keyed to it would truncate the tail of every long reply — the original DD-5 had this bug).
+- **Audio-stopped cap (barge-in):** see DD-8 — `audioStopped()` (agent state leaves `speaking`) arms `deadline = now + AUDIO_STOP_GRACE_MS` (500). If `buffer non-empty && now ≥ deadline` → force teardown, discard the stale tail. Normal tails (≈ anchor latency + lag < 500 ms) drain before the deadline; a barge-in's multi-second stale tail is cut within 500 ms.
 - **Dropped-`done` safety net:** `!replyDone && buffer empty && playhead ≥ lastT && (now − lastArrival) > IDLE_MS (250)` → teardown. Preserves the current idle net (`blendshapes.js:22,38-41`) but measured on drain-complete, not raw arrival — can never truncate queued animation.
 - **`flush()` (disconnect):** synchronous teardown → `sink.onReplyEnd()` if a face was started; preserves the `room.js:88-93` invariant (`blendshapes.endStream()` → `mouth.endA2FStream()` before `lipsync.stop()`'s final `setMouthOpen(0)`), so the mouth closes instead of freezing open. `onReplyEnd` fires only if a frame was applied (`faceStarted`), keeping `mouth.beginA2FStream`/`endA2FStream` balanced.
-**Alternative:** Keep arrival-gap idle as stream end (torn down while frames are queued → audio cuts face early), or drain-everything-on-done (stale frames drain seconds after barge-in).
+**Alternative:** Keep arrival-gap idle as stream end (torn down while frames are queued → audio cuts face early); drain-everything-on-done (stale frames drain seconds after barge-in); grace cap armed by wire `done` (truncates long replies — rejected after Task 2 flagged it and `tts_plugin.py` confirmed done = synthesis-complete).
+
+### DD-8: Barge-in signal = agent-state transition away from `speaking` (added during execution)
+
+**Decision:** The frontend's authoritative audio-playout signal is the LiveKit agent state (`main.js:110` `onAgentState`, from `agent-state.js` watch): it stays `speaking` during actual playout and leaves `speaking` on completion AND on barge-in. On a `speaking → non-speaking` transition, `main.js` calls `blendshapes.audioStopped()` → `sched.audioStopped()` which arms the bounded drain grace above.
+**Rationale:** The wire `{done}` cannot distinguish "synthesis finished, playout continues" from "barge-in, audio stopped" — the agent state can, with zero new plumbing (the hook already exists at `main.js:110` and `lastAgentState` is already tracked at `main.js:62`).
+**Alternative:** Audio element `currentTime`/silence detection (new plumbing through room.js, rejected in DD-1); fixed grace on wire done (truncates long replies).
 
 ### DD-6: Debug hooks move to the apply path
 
@@ -83,6 +89,16 @@
 - **How:** `createBlendshapes({ facial, mouth, log, debug, now, scheduleRaf })` (defaults `performance.now`, `requestAnimationFrame`/`cancelAnimationFrame` guarded by `typeof window`). Build `sink = { onReplyStart(){ mouth.beginA2FStream(); if(debug)debug.onStart(); if(log)log('a2f stream start'); }, apply(f){ if(debug)debug.onFrame(f); facial.apply(f.arkit); mouth.ingestA2FFrame(f); }, onReplyEnd(){ facial.release(); mouth.endA2FStream(); if(debug)debug.onEnd(); if(log)log('a2f stream end'); } }`. `const sched = createScheduler({ now, sink })`. `handle(evt)`: `blendshapes` type → `sched.push(evt); ensureLoop()`; `evt.done` → `sched.markDone(); ensureLoop()`. rAF loop: `tick(){ const active = sched.tick(); if(active) raf=scheduleRaf(tick); else raf=null; }`; `ensureLoop(){ if(!raf) raf=scheduleRaf(tick); }`. `endStream()` → `sched.flush()` + cancel raf. Remove old `active`/`idleTimer`/direct-apply logic (`:25-52`) and the `IDLE_MS` const (moved into scheduler defaults). Update the module header comment: buffering/timing live in `schedule.js`; debug hooks fire at apply time.
 - **Context:** `infra/pi/web/static/js/blendshapes.js:24-77` (full current impl), `facial.js:12-18`, `mouth.js:121-146` (begin/ingest/end), `facedebug.js:74-107` (onStart/onFrame/onEnd), `room.js:88-93` (endStream-before-lipsync.stop invariant), `main.js:60` (constructor call — must stay compatible).
 - **Verify:** `node -e "import('./infra/pi/web/static/js/blendshapes.js').then(m=>console.log(typeof m.createBlendshapes))"` prints `function`; no residual apply-on-arrival in `handleFrame`.
+
+### Task 3b: Audio-stopped grace replaces done-grace (DD-5 revision + DD-8) — added during execution
+
+- **Files:** `infra/pi/web/static/js/schedule.js` (change), `infra/pi/web/static/js/schedule.test.mjs` (change), `infra/pi/web/static/js/blendshapes.js` (change), `infra/pi/web/static/js/main.js` (change, ~2 lines)
+- **Depends on:** Tasks 1–3
+- **Scope:** M
+- **What:** Remove the done-armed force-teardown from the scheduler (wire `done` = synthesis-complete, arrives mid-playout on long replies and would truncate the animation tail); add `audioStopped()` arming a 500 ms drain grace, wired from the agent-state `speaking → non-speaking` transition in `main.js`.
+- **How:** schedule.js: `markDone()` only sets `replyDone`; new `audioStopped()` sets `stopDeadline = now()+audioStopGraceMs` (default 500, replaces doneGraceMs) when a reply is active; tick's force-teardown trigger becomes `buffer non-empty && stopDeadline armed && now ≥ stopDeadline`; teardown resets it. blendshapes.js: expose `audioStopped()` → `sched.audioStopped(); ensureLoop()`. main.js `onAgentState` (line ~110): before updating `lastAgentState`, `if (lastAgentState === 'speaking' && state !== 'speaking') blendshapes.audioStopped()`. schedule.test.mjs: replace the done-cap case with (e1) early done mid-playout → buffer drains fully, no truncation, teardown after last frame's playout; (e2) barge-in: `audioStopped()` with a multi-second buffered tail → force teardown within grace, not all frames applied; (e3) `audioStopped()` when idle → no-op.
+- **Context:** current `schedule.js`, `schedule.test.mjs`, `blendshapes.js` (post Task 1–3), `main.js:60-62,108-112`, `tts_plugin.py:467-493` (done = synthesis-complete, read-only).
+- **Verify:** `node --test infra/pi/web/static/js/schedule.test.mjs` green; smoke: early done does not truncate; `audioStopped` caps a stale tail.
 
 ### Task 4: Wiring test `blendshapes.test.mjs`
 
