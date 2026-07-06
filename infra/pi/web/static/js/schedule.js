@@ -16,7 +16,10 @@
 //                         last frame played out.
 //   2. Audio-stop cap   — audioStopped() (agent state left `speaking`: playout
 //                         ended or barge-in) armed a bounded drain grace; past
-//                         it, discard whatever is still buffered and end.
+//                         it, discard whatever is still buffered and end. Any
+//                         new frame disarms the grace: frames still arriving
+//                         means the reply is still live (a VAD state flap or a
+//                         stale stop event must not truncate it).
 //   3. Dropped-done net — no done, buffer drained, played out, and no frame
 //                         arrived for idleMs.
 //   4. flush()          — synchronous teardown (e.g. disconnect).
@@ -47,7 +50,15 @@ export function createScheduler({ now, sink, lagMs = 100, idleMs = 250, audioSto
   }
 
   function push(evt) {
+    // A malformed frame (t missing, non-finite, or negative) must never break
+    // the stream: Math.max(lastTms, NaN) would poison lastTms forever and kill
+    // every played-out teardown. Drop it before touching any state.
+    if (typeof evt.t !== 'number' || !Number.isFinite(evt.t) || evt.t < 0) return;
     lastArrivalWall = now();
+    // Frames still arriving means this face-stream is still live: disarm the
+    // audio-stop grace so a mid-reply state flap (or a stale audioStopped()
+    // landing after the next reply re-anchored) cannot tear down a live reply.
+    stopDeadline = null;
     // New reply: no anchor yet, or t jumped backwards (fresh reply after a
     // dropped done — small out-of-order jitter stays under resetEpsMs).
     if (anchorWall === null || evt.t * 1000 < lastTms - resetEpsMs) {

@@ -202,6 +202,26 @@ const count = (log, ev) => log.filter((e) => e.ev === ev).length;
   eq(count(log, 'end'), 1, 'e4: no double-end');
 }
 
+// (e5) State flap disarms the grace: agent state flaps speaking → x → speaking
+// mid-reply (VAD false barge-in) while the same reply's frames keep arriving —
+// a new push must disarm the audio-stop grace, so nothing tears down at the
+// stale deadline and the reply plays out and ends normally.
+{
+  const { sched, log } = makeSched();
+  for (let k = 0; k <= 9; k++) sched.push(f(k * G));          // t=0..0.297
+  while (clock < 200) { clock += 16; sched.tick(); }          // some frames applied
+  sched.audioStopped();                                       // stale deadline ~708
+  for (let k = 10; k <= 30; k++) sched.push(f(k * G));        // same reply keeps arriving
+  sched.markDone();                                           // t=0.330..0.990, playout end 1090
+  let last = true;
+  while (clock < 1300 && last) { clock += 16; last = sched.tick(); }
+  eq(applies(log).length, 31, 'e5: every frame applied — grace disarmed by the new frames');
+  eq(count(log, 'end'), 1, 'e5: onReplyEnd fired exactly once');
+  ok(log[log.length - 1].clock >= 1090,
+    `e5: normal end at playout, not at the stale grace deadline (got ${log[log.length - 1].clock})`);
+  eq(sched.active, false, 'e5: idle after the normal end');
+}
+
 // (f) Idle net exactness: after drain-complete with no done, teardown must not
 // fire until strictly more than idleMs has passed since the last arrival.
 {
@@ -257,6 +277,39 @@ const count = (log, ev) => log.filter((e) => e.ev === ev).length;
   eq(count(log, 'end'), 1, 'i: flush fires onReplyEnd for a started reply');
   eq(sched.active, false, 'i: inactive after flush');
   eq(sched.tick(), false, 'i: tick() returns false after flush');
+}
+
+// (j) Malformed frames are dropped, not poisonous: a frame with t missing,
+// NaN, or negative parses as valid JSON but would make lastTms NaN via
+// Math.max — after which no played-out teardown ever fires. Such frames must
+// be dropped before touching any state; the reply still ends via done+drain.
+{
+  const { sched, log } = makeSched();
+  for (let k = 0; k <= 4; k++) sched.push(f(k * G));          // t=0..0.132
+  sched.push({ type: 'blendshapes', frame: 5, arkit: {} });   // t undefined -> dropped
+  sched.push({ ...f(5 * G), t: NaN });                        // explicit NaN -> dropped
+  sched.push({ ...f(5 * G), t: -1 });                         // negative -> dropped (no spurious reset)
+  eq(count(log, 'end'), 0, 'j: malformed frames did not tear anything down');
+  for (let k = 5; k <= 9; k++) sched.push(f(k * G));          // t=0.165..0.297, playout end 397
+  sched.markDone();
+  let last = true;
+  while (clock < 600 && last) { clock += 16; last = sched.tick(); }
+  const a = applies(log);
+  eq(a.length, 10, 'j: only the 10 valid frames applied');
+  ok(a.every((e) => Number.isFinite(e.t)), 'j: no malformed frame reached the sink');
+  eq(count(log, 'end'), 1, 'j: reply ended normally — lastTms not poisoned by NaN');
+  ok(log[log.length - 1].clock >= 397, 'j: end waits for last-frame playout (anchor+297+lag)');
+  eq(sched.active, false, 'j: idle after the normal end');
+}
+
+// (k) Malformed frame while idle stays idle: a dropped frame must not anchor
+// a reply either.
+{
+  const { sched, log } = makeSched();
+  sched.push({ type: 'blendshapes', frame: 0, arkit: {} });   // t undefined -> dropped
+  eq(sched.active, false, 'k: no anchor from a malformed frame');
+  eq(sched.tick(), false, 'k: tick() stays false');
+  eq(log.length, 0, 'k: no sink calls');
 }
 
 console.log(`schedule.js: all ${assertions} assertions passed`);

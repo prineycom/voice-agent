@@ -1,10 +1,16 @@
 // Mouth-opening controller: the SINGLE caller of avatar.setMouthOpen(). Owns
 // provider selection (A2F blendshapes primary, volume analyser fallback), the
-// A2F mouth-open shaping, an empty (D=0) delay-line seam for future audio-aligned
-// buffering, and a cross-correlator instrument that measures the A2F↔audio offset
+// A2F mouth-open shaping, an empty (D=0) delay-line seam for a mouth-only trim,
+// and a cross-correlator instrument that measures the residual A2F↔audio offset
 // at the end of each utterance. It does NOT touch lipsync.js: the existing volume
 // analyser is reused unchanged by passing `mouth.volumeSink` into createLipSync()
 // in place of `avatar` — volumeSink exposes the same setMouthOpen(v) sink shape.
+//
+// Playout-aligned buffering (ADR-0013 Phase 3) now lives one layer up, in
+// schedule.js: frames are drained at `anchorWall + t·1000 + lagMs`, so
+// ingestA2FFrame() below runs at scheduled apply time, not on wire arrival.
+// The `a2fEnv` timestamps therefore already trail the wire by that constant
+// lag — see crossCorrelateOffset()'s doc for what its output measures now.
 //
 // Only one provider drives the mouth at a time. When A2F is streaming it owns the
 // mouth; volume frames are still recorded (for correlation) but not forwarded. On
@@ -35,6 +41,10 @@ export function crossCorrelateOffset(a, b) {
   // Resample both series onto a common 10ms grid over their overlapping span,
   // subtract means, then find the integer lag maximising the normalised
   // cross-correlation. Positive lag = `a` leads `b` (A2F earlier than audio).
+  // Callers now feed `a2fEnv` samples stamped at schedule.js's scheduled apply
+  // time (anchor + t·1000 + lagMs), not wire arrival, so the returned offset
+  // already has that constant lag baked in — it measures residual playout
+  // misalignment, useful for tuning schedule.js's lagMs, not raw A2F latency.
   const gridMs = 10;
   const maxLagMs = 300;
   if (!a || !b || a.length < 2 || b.length < 2) return 0;
@@ -102,11 +112,11 @@ export function createMouth(avatar, { log, forceVolume = false, now } = {}) {
 
   const provider = () => (a2fActive && !forceVolume) ? 'a2f' : 'volume';
 
-  const delayMs = 0; // ADR-0013 measure-first: apply-on-arrival. Phase 3 buffers frames
-                     // against `pts` and the audio playout position, tuning delayMs from the
-                     // cross-correlator offset. Kept D=0 here — a genuine seam, not a scheduler.
+  const delayMs = 0; // Mouth-only trim knob, separate from schedule.js's playout-aligned
+                     // buffering (ADR-0013 Phase 3, which now owns when ingestA2FFrame()
+                     // below runs). Kept D=0 here — a genuine seam, not a second scheduler.
   function applyA2F(value) {
-    // delayMs === 0 → pass-through. A Phase-3 buffer slots in here keyed on pts.
+    // delayMs === 0 → pass-through. A future fine-trim can slot in here keyed on pts.
     if (provider() === 'a2f') avatar.setMouthOpen(value);
   }
 

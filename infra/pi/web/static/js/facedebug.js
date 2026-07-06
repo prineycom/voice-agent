@@ -1,7 +1,14 @@
 // A2F debug face: a canvas schematic face + timing readout driven DIRECTLY from
 // the raw ARKit blendshape frames, bypassing Live2D. Bisects "no facial
-// animation": if this face moves, blendshapes reach the browser; the timing
-// panel then shows HOW they arrive (steady vs a burst faster than real time).
+// animation": if this face moves, blendshapes reach the browser.
+//
+// debug.onStart/onFrame/onEnd are called by blendshapes.js's sink at APPLY
+// time — i.e. after schedule.js has drained each frame at its reply-relative
+// `t` on a wall-clock anchor, paced to real time. So the timing panel measures
+// PLAYBACK pacing, not wire arrival: recv span ≈ audio span (ratio ≈ 1x) is
+// the healthy/expected reading when the scheduler is working. A ratio >> 1
+// (frames applied in a burst faster than real time) now indicates the
+// scheduler is broken or bypassed, not a normal transport characteristic.
 //
 // Activated by `?facedebug=1`. Non-destructive overlay; motions are frozen by
 // main.js. Per-stream stats also go to console.log('[a2f] …') and window.__a2fStats.
@@ -93,7 +100,7 @@ export function createFaceDebug() {
 
   function onEnd() {
     if (!s || s.count === 0) return;
-    const wall = Math.max(0, s.lastWall - s.firstWall);           // ms spent receiving
+    const wall = Math.max(0, s.lastWall - s.firstWall);           // ms spent applying (playback pacing, post-scheduler)
     const tspan = (s.firstT !== null && s.lastT !== null) ? (s.lastT - s.firstT) * 1000 : NaN; // ms of audio the frames cover
     const fps = wall > 0 ? Math.round((s.count - 1) / (wall / 1000)) : 0;
     const ratio = (wall > 0 && !isNaN(tspan)) ? (tspan / wall).toFixed(1) : '?';
@@ -108,6 +115,10 @@ export function createFaceDebug() {
 
   draw({});
   info.textContent = 'frames:0\nwaiting for A2F blendshapes…\n(speak to the agent)';
+  // recv= is now the playback (apply-time) span, post-scheduler — expect x≈1
+  // (recv≈audio) when the scheduler is pacing correctly; x >> 1 means frames
+  // are being applied in a burst faster than real time, i.e. the scheduler
+  // is broken or bypassed.
   histEl.textContent = 'per-stream: <count> recv=<ms to receive> audio=<ms covered> fps=<rate> gap=<max pause> x<audio/recv>\n(x >> 1 means frames arrive as a burst, faster than real time)';
   return { onFrame, onStart, onEnd };
 }
