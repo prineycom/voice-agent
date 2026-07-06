@@ -14,6 +14,7 @@ at boot and auto-restarts on failure.
 | Pi | LiteLLM proxy | Docker | 4000 | LLM gateway; alias `voice-agent` → Desktop `llama-server` (ADR 0014) |
 | Desktop (Windows, RTX 4070) | `voice-agent-stt` | NSSM (LocalSystem) | 8001 | faster-whisper large-v3-turbo |
 | Desktop | `voice-agent-tts` | NSSM (LocalSystem) | 8002 | Qwen3-TTS, multi-engine |
+| Desktop | `voice-agent-a2f` | Docker `--restart always` in WSL2 + logon task | 8003 | Audio2Face-3D helper (ADR 0015); container `voice-agent-a2f:latest`, not NSSM (WSL≠LocalSystem) |
 | Desktop | `voice-agent-llm` | NSSM (LocalSystem) | 8004 | llama.cpp — Qwen3.5-4B-MTP (ADR 0014); manual restart (not in deploy.sh) |
 
 Desktop services run as **LocalSystem** so they start at boot **without login**

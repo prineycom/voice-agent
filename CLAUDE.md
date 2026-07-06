@@ -44,6 +44,7 @@ Desktop (RTX 4070)
 - STT/TTS transport is WebSocket (not gRPC) — simpler, FastAPI native, LiveKit ecosystem pattern
 - LLM model is swappable via LiteLLM config (one line) — now a local Qwen3.5-4B-MTP on the Desktop GPU (llama.cpp, `voice-agent-llm` NSSM on :8004), replacing cloud (ADR 0014). Non-thinking via `LLAMA_CHAT_TEMPLATE_KWARGS` env; MTP self-speculative decoding for speed; `-ub` (not context) is the VRAM lever
 - Live2D: motion states (idle/listening/thinking/speaking) + expressions, driven by authoritative agent motion events on the `voiceagent` data channel; expressions come from LLM inline emotion tags (enum neutral/happy/sad/surprised/thinking, stripped before TTS/transcript); volume-based lip-sync on the agent's WebRTC audio track (client-side, not phoneme/TTS-side) — see ADR 0008-0011
+- A2F facial animation is PRODUCTION (ADR 0015): real Audio2Face-3D `helper` runs as a Docker container in WSL2 on the Desktop (`voice-agent-a2f:latest`, :8003, CDI GPU, ~0.4GB VRAM) — NOT NSSM (WSL≠LocalSystem); supervised by `--restart always` + a logon Scheduled Task. TTS forks PCM+emotion → A2F → agent forwards ARKit blendshapes → frontend (A2F primary, volume-lipsync fallback). Rebuild: `deploy/build_image.sh`
 - Frontend is vanilla JS as ES modules, no build step (no React/Vue overhead for Pi 5); served as static files by the stdlib http.server
 - Sound goes through LiveKit WebRTC in browser, not system speakers
 - Kiosk and web access share the same responsive frontend (kiosk-specific concerns are Epic 6)

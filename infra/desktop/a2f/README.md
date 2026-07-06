@@ -68,11 +68,18 @@ NSSM service `voice-agent-a2f` (LocalSystem, boot-start), mirroring STT/TTS — 
 `deploy/`. Firewall: `netsh advfirewall firewall add rule name=voiceagent-a2f
 dir=in action=allow protocol=TCP localport=8003`.
 
-## Status (Phase 1)
+## Status — PRODUCTION (helper backend live)
+
+The real `helper` backend is deployed as an always-on containerized service on the
+Desktop GPU — see [ADR 0015](../../../docs/adr/0015-a2f-helper-production.md) and
+[`deploy/`](deploy/) (Dockerfile + `setup_a2f_service.ps1`). The `mock` backend
+remains the CI / frontend-dev default when run bare.
 
 - [x] FastAPI service, `/health`, WS `/a2f` contract, emotion mapping, mock backend, tests
 - [x] `build_engine.sh` — reproducible batch-1 engine (verified in the spike)
-- [x] `a2f_stream/` C++ helper — **built + working on the box**: 68 ARKit coeffs/frame (52 skin+16 tongue), GPU blendshape solve, verified vs a test WAV
+- [x] `a2f_stream/` C++ helper — 68 ARKit coeffs/frame (52 skin+16 tongue), GPU blendshape solve
 - [x] `helper` backend subprocess bridge in `engine.py` (resample 24→16k, feed, map, 60→30 fps)
-- [ ] make the helper **persistent** — needs a port to the SDK *Interactive* executors (streaming); the batch executor can't be reused across utterances (see a2f_stream/README.md)
-- [ ] TTS-side PCM fork + `emotion` field plumbing; agent-side `/a2f` forward to `voiceagent`
+- [x] persistent helper — SDK *Interactive* executors, engine loaded once (issue #34)
+- [x] TTS-side PCM fork + `emotion` field; agent-side `/a2f` forward to `voiceagent` (issues #33/#36)
+- [x] **production deploy** — Docker image (`voice-agent-a2f:latest`) in the TensorRT
+  container, `--restart always`, boot via logon Scheduled Task; VRAM Δ≈0.4 GB
