@@ -28,6 +28,16 @@
 // the A2E model file is then not required). The stdin/stdout protocol is
 // byte-identical in both modes.
 //
+// Tuning knobs (optional envs; unset ⇒ the SDK/model-config defaults, i.e.
+// exactly the previous behavior):
+//   A2E post-process: A2E_EMOTION_STRENGTH, A2E_EMOTION_CONTRAST,
+//     A2E_LIVE_BLEND_COEF, A2E_LIVE_TRANSITION_TIME, A2E_MAX_EMOTIONS,
+//     A2E_PREFERRED_STRENGTH.
+//   A2F face animator: A2F_SKIN_STRENGTH, A2F_UPPER_FACE_STRENGTH,
+//     A2F_LOWER_FACE_STRENGTH, A2F_BLINK_STRENGTH.
+//   Per-pose weight shaping: A2F_BS_MULTIPLIERS / A2F_BS_OFFSETS —
+//     "BrowDownLeft=0.5,MouthSmileLeft=1.2" CSVs applied to the skin solver.
+//
 // Build: ../build_helper.sh (inside nvcr.io/nvidia/tensorrt:25.08-py3).
 
 #include "audio2emotion/audio2emotion.h"
@@ -51,6 +61,8 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -72,6 +84,102 @@ const char* a2eModelJson() {
 bool a2eEnabled() {
   const char* p = std::getenv("A2E_ENABLED");
   return !(p && std::strcmp(p, "0") == 0);
+}
+
+// Env knob helpers. Unset or unparseable envs return the given default, so
+// every knob falls back to its SDK/model-config baseline — a bad value warns
+// and degrades, it never aborts the helper.
+float envFloat(const char* name, float def) {
+  const char* p = std::getenv(name);
+  if (!p || !*p) return def;
+  char* end = nullptr;
+  const float v = std::strtof(p, &end);
+  if (end == p || *end != '\0') {
+    std::cerr << "a2f_stream: env " << name << "='" << p << "' is not a float — using " << def << "\n";
+    return def;
+  }
+  return v;
+}
+long envInt(const char* name, long def) {
+  const char* p = std::getenv(name);
+  if (!p || !*p) return def;
+  char* end = nullptr;
+  const long v = std::strtol(p, &end, 10);
+  if (end == p || *end != '\0') {
+    std::cerr << "a2f_stream: env " << name << "='" << p << "' is not an integer — using " << def << "\n";
+    return def;
+  }
+  return v;
+}
+
+// Parses a "Name=1.5,Other=0.25" CSV env into name→value pairs. Malformed
+// entries (no '=', empty name, non-float value) are warned and skipped; blank
+// entries are ignored. Unset env ⇒ empty result.
+std::vector<std::pair<std::string, float>> envCsvMap(const char* name) {
+  std::vector<std::pair<std::string, float>> out;
+  const char* p = std::getenv(name);
+  if (!p) return out;
+  const std::string csv(p);
+  for (std::size_t pos = 0; pos <= csv.size();) {
+    std::size_t comma = csv.find(',', pos);
+    if (comma == std::string::npos) comma = csv.size();
+    std::string entry = csv.substr(pos, comma - pos);
+    pos = comma + 1;
+    const auto first = entry.find_first_not_of(" \t");
+    if (first == std::string::npos) continue;  // blank entry (incl. trailing comma)
+    entry = entry.substr(first, entry.find_last_not_of(" \t") - first + 1);
+    const std::size_t eq = entry.find('=');
+    std::string key = (eq == std::string::npos) ? std::string() : entry.substr(0, eq);
+    const auto keyEnd = key.find_last_not_of(" \t");
+    key = (keyEnd == std::string::npos) ? std::string() : key.substr(0, keyEnd + 1);
+    if (key.empty()) {
+      std::cerr << "a2f_stream: env " << name << ": bad entry '" << entry
+                << "' (want Name=value) — skipped\n";
+      continue;
+    }
+    const std::string val = entry.substr(eq + 1);
+    char* end = nullptr;
+    const float v = std::strtof(val.c_str(), &end);
+    while (end && (*end == ' ' || *end == '\t')) ++end;
+    if (end == val.c_str() || *end != '\0') {
+      std::cerr << "a2f_stream: env " << name << ": bad value in '" << entry << "' — skipped\n";
+      continue;
+    }
+    out.emplace_back(std::move(key), v);
+  }
+  return out;
+}
+
+// Applies an A2F_BS_MULTIPLIERS / A2F_BS_OFFSETS CSV into the SKIN solver's
+// creation-time config. Creation-time is the only route: the per-pose runtime
+// setters (IBlendshapeSolver::SetMultiplier/SetOffset) sit on the solver
+// object, which the interactive blendshape executor never exposes. Baseline is
+// the model-config array when present, else the solver identity (multiplier 1,
+// offset 0); unknown pose names warn and are skipped. `storage` backs the
+// adjusted view and must outlive executor creation.
+void applyBsEnvOverrides(const char* envName, bool isMultiplier,
+                         nva2f::BlendshapeSolveExecutorCreationParameters::BlendshapeParams& skin,
+                         std::vector<float>& storage) {
+  const auto entries = envCsvMap(envName);
+  if (entries.empty()) return;  // unset/empty/garbage-only env ⇒ config untouched
+  const std::size_t n = skin.config.numBlendshapes;
+  auto& view = isMultiplier ? skin.config.multipliers : skin.config.offsets;
+  storage.assign(n, isMultiplier ? 1.0f : 0.0f);
+  if (view.Data() && view.Size() == n)
+    std::memcpy(storage.data(), view.Data(), n * sizeof(float));
+  for (const auto& entry : entries) {
+    std::size_t idx = n;
+    for (std::size_t i = 0; i < skin.data.poseNamesSize && i < n; ++i) {
+      if (skin.data.poseNames[i] && entry.first == skin.data.poseNames[i]) { idx = i; break; }
+    }
+    if (idx == n) {
+      std::cerr << "a2f_stream: env " << envName << ": unknown pose '" << entry.first
+                << "' — skipped\n";
+      continue;
+    }
+    storage[idx] = entry.second;
+  }
+  view = nva2x::HostTensorFloatConstView{storage.data(), storage.size()};
 }
 
 // A partial stdin read (fewer bytes than the wire protocol promised) means the
@@ -167,9 +275,27 @@ int main() {
   const nva2x::IEmotionAccumulator* emoAccPtr = emoAcc.get();
   geomParams.sharedEmotionAccumulators = &emoAccPtr;
 
-  const auto regressionParams = geomInfo->GetExecutorCreationParameters(
+  auto regressionParams = geomInfo->GetExecutorCreationParameters(
       nva2f::IGeometryExecutor::ExecutionOption::All, /*frameRateNumerator=*/60,
       /*frameRateDenominator=*/1);
+
+  // Face knobs (A2F_*_STRENGTH) override the model-config skin animator params
+  // at creation. Only applied when at least one env is set — otherwise the
+  // model-info pointer passes through untouched. envFloat falls back to the
+  // model-config field, so each unset env keeps its model value exactly.
+  nva2f::IRegressionModel::GeometryExecutorCreationParameters::SkinParameters skinParams{};
+  const bool skinEnvSet =
+      std::getenv("A2F_SKIN_STRENGTH") || std::getenv("A2F_UPPER_FACE_STRENGTH") ||
+      std::getenv("A2F_LOWER_FACE_STRENGTH") || std::getenv("A2F_BLINK_STRENGTH");
+  if (skinEnvSet && regressionParams.initializationSkinParams) {
+    skinParams = *regressionParams.initializationSkinParams;
+    auto& sp = skinParams.params;
+    sp.skinStrength = envFloat("A2F_SKIN_STRENGTH", sp.skinStrength);
+    sp.upperFaceStrength = envFloat("A2F_UPPER_FACE_STRENGTH", sp.upperFaceStrength);
+    sp.lowerFaceStrength = envFloat("A2F_LOWER_FACE_STRENGTH", sp.lowerFaceStrength);
+    sp.blinkStrength = envFloat("A2F_BLINK_STRENGTH", sp.blinkStrength);
+    regressionParams.initializationSkinParams = &skinParams;
+  }
 
   auto geomExec = ToUniquePtr(nva2f::CreateRegressionGeometryInteractiveExecutor(
       geomParams, regressionParams, /*batchSize=*/1));
@@ -183,6 +309,20 @@ int main() {
   nva2f::DeviceBlendshapeSolveExecutorCreationParameters bsParams;
   bsParams.initializationSkinParams = bsParams0.initializationSkinParams;
   bsParams.initializationTongueParams = bsParams0.initializationTongueParams;
+
+  // Per-pose weight shaping (A2F_BS_MULTIPLIERS / A2F_BS_OFFSETS) rides in via
+  // the skin solver's creation config — see applyBsEnvOverrides. The copied
+  // params struct and the storage vectors stay alive for the executor's
+  // lifetime; unset envs keep the model-info pointer untouched.
+  nva2f::BlendshapeSolveExecutorCreationParameters::BlendshapeParams bsSkinParams{};
+  std::vector<float> bsMultipliers, bsOffsets;
+  if (bsParams0.initializationSkinParams &&
+      (std::getenv("A2F_BS_MULTIPLIERS") || std::getenv("A2F_BS_OFFSETS"))) {
+    bsSkinParams = *bsParams0.initializationSkinParams;
+    applyBsEnvOverrides("A2F_BS_MULTIPLIERS", /*isMultiplier=*/true, bsSkinParams, bsMultipliers);
+    applyBsEnvOverrides("A2F_BS_OFFSETS", /*isMultiplier=*/false, bsSkinParams, bsOffsets);
+    bsParams.initializationSkinParams = &bsSkinParams;
+  }
 
   auto bsExec = ToUniquePtr(nva2f::CreateDeviceBlendshapeSolveInteractiveExecutor(
       geomExec.release(), bsParams));  // ownership of geomExec transferred here
@@ -230,7 +370,26 @@ int main() {
     if (!prefAcc) { std::cerr << "preferred emotion accumulator alloc failed\n"; return 2; }
     const nva2x::IEmotionAccumulator* prefAccPtr = prefAcc.get();
     a2eModelParams.sharedPreferredEmotionAccumulators = &prefAccPtr;
-    a2ePostParams = a2eModelParams.postProcessParams;  // model-config baseline for per-utterance toggling
+
+    // A2E knobs override the model-config post-process baseline; envFloat
+    // falls back to the config's current value, so each unset env keeps the
+    // model default exactly. The result is the base params for BOTH executor
+    // creation and the per-utterance enablePreferredEmotion toggle below —
+    // A2E_PREFERRED_STRENGTH in particular lifts preferredEmotionStrength off
+    // the model-config baseline it was previously stuck at.
+    auto& pp = a2eModelParams.postProcessParams;
+    pp.emotionStrength = envFloat("A2E_EMOTION_STRENGTH", pp.emotionStrength);
+    pp.emotionContrast = envFloat("A2E_EMOTION_CONTRAST", pp.emotionContrast);
+    pp.liveBlendCoef = envFloat("A2E_LIVE_BLEND_COEF", pp.liveBlendCoef);
+    pp.liveTransitionTime = envFloat("A2E_LIVE_TRANSITION_TIME", pp.liveTransitionTime);
+    pp.preferredEmotionStrength = envFloat("A2E_PREFERRED_STRENGTH", pp.preferredEmotionStrength);
+    const long maxEmotions = envInt("A2E_MAX_EMOTIONS", static_cast<long>(pp.maxEmotions));
+    if (maxEmotions >= 0) {
+      pp.maxEmotions = static_cast<std::size_t>(maxEmotions);
+    } else {
+      std::cerr << "a2f_stream: A2E_MAX_EMOTIONS must be >= 0 — keeping " << pp.maxEmotions << "\n";
+    }
+    a2ePostParams = a2eModelParams.postProcessParams;  // env-adjusted baseline for per-utterance toggling
 
     nva2e::EmotionExecutorCreationParameters a2eParams;
     a2eParams.cudaStream = stream;
