@@ -35,9 +35,10 @@ ENV LD_LIBRARY_PATH=/opt/a2f/lib:/usr/local/cuda/lib64 \
 # --- A2E (audio2emotion) ------------------------------------------------------
 # A2E engine load happens lazily on the first utterance, so the first-utterance
 # timeout is raised from the default 30s (engine.py) to cover the TRT engine load.
-# The A2E_* knobs below are the model-config defaults, spelled out so the tuning
+# The A2E_* knobs below match the model-config values, spelled out so the tuning
 # pass can override them at `docker run` without rebuilding.
 # Other helper knobs (unset = model default, override at run time if needed):
+#   A2E_MAX_EMOTIONS (model default 6; "keep N largest" — 0 zeroes ALL output),
 #   A2F_SKIN_STRENGTH, A2F_UPPER_FACE_STRENGTH, A2F_LOWER_FACE_STRENGTH,
 #   A2F_BLINK_STRENGTH, A2F_BS_MULTIPLIERS, A2F_BS_OFFSETS
 ENV A2E_MODEL_JSON=/opt/a2f/a2e/model.json \
@@ -47,7 +48,6 @@ ENV A2E_MODEL_JSON=/opt/a2f/a2e/model.json \
     A2E_EMOTION_CONTRAST=1.0 \
     A2E_LIVE_BLEND_COEF=0.7 \
     A2E_LIVE_TRANSITION_TIME=0.5 \
-    A2E_MAX_EMOTIONS=0 \
     A2E_PREFERRED_STRENGTH=0.5
 
 EXPOSE 8003
