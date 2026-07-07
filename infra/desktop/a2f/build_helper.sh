@@ -10,6 +10,7 @@ LIB="$SDK/_build/release/audio2x-sdk/lib"
 
 g++ -std=c++17 -O2 "$SRC" -o "$OUT" \
   -I"$SDK/audio2face-sdk/include" \
+  -I"$SDK/audio2emotion-sdk/include" \
   -I"$SDK/audio2x-common/include" \
   -I/usr/local/cuda/include \
   -L"$LIB" -laudio2x \
