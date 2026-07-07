@@ -75,6 +75,7 @@ comparison ("A/B against the old path, must be obviously better"), not as pipeli
 ## Roadmap
 
 1. **Calibrate** — forced-emotion vs zero A/B on facedebug (hours). Decides everything below.
+   **Done 2026-07-07** — verdict: emotion supply proceeds (see [calibration report](research/2026-07-07-a2f-emotion-calibration.md)).
 2. **Emotion supply** — integrate A2E audio inference into the helper; keep tag as an additive
    boost; tune SDK strength knobs while in there (ADR-0016).
 3. **Live2D amplification** — expander curves + discrete accents in `arkit-map.js`/frontend;
