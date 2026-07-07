@@ -12,6 +12,8 @@ FROM nvcr.io/nvidia/tensorrt:25.08-py3
 # --- baked GPU artifacts (from build_image.sh ./ctx) --------------------------
 # James model dir (model.json + network.trt + npz + configs; network.onnx excluded)
 COPY model/          /opt/a2f/model/
+# A2E (audio2emotion) model dir (model.json + network.trt + configs; network.onnx excluded)
+COPY a2e/            /opt/a2f/a2e/
 # Persistent C++ helper + its SDK runtime lib
 COPY a2f_stream      /opt/a2f/a2f_stream
 COPY libaudio2x.so   /opt/a2f/lib/libaudio2x.so
@@ -29,6 +31,24 @@ ENV LD_LIBRARY_PATH=/opt/a2f/lib:/usr/local/cuda/lib64 \
     A2F_MODEL_JSON=/opt/a2f/model/model.json \
     A2F_HOST=0.0.0.0 \
     A2F_PORT=8003
+
+# --- A2E (audio2emotion) ------------------------------------------------------
+# A2E engine load happens lazily on the first utterance, so the first-utterance
+# timeout is raised from the default 30s (engine.py) to cover the TRT engine load.
+# The A2E_* knobs below are the model-config defaults, spelled out so the tuning
+# pass can override them at `docker run` without rebuilding.
+# Other helper knobs (unset = model default, override at run time if needed):
+#   A2F_SKIN_STRENGTH, A2F_UPPER_FACE_STRENGTH, A2F_LOWER_FACE_STRENGTH,
+#   A2F_BLINK_STRENGTH, A2F_BS_MULTIPLIERS, A2F_BS_OFFSETS
+ENV A2E_MODEL_JSON=/opt/a2f/a2e/model.json \
+    A2E_ENABLED=1 \
+    A2F_HELPER_FIRST_TIMEOUT=60 \
+    A2E_EMOTION_STRENGTH=0.6 \
+    A2E_EMOTION_CONTRAST=1.0 \
+    A2E_LIVE_BLEND_COEF=0.7 \
+    A2E_LIVE_TRANSITION_TIME=0.5 \
+    A2E_MAX_EMOTIONS=0 \
+    A2E_PREFERRED_STRENGTH=0.5
 
 EXPOSE 8003
 CMD ["python3", "/app/server.py"]
