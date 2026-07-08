@@ -23,9 +23,10 @@ The Desktop `/tts` contract (see infra/desktop/README.md):
       (or JSON {"error": "..."} on failure)
 The streaming path pipelines sentences over one socket and matches each `done` to a
 sent sentence. Blendshape frames are re-based from sentence-relative `t` to
-reply-relative `t` (accumulating each sentence's audio duration) and forwarded on
-the `voiceagent` data channel; `done`/`a2f_done` are internal and never forwarded.
-Exactly ONE reply-level {"done": true} is published per reply.
+reply-relative `t` (accumulating each sentence's audio duration), bounded to a
+single-MTU payload (see FRAME_MAX_BYTES) and forwarded on the `voiceagent` data
+channel; `done`/`a2f_done` are internal and never forwarded. Exactly ONE
+reply-level {"done": true} is published per reply.
 """
 
 from __future__ import annotations
@@ -65,6 +66,43 @@ SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
 # Raw PCM mime type so the emitter treats incoming bytes as already-decoded samples.
 MIME_TYPE = "audio/pcm"
+# Ceiling for one serialized blendshape frame on the lossy `voiceagent` channel.
+# The channel rides the Tailscale (WireGuard) path with a 1280-byte MTU, and a
+# lossy datagram fragmented across packets is lost if ANY fragment drops — so a
+# frame must fit a single MTU, with headroom for the LiveKit/SCTP envelope.
+FRAME_MAX_BYTES = 1100
+
+
+def _compact_arkit(frame_no: int, t: float, arkit: dict) -> bytes:
+    """Serialize one blendshape frame, bounded to FRAME_MAX_BYTES.
+
+    Values are rounded to 3 decimals and keys that round to 0 are dropped — the
+    frontend reads a missing key as 0 (see infra/pi/web/static/js/arkit-map.js),
+    so dropping them is lossless there. If the full payload would still exceed
+    the budget, the highest-|value| keys win (name-order tiebreak, so the result
+    is deterministic) and the rest are dropped. Malformed input (non-numeric
+    value or `t`, non-dict arkit) raises TypeError so the caller's defensive
+    handler drops the whole frame.
+    """
+    if not isinstance(arkit, dict):
+        raise TypeError("arkit must be a dict")
+    kept = sorted(
+        ((name, rv) for name, v in arkit.items() if (rv := round(v, 3)) != 0),
+        key=lambda kv: (-abs(kv[1]), kv[0]),
+    )
+    frame = {"type": "blendshapes", "frame": frame_no, "t": round(t, 3), "arkit": {}}
+    # Base envelope cost with an empty arkit; each kept key then adds exactly
+    # `"name":value` plus one comma after the first — matching the compact
+    # separators the final dump uses, so `total` tracks the real payload size.
+    total = len(json.dumps(frame, separators=(",", ":")))
+    out = frame["arkit"]
+    for name, rv in kept:
+        cost = len(json.dumps(name)) + 1 + len(json.dumps(rv)) + (1 if out else 0)
+        if total + cost > FRAME_MAX_BYTES:
+            continue  # over budget — a shorter lower-|v| key may still fit
+        out[name] = rv
+        total += cost
+    return json.dumps(frame, separators=(",", ":")).encode()
 
 
 class DesktopTTS(tts.TTS):
@@ -407,21 +445,19 @@ class DesktopSynthesizeStream(tts.SynthesizeStream):
 
                             msg_type = data.get("type")
                             if msg_type == "blendshapes":
-                                # Re-base sentence-relative `t` to reply-relative and
-                                # forward on the `voiceagent` channel (lossy). A
-                                # malformed frame (missing/None key) must NEVER break
-                                # audio — build the payload defensively and drop the
-                                # frame on any error, exactly like a failed publish.
+                                # Re-base sentence-relative `t` to reply-relative,
+                                # bound the payload to a single MTU for the lossy
+                                # `voiceagent` channel (see FRAME_MAX_BYTES) and
+                                # forward. A malformed frame (missing/None key,
+                                # non-numeric value) must NEVER break audio — build
+                                # the payload defensively and drop the frame on any
+                                # error, exactly like a failed publish.
                                 try:
-                                    t = data["t"]
-                                    payload = json.dumps(
-                                        {
-                                            "type": "blendshapes",
-                                            "frame": data["frame"],
-                                            "t": t + reply_offset_s,
-                                            "arkit": data["arkit"],
-                                        }
-                                    ).encode()
+                                    payload = _compact_arkit(
+                                        data["frame"],
+                                        data["t"] + reply_offset_s,
+                                        data["arkit"],
+                                    )
                                 except (KeyError, TypeError):
                                     # Malformed A2F frame — skip it; never touches the
                                     # audio path or reply_offset_s accounting.

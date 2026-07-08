@@ -20,7 +20,7 @@ import pytest
 import websockets
 from livekit.agents import APIConnectOptions, APIError
 
-from tts_plugin import NUM_CHANNELS, SAMPLE_RATE, DesktopTTS
+from tts_plugin import FRAME_MAX_BYTES, NUM_CHANNELS, SAMPLE_RATE, DesktopTTS
 
 
 def _publish_spy():
@@ -40,6 +40,18 @@ def _publish_spy():
 def _bs_frame(index, t):
     """A deterministic A2F blendshape frame with sentence-relative ``t``."""
     return {"type": "blendshapes", "frame": index, "t": t, "arkit": {"jawOpen": 0.5}}
+
+
+def _publish_raw_spy():
+    """Like ``_publish_spy`` but also keeps the raw bytes for size assertions."""
+    raw = []
+    decoded = []
+
+    def publish(payload):
+        raw.append(bytes(payload))
+        decoded.append(json.loads(payload.decode()))
+
+    return publish, raw, decoded
 
 
 async def _collect(stream):
@@ -538,7 +550,9 @@ async def test_blendshape_t_rebased_monotonic_across_reply(tts_server_factory):
     # sentence-1's audio duration (0.1s).
     assert ts[:3] == pytest.approx([0.0, 0.04, 0.08])
     assert ts[3:] == pytest.approx([0.1, 0.14, 0.18])
-    # Frame index and arkit payload are forwarded untouched.
+    # Frame index is forwarded untouched; arkit carries the significant keys,
+    # rounded to 3 decimals and capped to FRAME_MAX_BYTES — {"jawOpen": 0.5}
+    # survives the rounding intact.
     assert [p["frame"] for p in forwarded] == [0, 1, 2, 0, 1, 2]
     assert all(p["arkit"] == {"jawOpen": 0.5} for p in forwarded)
 
@@ -615,6 +629,130 @@ async def test_malformed_blendshape_frame_never_breaks_audio(tts_server_factory)
     # done still reached the channel — audio path unbroken.
     assert not any(p.get("type") == "blendshapes" for p in published)
     assert published.count({"done": True}) == 1
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_dense_blendshape_frame_capped_to_frame_max_bytes(tts_server_factory):
+    # A dense (68-key) A2F frame must serialize within FRAME_MAX_BYTES — one MTU
+    # on the lossy channel. The highest-|value| keys win, with equal values
+    # tie-broken by name, so the cut falls on the alphabetical tail of the tied
+    # 0.5-filler block while the few larger values always survive.
+    fillers = {f"filler{i:02d}LongBlendshapeName": 0.5 for i in range(66)}
+    dense = {**fillers, "zzBig": 0.9, "zzBigger": 0.95}
+    frame = {"type": "blendshapes", "frame": 0, "t": 0.0, "arkit": dense}
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM], loop=True, blendshapes=lambda i: [frame]
+    )
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, raw, decoded = _publish_raw_spy()
+    tts_impl.set_publisher(publish)
+
+    await _drive(tts_impl.stream(), "First sentence here.")
+
+    frames = [(r, p) for r, p in zip(raw, decoded) if p.get("type") == "blendshapes"]
+    assert len(frames) == 1
+    raw_frame, forwarded = frames[0]
+    # The full frame would blow the budget; the published payload fits it.
+    assert len(json.dumps(frame, separators=(",", ":")).encode()) > FRAME_MAX_BYTES
+    assert len(raw_frame) <= FRAME_MAX_BYTES
+    arkit = forwarded["arkit"]
+    # The largest values survive even though they sort LAST by name...
+    assert arkit["zzBigger"] == 0.95
+    assert arkit["zzBig"] == 0.9
+    # ...and the tied 0.5 fillers are kept as an alphabetical PREFIX (name-order
+    # tiebreak): the dropped keys are exactly the alphabetical tail.
+    kept_fillers = sorted(k for k in arkit if k in fillers)
+    assert 0 < len(kept_fillers) < len(fillers)
+    assert kept_fillers == sorted(fillers)[: len(kept_fillers)]
+    assert all(arkit[k] == 0.5 for k in kept_fillers)
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sparse_blendshape_frame_passes_with_rounding_only(tts_server_factory):
+    # A typical sparse frame is far under the budget: every significant key passes
+    # through, with values (and the re-based `t`) rounded to 3 decimals.
+    frame = {
+        "type": "blendshapes",
+        "frame": 3,
+        "t": 0.0333333,
+        "arkit": {"jawOpen": 0.53001, "eyeBlinkLeft": 0.1239, "browDownLeft": 1.0},
+    }
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM], loop=True, blendshapes=lambda i: [frame]
+    )
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, published = _publish_spy()
+    tts_impl.set_publisher(publish)
+
+    await _drive(tts_impl.stream(), "First sentence here.")
+
+    forwarded = [p for p in published if p.get("type") == "blendshapes"]
+    assert len(forwarded) == 1
+    assert forwarded[0]["frame"] == 3
+    assert forwarded[0]["t"] == 0.033
+    assert forwarded[0]["arkit"] == {
+        "jawOpen": 0.53,
+        "eyeBlinkLeft": 0.124,
+        "browDownLeft": 1.0,
+    }
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_blendshape_keys_rounding_to_zero_are_dropped(tts_server_factory):
+    # Keys whose value rounds to 0 at 3 decimals are absent from the payload —
+    # the frontend reads a missing key as 0 (arkit-map.js), so this is lossless
+    # there and buys back budget on the lossy channel.
+    frame = {
+        "type": "blendshapes",
+        "frame": 0,
+        "t": 0.0,
+        "arkit": {
+            "jawOpen": 0.5,
+            "browDownLeft": 0.0004,
+            "cheekPuff": 0.0,
+            "noseSneerLeft": -0.0002,
+        },
+    }
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM], loop=True, blendshapes=lambda i: [frame]
+    )
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, published = _publish_spy()
+    tts_impl.set_publisher(publish)
+
+    await _drive(tts_impl.stream(), "First sentence here.")
+
+    forwarded = [p for p in published if p.get("type") == "blendshapes"]
+    assert len(forwarded) == 1
+    assert forwarded[0]["arkit"] == {"jawOpen": 0.5}
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_blendshape_payload_uses_compact_separators(tts_server_factory):
+    # Wire bytes carry no separator whitespace — every byte counts against the
+    # single-MTU budget, so the payload is dumped with compact separators.
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM], loop=True, blendshapes=lambda i: [_bs_frame(0, 0.0)]
+    )
+    tts_impl = DesktopTTS(ws_url=srv.url)
+    publish, raw, decoded = _publish_raw_spy()
+    tts_impl.set_publisher(publish)
+
+    await _drive(tts_impl.stream(), "First sentence here.")
+
+    raw_frames = [
+        r for r, p in zip(raw, decoded) if p.get("type") == "blendshapes"
+    ]
+    assert len(raw_frames) == 1
+    assert b" " not in raw_frames[0]
 
     await tts_impl.aclose()
 
