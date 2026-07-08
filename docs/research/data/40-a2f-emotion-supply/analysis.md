@@ -332,3 +332,121 @@ steers the face, but (1) the A2E baseline is too subtle at `A2E_EMOTION_STRENGTH
 Both point at the strength/contrast/max_emotions knobs before any fallback is considered.
 `BrowDownLeft` under joyboost is already below the 0.15 target (0.1143) and the
 jaw-articulation control is within ±25% — record both as the pre-tuning reference points.
+
+---
+
+# Tuning (Task 8) — bounded knob sweep, winning config, bake
+
+Date: 2026-07-08. This section appends to (does not revise) the acceptance report above.
+Task 8 tunes the helper's emotion knobs against the pre-registered DONE criteria and bakes
+the winner into `infra/desktop/a2f/deploy/Dockerfile`.
+
+## Pre-registered criteria (from the plan, DD-5 — first config satisfying all wins)
+
+> **(a)** neutral-tag pure-A2E run beats the #39 zeros baseline (≥ +0.02 abs or ≥ 3× group
+> mean) in ≥ 2 of {brows, eyes-expressive, mouth-form};
+> **(b)** joy-boost amplifies joy-correlated groups (brows, mouth-form) ≥ +20% group-mean
+> over the SAME config's a2e-neutral run;
+> **(c)** `BrowDownLeft` mean under joy-boost < 0.15, while anger's brow response survives
+> (> 50% of its value in the untuned-A2E anger run);
+> **(d)** jaw-articulation group within ±25% of that config's a2e-neutral.
+> Soft goal: prefer configs that keep eyes-expressive ≥ 0.5× under boost, all else equal.
+
+Iteration budget: ≤ 8 container-restart iterations. **Used: 7.**
+
+## Method deltas vs the acceptance captures
+
+Same probe, same fixed WAV (sha-checked), same groups/aggregates, same tunnel. Each
+iteration: `docker rm -f` + `docker run … -e KNOB=val … voice-agent-a2f:latest` (image
+`6f188ec4afb3` during the sweep), one discarded warm-up run, then zeros + joy + anger
+captures (`tune-<config>-{neutral,joyboost,angerboost}.json` in this directory).
+
+**Determinism:** the pipeline is bit-deterministic on a fixed WAV — the iteration-6 no-op
+config reproduced the Task 7 runs to four decimals in every group, and the final baked-image
+captures reproduced iteration 7 exactly. Differences in the sweep table are therefore real
+config effects, not run noise, and the reported margins are trustworthy.
+
+## Sweep table
+
+All unlisted knobs at shipped defaults (`A2E_EMOTION_STRENGTH=0.6`, `A2E_EMOTION_CONTRAST=1.0`,
+`A2E_PREFERRED_STRENGTH=0.5`, `A2E_LIVE_BLEND_COEF=0.7`). "supp" = eyes-expressive group
+ratio under joyboost vs same-config neutral (soft-goal suppression indicator).
+
+| it | config (overrides) | (a) brows Δ / eyes ratio / mouth ratio | (b) brows / mouth | (c) BDL-joy / anger-brow-vs-0.0566 | (d) jaw joy / anger | supp | verdict |
+|---|---|---|---|---|---|---|---|
+| — | untuned (Task 7 ref) | +0.0153 / 30.49× / 0.958 | 1.339 / 1.368 | 0.1143 / — (ref) | 1.091 / 1.229 | 0.217 | a ✗, b ✓, c ✓, d ✓ |
+| 1 | `STRENGTH=0.8` | **+0.0219** / 46.86× / 0.952 | 1.562 / 1.500 | **0.1590 ✗** / 157% | 1.136 / **1.368 ✗** | 0.518 | a ✓, b ✓, c ✗, d ✗ |
+| 2 | `STRENGTH=0.8 PREFERRED=0.3` | +0.0219 / 46.86× / 0.952 | **0.817 ✗** / 1.277 | 0.0774 / 133% | 1.064 / **1.259 ✗** | 0.356 | a ✓, b ✗, c ✓, d ✗ |
+| 3 | `STRENGTH=0.8 MAX_EMOTIONS=10` | — no data: **helper hangs** (see finding 1) | — | — | — | — | aborted |
+| 4 | `CONTRAST=1.5` | +0.0132 ✗ / 29.20× / 0.945 | 1.453 / 1.382 | 0.1163 / 100% | 1.084 / 1.222 | 0.245 | a ✗, b ✓, c ✓, d ✓ |
+| 5 | `A2F_UPPER_FACE_STRENGTH=1.2` | **+0.0310** / 21.17× / 0.954 | **1.044 ✗** / 1.375 | 0.1299 / 142% | 1.092 / 1.228 | 0.539 | a ✓, b ✗, c ✓, d ✓ |
+| 6 | `A2F_BS_MULTIPLIERS` (ARKit-case names) | no-op — byte-identical to untuned | | | | | wasted (finding 5) |
+| 7 | `A2F_BS_MULTIPLIERS=browInnerUp=1.35,browDownLeft=1.25,browDownRight=1.25` | **+0.0225** / 30.49× / 0.958 | **1.383 / 1.368** | **0.1428** / 134% | 1.091 / 1.229 | 0.217 | **a ✓, b ✓, c ✓, d ✓ — WINNER** |
+
+## Findings that reshaped the search
+
+1. **`A2E_MAX_EMOTIONS` is a trap — and Task 7's truncation hypothesis is wrong.** The A2E
+   network classifies only **six** emotions (`angry, disgust, fear, happy, neutral, sad` —
+   `/opt/a2f/a2e/network_info.json`), so the model default `max_emotions=6` already truncates
+   **nothing**. Worse, any value **> 6 hangs the helper**: the SDK CUDA post-process kernel
+   computes `emotionsToZero = inputEmotionsSize - maxEmotions` in unsigned arithmetic
+   (`multitrack_postprocess_cuda.cu`), which underflows to ~2^64 and spins the GPU forever —
+   verified live (5 consecutive first-frame timeouts at `MAX_EMOTIONS=10`, in-container
+   bisect: 6 → first frame in 0.2 s; 8/9/10 → no frame in 90–170 s). The hard-zeroing of
+   non-tag dims under boost (BrowInnerUp 0.1026 → 0.0000) is therefore NOT truncation — it is
+   the geometry model's nonlinear response to the lerped emotion vector (a joy-dominant
+   vector simply produces zero brow-raise), unreachable by these knobs.
+2. **Strength scales the boost too.** SDK pipeline order: softmax(contrast·logits) over 6
+   dims → nullify `neutral` → keep-N (no-op) → map to the 10-dim a2f space → EMA blend →
+   preferred-emotion lerp → transition smoothing → **× strength**. So `STRENGTH=0.8` fixes
+   (a) but drags the joy/anger boosts past the (c)/(d) rails; interpolating iterations 1–2,
+   (b) needs `PREFERRED ≳ 0.40` while (d) needs `< 0.30` at s=0.8 — provably unsatisfiable.
+3. **Contrast backfires on this utterance.** The 6-way softmax argmax is `neutral`, which is
+   nullified *after* the softmax — sharpening (contrast 1.5) shrinks all mapped dims
+   (neutral brows 0.0341 → 0.0320) instead of amplifying the sadness signal.
+4. **Upper-face strength makes (a) and (b) fight.** It amplifies neutral `BrowInnerUp`
+   ~5× more than the joy-boost's `BrowDown*` (0.1026→0.1796 vs 0.1143→0.1299 at 1.2), so the
+   joy ratio's denominator grows faster than its numerator: (a) passes, (b) brows collapses
+   to 1.044. Both criteria are served by the same 5-key brows group.
+5. **`A2F_BS_MULTIPLIERS` pose names are the solver's camelCase names** (`browInnerUp`, per
+   `bs_skin.npz poseNames`), NOT the ARKit CamelCase the service emits; wrong names warn
+   (`unknown pose 'BrowInnerUp' — skipped`) and silently no-op (iteration 6).
+
+## Winner — per-pose brow gains, A2E knobs untouched
+
+`A2F_BS_MULTIPLIERS=browInnerUp=1.35,browDownLeft=1.25,browDownRight=1.25` with every A2E
+knob at the shipped defaults. The multipliers act exactly linearly on the solver output
+(BrowInnerUp 0.1026 → 0.1385 = ×1.35; BrowDownLeft 0.1143 → 0.1428 = ×1.25), which decouples
+the two sides of the brows group: `browInnerUp` (A2E-driven, neutral run) buys (a) without
+touching the joy run (where it is zeroed anyway), and `browDown*` (tag-driven, joy run) buys
+(b)'s numerator without touching the neutral run (where it is 0.0000). Jaw and eyes are
+untouched, preserving (d) and (a)-eyes exactly.
+
+| criterion | rule | winner value | margin | verdict |
+|---|---|---|---|---|
+| (a) | ≥2 of 3 groups at ≥+0.02 abs or ≥3× | brows **+0.0225** (2.20×); eyes-expressive **30.49×**; mouth-form 0.958× | +0.0025 abs | **PASS** (2/3) |
+| (b) | brows & mouth-form ≥ +20% | brows **+38.3%**, mouth-form **+36.8%** | +18.3 / +16.8 pp | **PASS** |
+| (c) | BDL-joy < 0.15 AND anger brow > 50% of untuned | **0.1428**; anger brows 0.0758 = **134%** of 0.0566 (BrowInnerUp 0.3417 vs 0.2531) | 0.0072; +84 pp | **PASS** |
+| (d) | jaw within ±25% of own neutral | joy **+9.1%**, anger **+22.9%** | 15.9 / 2.1 pp | **PASS** |
+
+**Soft goal NOT met (documented):** eyes-expressive under joyboost is 0.2166× of neutral —
+identical to untuned, since the winner leaves the emotion pipeline alone. The only configs
+that reached ≥ 0.5× (it 1: 0.518; it 5: 0.539) failed hard criteria, and finding 1 shows the
+suppression is a lerp + geometry-nonlinearity property, not reachable by the available knobs.
+"All else equal" never held; hard criteria won.
+
+## Bake + confirming captures on the shipped image
+
+The winner is baked as an `ENV A2F_BS_MULTIPLIERS=…` line in
+`infra/desktop/a2f/deploy/Dockerfile` (commit `6c7765b`, which also corrects the
+`A2E_MAX_EMOTIONS` comment per finding 1). Rebuilt on the Desktop from the pulled repo
+(`build_image.sh` via `systemd-run`, image id `5f5fcdda6b2a`), container recreated with **no
+`-e` overrides** (`--restart always`, env verified baked in the running container).
+
+Confirming captures — `confirm-baked-{neutral,joyboost,angerboost}.json` — are
+**byte-identical in every group statistic to iteration 7** (determinism holds through the
+rebuild): (a) brows +0.0225 / eyes 30.49× ✓, (b) 1.3827 / 1.3682 ✓, (c) 0.1428 with anger
+`BrowInnerUp` 0.3417 ✓, (d) 1.0910 / 1.2290 ✓. **All four criteria PASS on the production
+image.** #39 anomaly re-check: `BrowDownLeft` under joy-boost = 0.1428 < 0.15 target — the
+multiplier eats about half the pre-tuning headroom (0.1143 → 0.1428); flagged for any future
+`PREFERRED_STRENGTH` increase, which multiplies on top of the baked ×1.25.
