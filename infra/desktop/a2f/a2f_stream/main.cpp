@@ -29,9 +29,13 @@
 // shared audio accumulator, interleaved with the geometry passes (geometry runs
 // first; emotion inference runs only when geometry is blocked on it — the SDK's
 // low-latency ordering), and fills the shared emotion accumulator with
-// timestamped post-processed emotion frames; the stdin emotion tag is routed
-// into the SDK preferred-emotion channel as a boost, enabled only when the tag
-// is non-zero. With A2E_ENABLED=0 the tag is written straight into the emotion
+// timestamped post-processed emotion frames. The emotion accumulator is
+// PRE-SEEDED with the stdin tag at t=0 (left open) so geometry emission starts
+// with the first audio chunks instead of stalling ~1.9 s until A2E's first
+// window is computable; A2E's frames then land behind the seed and take over
+// the timeline. The stdin emotion tag is also routed into the SDK
+// preferred-emotion channel as a boost, enabled only when the tag is
+// non-zero. With A2E_ENABLED=0 the tag is written straight into the emotion
 // accumulator at t=0 and the accumulator is closed up-front (previous behavior;
 // the A2E model file is then not required). The stdin/stdout protocol is
 // byte-identical in both modes.
@@ -187,11 +191,18 @@ bool onResults(void* ud, const nva2f::IBlendshapeExecutor::DeviceResults& r) {
 
 // Per-frame A2E post-processed emotion → the shared emotion accumulator the
 // geometry executor reads (userdata). Emotions stay on-device; timestamps come
-// from the A2E frame windows, in ascending order as Accumulate requires. The
-// manual callback (rather than nva2e::CreateEmotionBinder) keeps the wiring
-// explicit and identical to the previous interactive-executor build.
+// from the A2E frame windows, in ascending order. Accumulate requires STRICTLY
+// increasing timestamps, and the accumulator is pre-seeded with the tag frame
+// at t=0 each utterance while A2E's very first frame is ALSO at t=0 (the
+// classifier window has startOffset = -bufferLength/2, targetOffset =
+// +bufferLength/2, so execution 0's first frame target is 0) — skip any frame
+// that does not advance the frontier instead of failing the whole Execute.
+// Only that one t=0 frame ever qualifies: A2E emission timestamps strictly
+// increase from there. The manual callback (rather than
+// nva2e::CreateEmotionBinder) keeps the wiring explicit.
 bool onEmotions(void* ud, const nva2e::IEmotionExecutor::Results& r) {
   auto* acc = static_cast<nva2x::IEmotionAccumulator*>(ud);
+  if (r.timeStampCurrentFrame <= acc->LastAccumulatedTimestamp()) return true;  // seed collision — skip
   return !acc->Accumulate(r.timeStampCurrentFrame, r.emotions, r.cudaStream);
 }
 
@@ -411,6 +422,20 @@ int main() {
       if (nva2e::SetExecutorPostProcessParameters(*a2eExec, 0, post)) {
         std::cerr << "a2f_stream: set a2e post-process params failed\n";
       }
+      // PRE-SEED: the tag vector at t=0 (the zero vector for a neutral tag — a
+      // valid flat emotion), accumulator left OPEN. While the accumulator is
+      // open, geometry frame availability is capped by the last accumulated
+      // emotion timestamp and is ZERO while it is empty — without the seed no
+      // frame can be emitted until A2E's first execution, which needs
+      // bufferLength/2 = 30000 samples (~1.9 s) of audio (measured ~2.1 s to
+      // first frame). With the seed, the first frame waits only on the
+      // geometry's own ~0.5 s audio lookahead; A2E's frames land BEHIND the
+      // seed (from ~t=533 on — its colliding t=0 frame is skipped in
+      // onEmotions) and take over the emotion timeline from there. The seed
+      // also guarantees emoAcc is never empty, so the close-time Close()
+      // cannot fail and an A2E-less utterance degrades to constant tag
+      // emotion — the seed IS the tag fallback now.
+      emoAcc->Accumulate(0, tagView, stream);
       // emoAcc stays OPEN — the A2E results callback fills it incrementally as
       // audio streams in; it is closed once the audio is closed and A2E drained.
     } else {
@@ -424,7 +449,7 @@ int main() {
 
     // Once an Execute returns an error, retrying every chunk would spin/log
     // forever, so the rest of the utterance degrades: a2eBroken ⇒ A2E treated
-    // as drained (the close-time tag fallback still guarantees emotion data);
+    // as drained (the t=0 tag pre-seed still guarantees emotion data);
     // computeBroken ⇒ no more frames for this utterance (the done marker is
     // still emitted). These flags catch EXECUTE-level errors only — a failed
     // device-to-host copy inside onResults returns false to the executor,
@@ -460,11 +485,11 @@ int main() {
         }
         if (audioAcc->IsClosed() && !emoAcc->IsClosed()) {
           // Audio is complete and A2E has no executions left ⇒ emotions are
-          // complete. Under streaming, "A2E produced nothing" is only knowable
-          // here — degrade to the tag at t=0 (previous tag-only behavior)
-          // rather than closing an empty accumulator, which would starve the
-          // geometry executor into emitting no frames at all.
-          if (emoAcc->IsEmpty()) emoAcc->Accumulate(0, tagView, stream);
+          // complete. The per-utterance t=0 pre-seed guarantees the
+          // accumulator is never empty here (Close on an empty accumulator
+          // errors) and doubles as the tag-only fallback when A2E produced
+          // nothing (short/broken utterance): once closed, geometry is no
+          // longer emotion-frontier-limited and emits every remaining frame.
           emoAcc->Close();
           continue;  // closing may unblock the geometry tail
         }
