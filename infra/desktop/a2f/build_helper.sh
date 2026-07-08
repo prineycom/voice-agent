@@ -2,6 +2,10 @@
 # Compile the a2f_stream helper against the built libaudio2x + SDK headers.
 # Run inside the TRT toolchain container (nvcr.io/nvidia/tensorrt:25.08-py3) with
 # the SDK checkout mounted. Requires ./build.sh to have produced libaudio2x.so.
+#
+# Unit tests for the SDK-independent env parsing (env_knobs.h) run anywhere:
+#   g++ -std=c++17 -o /tmp/test_env_knobs a2f_stream/test_env_knobs.cpp && /tmp/test_env_knobs
+# (Not part of this build — the helper build stays SDK-only.)
 set -euo pipefail
 SDK=${SDK:-/root/a2f-sdk/Audio2Face-3D-SDK}
 SRC=${SRC:-$(dirname "$0")/a2f_stream/main.cpp}

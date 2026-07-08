@@ -40,6 +40,8 @@
 //
 // Build: ../build_helper.sh (inside nvcr.io/nvidia/tensorrt:25.08-py3).
 
+#include "env_knobs.h"
+
 #include "audio2emotion/audio2emotion.h"
 #include "audio2face/audio2face.h"
 #include "audio2face/executor.h"
@@ -86,69 +88,8 @@ bool a2eEnabled() {
   return !(p && std::strcmp(p, "0") == 0);
 }
 
-// Env knob helpers. Unset or unparseable envs return the given default, so
-// every knob falls back to its SDK/model-config baseline — a bad value warns
-// and degrades, it never aborts the helper.
-float envFloat(const char* name, float def) {
-  const char* p = std::getenv(name);
-  if (!p || !*p) return def;
-  char* end = nullptr;
-  const float v = std::strtof(p, &end);
-  if (end == p || *end != '\0') {
-    std::cerr << "a2f_stream: env " << name << "='" << p << "' is not a float — using " << def << "\n";
-    return def;
-  }
-  return v;
-}
-long envInt(const char* name, long def) {
-  const char* p = std::getenv(name);
-  if (!p || !*p) return def;
-  char* end = nullptr;
-  const long v = std::strtol(p, &end, 10);
-  if (end == p || *end != '\0') {
-    std::cerr << "a2f_stream: env " << name << "='" << p << "' is not an integer — using " << def << "\n";
-    return def;
-  }
-  return v;
-}
-
-// Parses a "Name=1.5,Other=0.25" CSV env into name→value pairs. Malformed
-// entries (no '=', empty name, non-float value) are warned and skipped; blank
-// entries are ignored. Unset env ⇒ empty result.
-std::vector<std::pair<std::string, float>> envCsvMap(const char* name) {
-  std::vector<std::pair<std::string, float>> out;
-  const char* p = std::getenv(name);
-  if (!p) return out;
-  const std::string csv(p);
-  for (std::size_t pos = 0; pos <= csv.size();) {
-    std::size_t comma = csv.find(',', pos);
-    if (comma == std::string::npos) comma = csv.size();
-    std::string entry = csv.substr(pos, comma - pos);
-    pos = comma + 1;
-    const auto first = entry.find_first_not_of(" \t");
-    if (first == std::string::npos) continue;  // blank entry (incl. trailing comma)
-    entry = entry.substr(first, entry.find_last_not_of(" \t") - first + 1);
-    const std::size_t eq = entry.find('=');
-    std::string key = (eq == std::string::npos) ? std::string() : entry.substr(0, eq);
-    const auto keyEnd = key.find_last_not_of(" \t");
-    key = (keyEnd == std::string::npos) ? std::string() : key.substr(0, keyEnd + 1);
-    if (key.empty()) {
-      std::cerr << "a2f_stream: env " << name << ": bad entry '" << entry
-                << "' (want Name=value) — skipped\n";
-      continue;
-    }
-    const std::string val = entry.substr(eq + 1);
-    char* end = nullptr;
-    const float v = std::strtof(val.c_str(), &end);
-    while (end && (*end == ' ' || *end == '\t')) ++end;
-    if (end == val.c_str() || *end != '\0') {
-      std::cerr << "a2f_stream: env " << name << ": bad value in '" << entry << "' — skipped\n";
-      continue;
-    }
-    out.emplace_back(std::move(key), v);
-  }
-  return out;
-}
+// envFloat / envInt / envCsvMap live in env_knobs.h (SDK-independent,
+// unit-tested by test_env_knobs.cpp); only SDK-typed helpers stay here.
 
 // Applies an A2F_BS_MULTIPLIERS / A2F_BS_OFFSETS CSV into the SKIN solver's
 // creation-time config. Creation-time is the only route: the per-pose runtime
@@ -240,6 +181,15 @@ bool onEmotions(void* ud, const nva2e::IEmotionExecutor::Results& r) {
 }  // namespace
 
 int main() {
+  // Fail fast on a missing/unreadable A2E model: the ReadClassifierModelInfo
+  // check below only fires AFTER the full A2F engine load — seconds of GPU
+  // work wasted per respawn cycle when the path is wrong.
+  if (a2eEnabled()) {
+    std::FILE* f = std::fopen(a2eModelJson(), "rb");
+    if (!f) { std::cerr << "failed to read a2e model info: " << a2eModelJson() << "\n"; return 2; }
+    std::fclose(f);
+  }
+
   if (nva2x::SetCudaDeviceIfNeeded(0)) { std::cerr << "cuda init failed\n"; return 1; }
 
   // ---- one-time setup: load the bs1 engine ONCE, build persistent executors ----
@@ -383,11 +333,19 @@ int main() {
     pp.liveBlendCoef = envFloat("A2E_LIVE_BLEND_COEF", pp.liveBlendCoef);
     pp.liveTransitionTime = envFloat("A2E_LIVE_TRANSITION_TIME", pp.liveTransitionTime);
     pp.preferredEmotionStrength = envFloat("A2E_PREFERRED_STRENGTH", pp.preferredEmotionStrength);
-    const long maxEmotions = envInt("A2E_MAX_EMOTIONS", static_cast<long>(pp.maxEmotions));
-    if (maxEmotions >= 0) {
-      pp.maxEmotions = static_cast<std::size_t>(maxEmotions);
-    } else {
+    // The model-config maxEmotions IS the network's emotion class count; any
+    // env value above it makes the SDK's CUDA post-process kernel spin forever
+    // (unsigned underflow in its keep-N loop, verified live) — so bound the
+    // override by the pre-override config value, not a hardcoded count.
+    const long configMaxEmotions = static_cast<long>(pp.maxEmotions);
+    const long maxEmotions = envInt("A2E_MAX_EMOTIONS", configMaxEmotions);
+    if (maxEmotions < 0) {
       std::cerr << "a2f_stream: A2E_MAX_EMOTIONS must be >= 0 — keeping " << pp.maxEmotions << "\n";
+    } else if (maxEmotions > configMaxEmotions) {
+      std::cerr << "a2f_stream: A2E_MAX_EMOTIONS must be <= the model's emotion class count ("
+                << configMaxEmotions << ") — keeping " << pp.maxEmotions << "\n";
+    } else {
+      pp.maxEmotions = static_cast<std::size_t>(maxEmotions);
     }
     a2ePostParams = a2eModelParams.postProcessParams;  // env-adjusted baseline for per-utterance toggling
 

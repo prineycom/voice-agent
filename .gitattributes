@@ -1,0 +1,6 @@
+# Files executed in Linux contexts (Pi, WSL2, Docker) must stay LF even on
+# Windows checkouts with core.autocrlf=true.
+*.sh text eol=lf
+*.py text eol=lf
+*.service text eol=lf
+Dockerfile text eol=lf

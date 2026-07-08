@@ -23,9 +23,10 @@ The baked helper loads the A2F + A2E TRT engines lazily on the first utterance �
 **~1.65 GiB VRAM total** (A2E ≈ 1.25 GiB of it); `A2F_HELPER_FIRST_TIMEOUT=60` and the
 tuned `A2F_BS_MULTIPLIERS` brow gains are baked in the Dockerfile.
 
-CRLF gotcha: if the repo checkout came through Windows, the shell scripts fail with
-`pipefail: invalid option` — strip CR after pulling (`sed -i 's/\r$//' *.sh ../*.sh`)
-and restore afterwards with `git checkout -- .`.
+CRLF gotcha: Windows checkouts used to smudge the shell scripts to CRLF
+(`pipefail: invalid option` in WSL). The root fix is the repo-root `.gitattributes`
+(forces LF for `*.sh`, `Dockerfile`, etc.); an already-smudged Desktop checkout needs
+a one-time `git rm --cached -r . && git reset --hard` after pulling it.
 
 ## Install / update the service (elevated PowerShell on the Desktop)
 

@@ -44,6 +44,10 @@ Build: `../build_helper.sh` (g++ against `libaudio2x.so`, run in the TRT contain
   position stale, so utterance 2 yielded 0 frames).
 - A failed/empty A2E pass degrades that utterance to tag-only (the emotion accumulator
   must not stay empty or the geometry pass emits no frames).
+- The shared emotion accumulator holds 1800 frames — at the A2E ~30 emotion-frames/s
+  rate that caps A2E coverage at **~60 s of audio per utterance**; longer utterances
+  degrade gracefully (the A2E pass keeps only the emotion frames that fit — blendshape
+  frames are still emitted for the whole utterance).
 - **Rollback:** `A2E_ENABLED=0` — no A2E executor is created, the A2E model file is not
   required, and the tag is written straight into the emotion accumulator at t=0 (the
   pre-#40 tag-only behavior). The stdin/stdout protocol is byte-identical in both modes.
@@ -61,7 +65,7 @@ never abort the helper. Production defaults are baked in `../deploy/Dockerfile`.
 | `A2E_EMOTION_STRENGTH` | Final scale on the post-processed emotion vector — note it scales the tag boost too (SDK order: softmax → nullify neutral → keep-N → map to 10-dim → EMA blend → preferred lerp → smoothing → × strength). |
 | `A2E_EMOTION_CONTRAST` | Softmax sharpening of the 6-class logits; applied *before* `neutral` is nullified, so sharpening a neutral-argmax utterance shrinks the mapped dims. |
 | `A2E_LIVE_BLEND_COEF` / `A2E_LIVE_TRANSITION_TIME` | EMA blend / transition smoothing across emotion frames. |
-| `A2E_MAX_EMOTIONS` | "Keep N largest" truncation. **Trap:** the network classifies only 6 emotions, so the model default (6) already truncates nothing; any value **> 6 hangs the helper** (unsigned underflow in the SDK CUDA post-process kernel spins the GPU forever) and **0 zeroes the output**. Leave unset. |
+| `A2E_MAX_EMOTIONS` | "Keep N largest" truncation. **Trap:** the network classifies only 6 emotions, so the model default (6) already truncates nothing; any value **> 6 would hang the helper** (unsigned underflow in the SDK CUDA post-process kernel spins the GPU forever) — the helper now rejects values above the model's class count (warns, keeps the config default) — and **0 zeroes the output**. Leave unset. |
 | `A2E_PREFERRED_STRENGTH` | Lerp weight of the preferred-emotion (tag) boost. Note the boost lerp suppresses non-tag A2E dims (a known, mechanistic property — see `docs/research/data/40-a2f-emotion-supply/analysis.md`). |
 | `A2F_SKIN_STRENGTH` / `A2F_UPPER_FACE_STRENGTH` / `A2F_LOWER_FACE_STRENGTH` / `A2F_BLINK_STRENGTH` | Face-animator strengths, applied to the skin params at executor creation. |
 | `A2F_BS_MULTIPLIERS` / `A2F_BS_OFFSETS` | Per-pose weight shaping CSVs, e.g. `browInnerUp=1.35,browDownLeft=1.25`. Pose names are the **solver's camelCase** names (`bs_skin.npz poseNames`), NOT the ARKit CamelCase the service emits — unknown names warn and no-op. Applied to the skin solver's creation-time config (the runtime setters are unreachable through the interactive executor). |
