@@ -38,9 +38,14 @@ ENV LD_LIBRARY_PATH=/opt/a2f/lib:/usr/local/cuda/lib64 \
 # The A2E_* knobs below match the model-config values, spelled out so the tuning
 # pass can override them at `docker run` without rebuilding.
 # Other helper knobs (unset = model default, override at run time if needed):
-#   A2E_MAX_EMOTIONS (model default 6; "keep N largest" — 0 zeroes ALL output),
+#   A2E_MAX_EMOTIONS — the A2E network classifies only SIX emotions
+#     (angry/disgust/fear/happy/neutral/sad), so the model default 6 already
+#     means "no truncation". NEVER set >6: the SDK's CUDA post-process kernel
+#     computes `emotionsToZero = 6 - maxEmotions` UNSIGNED, underflows, and
+#     spins forever (helper produces no frames — verified live, #40 Task 8);
+#     0 zeroes ALL output.
 #   A2F_SKIN_STRENGTH, A2F_UPPER_FACE_STRENGTH, A2F_LOWER_FACE_STRENGTH,
-#   A2F_BLINK_STRENGTH, A2F_BS_MULTIPLIERS, A2F_BS_OFFSETS
+#   A2F_BLINK_STRENGTH, A2F_BS_OFFSETS
 ENV A2E_MODEL_JSON=/opt/a2f/a2e/model.json \
     A2E_ENABLED=1 \
     A2F_HELPER_FIRST_TIMEOUT=60 \
@@ -49,6 +54,15 @@ ENV A2E_MODEL_JSON=/opt/a2f/a2e/model.json \
     A2E_LIVE_BLEND_COEF=0.7 \
     A2E_LIVE_TRANSITION_TIME=0.5 \
     A2E_PREFERRED_STRENGTH=0.5
+
+# --- Tuned emotion expressiveness (#40 Task 8) ---------------------------------
+# Winning config of the bounded tuning pass (docs/research/data/
+# 40-a2f-emotion-supply/analysis.md, "Tuning" section): all A2E knobs stay at
+# the defaults above; per-pose brow gains lift the A2E baseline over the old
+# zeros production (criterion a) while keeping the joy/anger boost criteria
+# (b)-(d) green. Pose names are the SOLVER's camelCase names (bs_skin.npz),
+# NOT the ARKit CamelCase the service emits — wrong names warn + no-op.
+ENV A2F_BS_MULTIPLIERS="browInnerUp=1.35,browDownLeft=1.25,browDownRight=1.25"
 
 EXPOSE 8003
 CMD ["python3", "/app/server.py"]
