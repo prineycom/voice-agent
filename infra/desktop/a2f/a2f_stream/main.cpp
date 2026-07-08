@@ -176,7 +176,10 @@ void writeFrame(const float* data, std::uint32_t n) {
 // per-utterance loop stops calling Execute (the abort guarantee relies on this).
 bool onResults(void* ud, const nva2f::IBlendshapeExecutor::DeviceResults& r) {
   auto* host = static_cast<nva2x::IHostTensorFloat*>(ud);
-  if (nva2x::CopyDeviceToHost(host->View(0, host->Size()), r.weights, r.cudaStream)) return false;
+  if (nva2x::CopyDeviceToHost(host->View(0, host->Size()), r.weights, r.cudaStream)) {
+    std::cerr << "a2f_stream: device-to-host weight copy failed — frame dropped\n";
+    return false;
+  }
   cudaStreamSynchronize(r.cudaStream);
   writeFrame(host->Data(), static_cast<std::uint32_t>(host->Size()));
   return true;
@@ -380,7 +383,19 @@ int main() {
     std::vector<float> emotion = readFloats(emoLen);
     emotion.resize(emotionSize, 0.0f);
     const nva2x::HostTensorFloatConstView tagView{emotion.data(), emotion.size()};
+
+    // Fresh accumulators for this utterance (Reset re-opens them), then rewind
+    // the executors' consumer state (read positions, caches, HasExecutionStarted)
+    // to sample 0 — the streaming-family equivalent of the old Invalidate() but
+    // usable BEFORE the audio is complete. Also cleans up after an abort. The
+    // executor resets MUST precede the per-utterance post-process param set
+    // below: the SDK rejects SetExecutorPostProcessParameters once execution
+    // has started on the track, and only Reset clears that state.
     emoAcc->Reset();
+    audioAcc->Reset();
+    if (bsExec->Reset(0)) { std::cerr << "a2f_stream: blendshape executor reset failed\n"; }
+    if (a2eExec && a2eExec->Reset(0)) { std::cerr << "a2f_stream: a2e executor reset failed\n"; }
+
     if (a2eExec) {
       // Tag → preferred-emotion channel. The executor requires a provided
       // preferred accumulator to be CLOSED before computing, so it is filled
@@ -407,18 +422,13 @@ int main() {
       emoAcc->Close();
     }
 
-    // Fresh audio stream for this utterance (Reset re-opens the accumulator),
-    // then rewind the executors' consumer state (read positions, caches) to
-    // sample 0 — the streaming-family equivalent of the old Invalidate() but
-    // usable BEFORE the audio is complete. Also cleans up after an abort.
-    audioAcc->Reset();
-    if (bsExec->Reset(0)) { std::cerr << "a2f_stream: blendshape executor reset failed\n"; }
-    if (a2eExec && a2eExec->Reset(0)) { std::cerr << "a2f_stream: a2e executor reset failed\n"; }
-
-    // Once an Execute fails, retrying every chunk would spin/log forever, so the
-    // rest of the utterance degrades: a2eBroken ⇒ A2E treated as drained (the
-    // close-time tag fallback still guarantees emotion data); computeBroken ⇒ no
-    // more frames for this utterance (the done marker is still emitted).
+    // Once an Execute returns an error, retrying every chunk would spin/log
+    // forever, so the rest of the utterance degrades: a2eBroken ⇒ A2E treated
+    // as drained (the close-time tag fallback still guarantees emotion data);
+    // computeBroken ⇒ no more frames for this utterance (the done marker is
+    // still emitted). These flags catch EXECUTE-level errors only — a failed
+    // device-to-host copy inside onResults returns false to the executor,
+    // which just skips that frame's emission (stderr-logged there).
     bool a2eBroken = false;
     bool computeBroken = false;
 
@@ -474,9 +484,12 @@ int main() {
         emoAcc->DropEmotionsBefore(std::min(timestampToRead, lastAccumulated));
       }
       const std::size_t sampleGeometry = bsExec->GetNextAudioSampleToRead(0);
+      // A broken A2E no longer reads audio — letting its stalled cursor
+      // constrain the drop would freeze memory trimming for the utterance.
       const std::size_t sample =
-          a2eExec ? std::min(sampleGeometry, a2eExec->GetNextAudioSampleToRead(0))
-                  : sampleGeometry;
+          (a2eExec && !a2eBroken)
+              ? std::min(sampleGeometry, a2eExec->GetNextAudioSampleToRead(0))
+              : sampleGeometry;
       audioAcc->DropSamplesBefore(sample);
     };
 
