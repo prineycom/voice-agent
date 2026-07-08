@@ -450,3 +450,70 @@ rebuild): (a) brows +0.0225 / eyes 30.49× ✓, (b) 1.3827 / 1.3682 ✓, (c) 0.1
 image.** #39 anomaly re-check: `BrowDownLeft` under joy-boost = 0.1428 < 0.15 target — the
 multiplier eats about half the pre-tuning headroom (0.1143 → 0.1428); flagged for any future
 `PREFERRED_STRENGTH` increase, which multiplies on top of the baked ×1.25.
+
+## Ops verification (Task 9)
+
+Date: **2026-07-08**. Operational envelope of the final production image: `voice-agent-a2f:latest`,
+id **`5f5fcdda6b2a`** (built from commit `6c7765b`), running container `a22c5e6f4ce4`,
+`--restart always`, WSL2 Docker on the Desktop, :8003. Measured over SSH from the Pi (probe via
+tunnel Pi:18003 → Desktop WSL2:8003), STT (:8001) + TTS (:8002) NSSM services resident and
+untouched throughout. Utterance: the same fixed 7.360 s WAV as all other captures here.
+
+### VRAM
+
+Per-process attribution is unavailable on this host (`nvidia-smi --query-compute-apps` reports
+`[N/A]` under Windows WDDM and `[Not Found]/[N/A]` inside WSL), so the method is the spike doc's
+**delta of total `memory.used`** (WSL `nvidia-smi`), with the a2f container the only thing
+exercising the GPU between readings.
+
+| point | state | total used (of 12282 MiB) | delta |
+|---|---|---|---|
+| (i) | container just restarted, before any utterance (`docker restart`, health ok) | 2022 MiB | — |
+| (ii) | after the first utterance (helper spawned, A2F + A2E TRT engines loaded) | 3709 MiB | **+1687 MiB** |
+| (iii) | after 5 more utterances (3 steady-state + in-container kill/respawn + 1 confirm) | 3709 MiB | +0 (no growth/leak) |
+
+- **Full helper GPU footprint (A2F + A2E + CUDA context): Δ 1687 MiB ≈ 1.65 GiB.**
+- **A2E-attributable delta:** 1687 − 403 (pre-#40 helper figure, ADR-0015) ≈ **1284 MiB ≈ 1.25 GiB**
+  — matching the 1.27 GB A2E TRT engine file almost exactly.
+- **vs budget:** the new helper total (~1.65 GiB) is ~3.3× the pre-#40 "~0.4–0.5 GB order"
+  figure quoted in ADR-0015 / the spike doc — this is the price of A2E and is the new number of
+  record. Headroom stays comfortable: 3709/12282 = 30% at capture; even projecting the spike-era
+  fully-loaded STT+TTS baseline (5513 MiB), total ≈ 5513 + 1687 = **7200 MiB ≈ 59%** of 12 GB.
+- The (i) baseline (2022 MiB) is lower than the spike-era 5513 MiB because the Windows STT/TTS
+  services lazy-load their models; both python.exe processes were present. The delta method is
+  unaffected — nothing else touched the GPU between readings.
+
+### Latency
+
+Wall-clock from the Pi (`time`, probe over the tunnel; the probe streams PCM without realtime
+pacing, so wall time = transport + helper compute, no audio-duration floor):
+
+| measurement | value | budget | verdict |
+|---|---|---|---|
+| First utterance after container restart (helper spawn + A2F + A2E engine load + full 7.36 s utterance) | **7.28 s** end-to-end | 60 s (`A2F_HELPER_FIRST_TIMEOUT`, baked) | PASS (12% of budget) |
+| Steady-state, end-to-end (3 consecutive runs, incl. ~0.5 s python startup + health GET) | **2.01 / 1.60 / 1.63 s** | — | — |
+| Steady-state, WS capture only (connect → all 221 frames; transport + helper compute) | **1.70 / 1.32 / 1.49 s** | 5 s (`A2F_HELPER_TIMEOUT`, in-flight, helper-side) | PASS |
+
+The 5 s per-utterance timeout wraps only the server-side helper I/O (`engine.py
+_utterance_io`), a strict subset of the capture time — so helper compute is **< 1.7 s** for a
+7.36 s utterance (≥ 4.3× realtime), comfortably under the plan's 2.5 s helper-side bar. **No
+`A2F_HELPER_TIMEOUT` change needed; the Dockerfile is untouched by this task.** Honest caveat:
+per-utterance compute is not logged service-side, so the 1.32–1.70 s figures include tunnel
+transport (~0.35 MB PCM up, ~1 MB frames down) and are an upper bound on helper compute.
+
+### Supervision
+
+| check | result |
+|---|---|
+| `docker restart voice-agent-a2f` → health | PASS — `{"status":"ok",…}` at the first poll, ≤ 8 s after the restart command (incl. SSH overhead) |
+| `RestartPolicy` | PASS — `always` (`docker inspect`) |
+| Boot Scheduled Task | PASS — `schtasks /query /tn voice-agent-a2f-boot` → `Ready` |
+| In-container helper kill (`docker exec … pkill -f a2f_stream`) | PASS — next probe run succeeded **transparently** (no failed or degraded run): engine.py detected the dead child and respawned via the first-timeout path, 7.42 s (≈ cold figure); the run after that was back to steady 2.08 s; VRAM returned to 3709 MiB (no leak); `RestartCount` stayed 0 — recovery is engine.py's crash→respawn, Docker never intervened |
+
+Kill-test caveat: the helper was killed while **idle**. Per engine.py, a mid-utterance crash
+would instead fail that one utterance (WS error to the client) and respawn on the next call —
+the tested path confirms the respawn machinery; the single-utterance-loss path is by design.
+
+Note: the health endpoint's `model_loaded` is hardcoded `false` for the helper backend
+(server.py:73, "reports real load once wired") — it is NOT an indicator of engine load; use the
+first-utterance latency signature instead.
