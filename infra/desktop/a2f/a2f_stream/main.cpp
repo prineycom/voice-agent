@@ -30,10 +30,10 @@
 // first; emotion inference runs only when geometry is blocked on it — the SDK's
 // low-latency ordering), and fills the shared emotion accumulator with
 // timestamped post-processed emotion frames. The emotion accumulator is
-// PRE-SEEDED with the stdin tag at t=0 (left open) so geometry emission starts
-// with the first audio chunks instead of stalling ~1.9 s until A2E's first
-// window is computable; A2E's frames then land behind the seed and take over
-// the timeline. The stdin emotion tag is also routed into the SDK
+// BRIDGE-SEEDED with the stdin tag over [0, A2E_BUFFER_LENGTH/2] (left open)
+// so geometry emission flows from the first audio chunks instead of stalling
+// until A2E's first window is computable; A2E's frames take over the timeline
+// past the bridge. The stdin emotion tag is also routed into the SDK
 // preferred-emotion channel as a boost, enabled only when the tag is
 // non-zero. With A2E_ENABLED=0 the tag is written straight into the emotion
 // accumulator at t=0 and the accumulator is closed up-front (previous behavior;
@@ -45,6 +45,9 @@
 //   A2E post-process: A2E_EMOTION_STRENGTH, A2E_EMOTION_CONTRAST,
 //     A2E_LIVE_BLEND_COEF, A2E_LIVE_TRANSITION_TIME, A2E_MAX_EMOTIONS,
 //     A2E_PREFERRED_STRENGTH.
+//   A2E analysis window: A2E_BUFFER_LENGTH (samples @16 kHz; default 16000,
+//     deliberately below the SDK sample's 60000; engine range [5000, 60000]) —
+//     smaller ⇒ earlier + closer-trailing prosody emotion, less context.
 //   A2F face animator: A2F_SKIN_STRENGTH, A2F_UPPER_FACE_STRENGTH,
 //     A2F_LOWER_FACE_STRENGTH, A2F_BLINK_STRENGTH.
 //   Per-pose weight shaping: A2F_BS_MULTIPLIERS / A2F_BS_OFFSETS —
@@ -192,14 +195,15 @@ bool onResults(void* ud, const nva2f::IBlendshapeExecutor::DeviceResults& r) {
 // Per-frame A2E post-processed emotion → the shared emotion accumulator the
 // geometry executor reads (userdata). Emotions stay on-device; timestamps come
 // from the A2E frame windows, in ascending order. Accumulate requires STRICTLY
-// increasing timestamps, and the accumulator is pre-seeded with the tag frame
-// at t=0 each utterance while A2E's very first frame is ALSO at t=0 (the
-// classifier window has startOffset = -bufferLength/2, targetOffset =
-// +bufferLength/2, so execution 0's first frame target is 0) — skip any frame
-// that does not advance the frontier instead of failing the whole Execute.
-// Only that one t=0 frame ever qualifies: A2E emission timestamps strictly
-// increase from there. The manual callback (rather than
-// nva2e::CreateEmotionBinder) keeps the wiring explicit.
+// increasing timestamps, and each utterance BRIDGE-SEEDS the accumulator with
+// tag frames covering [0, bufferLength/2] while A2E's earliest emissions land
+// in that same range (its window is centered: startOffset = -bufferLength/2,
+// targetOffset = +bufferLength/2, so its first frame target is 0) — skip every
+// frame that does not advance the frontier instead of failing the whole
+// Execute. Exactly the emissions overlapping the bridge are dropped, by
+// design; A2E timestamps strictly increase, so everything past the bridge end
+// accumulates. The manual callback (rather than nva2e::CreateEmotionBinder)
+// keeps the wiring explicit.
 bool onEmotions(void* ud, const nva2e::IEmotionExecutor::Results& r) {
   auto* acc = static_cast<nva2x::IEmotionAccumulator*>(ud);
   if (r.timeStampCurrentFrame <= acc->LastAccumulatedTimestamp()) return true;  // seed collision — skip
@@ -322,15 +326,43 @@ int main() {
   UniquePtr<nva2x::IEmotionAccumulator> prefAcc;
   UniquePtr<nva2e::IEmotionExecutor> a2eExec;
   nva2e::PostProcessParams a2ePostParams{};
+  // Last timestamp of the per-utterance tag bridge-seed — the A2E window's
+  // targetOffset (bufferLength/2); set below when A2E is enabled.
+  std::int64_t a2eBridgeEnd = 0;
   if (a2eEnabled()) {
     a2eInfo = ToUniquePtr(nva2e::ReadClassifierModelInfo(a2eModelJson()));
     if (!a2eInfo) { std::cerr << "failed to read a2e model info: " << a2eModelJson() << "\n"; return 2; }
 
-    // Mirror the SDK sample: 60000-sample window, 30 fps emotion output, 30
-    // inferences skipped (one real inference per second, post-processed per frame).
+    // A2E analysis window (A2E_BUFFER_LENGTH samples @16 kHz, default 16000).
+    // The window is CENTERED on each emotion frame (targetOffset =
+    // bufferLength/2), so the first A2E execution needs bufferLength/2 samples
+    // of audio and steady-state emotion trails the audio frontier by up to
+    // ~bufferLength/2. The SDK sample's 60000 put the first prosody emotion
+    // ~1.9 s in (the measured ~2.1 s first-frame gate); 16000 ⇒ 0.5 s,
+    // matching the geometry's own audio lookahead so emotion (almost) never
+    // delays a frame beyond it. The A2E TRT engine is built with dynamic input
+    // shapes 5000..60000 samples — values outside cannot run, clamp + warn.
+    long bufferLength = envInt("A2E_BUFFER_LENGTH", 16000);
+    if (bufferLength < 5000 || bufferLength > 60000) {
+      const long clamped = bufferLength < 5000 ? 5000 : 60000;
+      std::cerr << "a2f_stream: A2E_BUFFER_LENGTH=" << bufferLength
+                << " is outside the engine's dynamic input range [5000, 60000]"
+                   " — clamping to " << clamped << "\n";
+      bufferLength = clamped;
+    }
+    // The SDK rejects an execution stride larger than the window:
+    // (inferencesToSkip+1)*16000/30 <= bufferLength. Cap at the sample's 30
+    // (one real inference per second — the 60000-window behavior); smaller
+    // windows get the densest legal skip, i.e. one inference per window's
+    // worth of 30 fps output frames (29 for the 16000 default).
+    const std::size_t maxSkipPlusOne =
+        static_cast<std::size_t>(bufferLength) * 30 / 16000;  // floor
+    const std::size_t inferencesToSkip = std::min<std::size_t>(30, maxSkipPlusOne - 1);
+
     auto a2eModelParams = a2eInfo->GetExecutorCreationParameters(
-        /*bufferLength=*/60000, /*frameRateNumerator=*/30, /*frameRateDenominator=*/1,
-        /*inferencesToSkip=*/30);
+        static_cast<std::size_t>(bufferLength), /*frameRateNumerator=*/30,
+        /*frameRateDenominator=*/1, inferencesToSkip);
+    a2eBridgeEnd = bufferLength / 2;  // == the SDK-computed window targetOffset
 
     // A2E post-processed output must live in the exact emotion space the
     // geometry executor consumes — a size mismatch would corrupt the shared
@@ -422,20 +454,27 @@ int main() {
       if (nva2e::SetExecutorPostProcessParameters(*a2eExec, 0, post)) {
         std::cerr << "a2f_stream: set a2e post-process params failed\n";
       }
-      // PRE-SEED: the tag vector at t=0 (the zero vector for a neutral tag — a
-      // valid flat emotion), accumulator left OPEN. While the accumulator is
-      // open, geometry frame availability is capped by the last accumulated
-      // emotion timestamp and is ZERO while it is empty — without the seed no
-      // frame can be emitted until A2E's first execution, which needs
-      // bufferLength/2 = 30000 samples (~1.9 s) of audio (measured ~2.1 s to
-      // first frame). With the seed, the first frame waits only on the
-      // geometry's own ~0.5 s audio lookahead; A2E's frames land BEHIND the
-      // seed (from ~t=533 on — its colliding t=0 frame is skipped in
-      // onEmotions) and take over the emotion timeline from there. The seed
-      // also guarantees emoAcc is never empty, so the close-time Close()
-      // cannot fail and an A2E-less utterance degrades to constant tag
-      // emotion — the seed IS the tag fallback now.
-      emoAcc->Accumulate(0, tagView, stream);
+      // BRIDGE-SEED: the tag vector at t=0 and every A2E frame stride (~533
+      // samples) up to the A2E window's targetOffset (= bufferLength/2),
+      // accumulator left OPEN. While the accumulator is open, geometry frame
+      // availability is capped by the LAST accumulated emotion timestamp and
+      // is ZERO while it is empty — the bridge puts the emotion frontier at
+      // targetOffset immediately, so geometry flows continuously from frame 0
+      // on its own ~0.5 s audio lookahead instead of waiting bufferLength/2
+      // samples of audio for A2E's first execution. A2E emissions with target
+      // <= the bridge end are skipped by the monotonicity guard in onEmotions
+      // (by design: flat tag emotion covers the first bufferLength/2 of the
+      // timeline — where A2E cannot see yet anyway — and prosody takes over
+      // from the first frame past it). The bridge also guarantees emoAcc is
+      // never empty, so the close-time Close() cannot fail and an A2E-less
+      // (short/broken) utterance degrades to constant tag emotion — the
+      // bridge IS the tag fallback. ≤ ~17 host Accumulates at the default
+      // window — negligible per utterance.
+      for (std::int64_t t = 0;; t += 533) {  // 533 ≈ 16000 samples / 30 fps
+        const std::int64_t ts = std::min(t, a2eBridgeEnd);
+        emoAcc->Accumulate(ts, tagView, stream);
+        if (ts >= a2eBridgeEnd) break;
+      }
       // emoAcc stays OPEN — the A2E results callback fills it incrementally as
       // audio streams in; it is closed once the audio is closed and A2E drained.
     } else {
@@ -449,7 +488,7 @@ int main() {
 
     // Once an Execute returns an error, retrying every chunk would spin/log
     // forever, so the rest of the utterance degrades: a2eBroken ⇒ A2E treated
-    // as drained (the t=0 tag pre-seed still guarantees emotion data);
+    // as drained (the tag bridge-seed still guarantees emotion data);
     // computeBroken ⇒ no more frames for this utterance (the done marker is
     // still emitted). These flags catch EXECUTE-level errors only — a failed
     // device-to-host copy inside onResults returns false to the executor,
@@ -485,7 +524,7 @@ int main() {
         }
         if (audioAcc->IsClosed() && !emoAcc->IsClosed()) {
           // Audio is complete and A2E has no executions left ⇒ emotions are
-          // complete. The per-utterance t=0 pre-seed guarantees the
+          // complete. The per-utterance tag bridge-seed guarantees the
           // accumulator is never empty here (Close on an empty accumulator
           // errors) and doubles as the tag-only fallback when A2E produced
           // nothing (short/broken utterance): once closed, geometry is no
