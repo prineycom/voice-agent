@@ -15,6 +15,10 @@ WS /a2f:
         JSON {"type": "blendshapes", "frame": i, "t": sec, "arkit": {name: value, ...}} per frame,
         then JSON {"done": true}   (or {"error": "..."} on failure)
 
+Feeding is INCREMENTAL (#45): each PCM frame is forwarded to the backend as it
+arrives (``stream_from``), so blendshape frames may reach the client BEFORE it
+sends {"end"}. The wire protocol is unchanged — only the frames' timing.
+
 GET /health: backend/engine status, consistent with the STT/TTS services.
 """
 
@@ -76,41 +80,87 @@ async def health():
     )
 
 
+_END = object()  # chunk-queue sentinel: the client sent {"end": true}
+
+
+async def _queue_chunks(queue: asyncio.Queue):
+    """Async chunk iterator over the receive loop's queue, closed by ``_END``."""
+    while True:
+        chunk = await queue.get()
+        if chunk is _END:
+            return
+        yield chunk
+
+
+async def _forward_frames(ws: WebSocket, queue: asyncio.Queue, emotion: list[float] | None) -> None:
+    """Per-utterance forward task: stream frames from the backend to the client
+    as PCM chunks arrive, then {"done"} (or {"error"}). The ONLY task that sends
+    during an utterance, so frames and control replies never interleave."""
+    gen = backend.stream_from(_queue_chunks(queue), emotion)
+    try:
+        try:
+            async for frame in gen:
+                await ws.send_json({"type": "blendshapes", **frame})
+            await ws.send_json({"done": True})
+        except NotImplementedError as e:
+            await ws.send_json({"error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            log.exception("A2F inference error")
+            await ws.send_json({"error": str(e)})
+    finally:
+        # Deterministic teardown when this task is cancelled (client gone
+        # mid-utterance): closing the generator makes the engine abort the
+        # utterance on the helper, which stays in service.
+        await gen.aclose()
+
+
 @app.websocket("/a2f")
 async def a2f_ws(ws: WebSocket):
     await ws.accept()
+    forward: asyncio.Task | None = None
     try:
         while True:
+            # One utterance: optional emotion control, PCM frames, {"end"}.
+            # Inference starts on the FIRST PCM frame; audio is fed to the
+            # backend incrementally, so blendshape frames may go out while the
+            # client is still sending audio.
             emotion: list[float] | None = None
-            pcm = bytearray()
+            queue: asyncio.Queue = asyncio.Queue()
             ended = False
-            # Collect one utterance: optional emotion control, PCM frames, {"end"}.
             while not ended:
                 msg = await ws.receive()
                 if msg["type"] == "websocket.disconnect":
                     return
                 if msg.get("bytes") is not None:
-                    pcm += msg["bytes"]
+                    queue.put_nowait(msg["bytes"])
+                    if forward is None:
+                        forward = asyncio.create_task(_forward_frames(ws, queue, emotion))
                 elif msg.get("text") is not None:
                     ctrl = json.loads(msg["text"])
                     if "emotion" in ctrl:
-                        emotion = _emotion_vector(ctrl["emotion"])
+                        if forward is None:
+                            emotion = _emotion_vector(ctrl["emotion"])
+                        else:  # inference already runs with its emotion vector
+                            log.warning("emotion control after audio started — ignored")
                     if ctrl.get("end"):
                         ended = True
-            # Run inference and stream frames back.
-            try:
-                async for frame in backend.stream(bytes(pcm), emotion):
-                    await ws.send_json({"type": "blendshapes", **frame})
-                await ws.send_json({"done": True})
-            except NotImplementedError as e:
-                await ws.send_json({"error": str(e)})
-            except Exception as e:  # noqa: BLE001
-                log.exception("A2F inference error")
-                await ws.send_json({"error": str(e)})
+            queue.put_nowait(_END)
+            if forward is None:
+                # Audio-less utterance (just {"end"}): still run the backend so
+                # the client gets its {"done"} reply.
+                forward = asyncio.create_task(_forward_frames(ws, queue, emotion))
+            await forward
+            forward = None
     except WebSocketDisconnect:
         pass
     except Exception:  # noqa: BLE001
         log.exception("A2F websocket error")
+    finally:
+        if forward is not None:
+            # Client disconnected (or the receive loop failed) mid-utterance:
+            # abort the in-flight inference (the helper stays in service).
+            forward.cancel()
+            await asyncio.gather(forward, return_exceptions=True)
 
 
 if __name__ == "__main__":
