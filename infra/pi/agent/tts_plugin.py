@@ -35,6 +35,7 @@ import asyncio
 import collections
 import json
 import logging
+import math
 
 import websockets
 from livekit.agents import (
@@ -86,8 +87,16 @@ def _compact_arkit(frame_no: int, t: float, arkit: dict) -> bytes:
     """
     if not isinstance(arkit, dict):
         raise TypeError("arkit must be a dict")
+    if not math.isfinite(t):
+        raise TypeError("t must be finite")
+    # Non-finite values would serialize as bare NaN/Infinity tokens — invalid
+    # JSON for the browser's JSON.parse — so they are dropped with the zeros.
     kept = sorted(
-        ((name, rv) for name, v in arkit.items() if (rv := round(v, 3)) != 0),
+        (
+            (name, rv)
+            for name, v in arkit.items()
+            if (rv := round(v, 3)) != 0 and math.isfinite(rv)
+        ),
         key=lambda kv: (-abs(kv[1]), kv[0]),
     )
     frame = {"type": "blendshapes", "frame": frame_no, "t": round(t, 3), "arkit": {}}
