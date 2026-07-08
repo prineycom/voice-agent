@@ -8,13 +8,13 @@ relates-to: "0012-audio2face-hybrid-facial-animation, 0013-a2f-driven-lipsync-vo
 
 # Emotion Supply for Facial Animation: A2E from Audio + Emotion-Tag Boost
 
-Epic 8 shipped A2F facial animation whose emotion input is effectively disconnected: the only
-source is the LLM inline emotion tag (5-value enum), and `neutral`/absent — the common case —
-maps to an all-zeros A2E vector (`infra/desktop/a2f/emotion.py`). Our slim helper
-(`infra/desktop/a2f/a2f_stream/main.cpp`, ADR-0015) feeds A2F's emotion accumulator only from
-that vector and **does not run Audio2Emotion (A2E)** — the audio-prosody emotion inference the
-full A2F NIM always blends in. Result: A2F degenerates to near-pure phoneme articulation and the
-face is visually indistinguishable from volume lip-sync (see `docs/retro-epic8-a2f.md`).
+Epic 8 shipped A2F facial animation whose emotion input was effectively disconnected: the only
+source was the LLM inline emotion tag (5-value enum), and `neutral`/absent — the common case —
+mapped to an all-zeros A2E vector (`infra/desktop/a2f/emotion.py`). Our slim helper
+(`infra/desktop/a2f/a2f_stream/main.cpp`, ADR-0015) fed A2F's emotion accumulator only from
+that vector and **did not run Audio2Emotion (A2E)** — the audio-prosody emotion inference the
+full A2F NIM always blends in. Result: A2F degenerated to near-pure phoneme articulation and the
+face was visually indistinguishable from volume lip-sync (see `docs/retro-epic8-a2f.md`).
 
 ## Decision
 
@@ -30,6 +30,19 @@ face is visually indistinguishable from volume lip-sync (see `docs/retro-epic8-a
   `joy=1.0` vector vs zeros, compared on the raw-ARKit `?facedebug=1` overlay. If even a forced
   full-strength emotion barely moves the raw face, the investment redirects to SDK
   tuning/model configuration first — not to emotion sourcing.
+
+## Status update (2026-07-08)
+
+The calibration gate resolved on the **proceed** branch (2026-07-07): a forced full-strength
+emotion clearly moves the raw face, so the investment stayed on emotion sourcing (see the
+[calibration report](../research/2026-07-07-a2f-emotion-calibration.md)). The decision landed
+in issue #40: the helper runs A2E (nvidia/Audio2Emotion-v2.2, TRT engine baked into the image)
+as the baseline emotion source; the LLM tag rides the SDK's preferred-emotion channel as an
+additive boost, enabled per utterance only for a non-zero tag; the tuning pass baked per-pose
+brow multipliers (`A2F_BS_MULTIPLIERS="browInnerUp=1.35,browDownLeft=1.25,browDownRight=1.25"`)
+with all A2E knobs at model defaults. All four acceptance criteria pass on the production
+image; `A2E_ENABLED=0` is the one-flag rollback to tag-only. Evidence:
+[`docs/research/data/40-a2f-emotion-supply/`](../research/data/40-a2f-emotion-supply/analysis.md).
 
 ## Alternatives considered
 
@@ -51,8 +64,11 @@ face is visually indistinguishable from volume lip-sync (see `docs/retro-epic8-a
 - Emotion becomes continuous and voice-driven; the tag shifts from "the emotion" to "the
   intent bias", matching its original purpose.
 - The glossary entries **Expression**/**Emotion tag** in `.yoke/context.md` describe this
-  split; until the helper work lands, the code remains tag-only and flat — the glossary marks
-  A2E as decided-but-pending.
+  split; the helper work landed in #40, so the glossary now describes A2E as the live
+  baseline source (the tag-only, flat state is history).
+- The helper's GPU footprint grows to ~1.65 GiB total (the A2E TRT engine accounts for
+  ≈1.25 GiB of it), up from the pre-A2E ~0.4 GiB; projected all-services usage stays
+  ≈7.2 of 12 GiB.
 - Downstream, the Live2D mapping layer can rely on meaningful brow/eye/mouth-form dynamics,
   which the retro's amplification step (nonlinear gain + discrete accents) then exaggerates
   for the anime art style.

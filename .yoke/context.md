@@ -23,8 +23,8 @@ _Avoid_: status, mode, animation
 A facial **emotion** of the **Avatar**. Historically rendered from a Live2D `.exp3.json` file
 driven by an **Emotion tag**. Under **Facial animation** (Epic 8) this `.exp3.json` path is
 **replaced**: facial emotion is produced by **Audio2Face** from its **Emotion vector** input.
-Today that vector comes only from the **Emotion tag** (zeros when `neutral`); per ADR-0016 the
-baseline source becomes **Audio2Emotion** with the tag as an additive boost. Still orthogonal
+Per ADR-0016 (landed in #40) the baseline vector comes from **Audio2Emotion**, with the
+**Emotion tag** as an additive boost — a `neutral`/zero tag means pure A2E. Still orthogonal
 to **Motion state**.
 _Avoid_: mood, face, emotion (reserve "emotion" for the source intent, see Emotion tag)
 
@@ -59,16 +59,18 @@ _Avoid_: A2F-2D, facial capture
 
 **Audio2Emotion** (A2E):
 The emotion-inference half of the A2F stack: infers an **Emotion vector** from the audio's
-prosody. The full NVIDIA NIM always blends it in; our slim helper does not run it yet — per
-ADR-0016 it becomes the baseline emotion source, with the **Emotion tag** as an additive boost.
+prosody. The full NVIDIA NIM always blends it in; since #40 (ADR-0016) our slim helper runs it
+per utterance as the baseline emotion source, with the **Emotion tag** as an additive boost via
+the SDK preferred-emotion channel. `A2E_ENABLED=0` rolls the helper back to tag-only.
 _Avoid_: sentiment analysis, emotion recognition (too generic)
 
 **Emotion vector**:
 The 10-dimensional A2E-vocabulary input to **Audio2Face**
 (`grief, joy, disgust, outofbreath, pain, anger, amazement, cheekiness, sadness, fear`,
-each 0.0–1.0) that colors the emitted **Blendshapes**. Today built sparsely from the
-**Emotion tag** enum; all-zeros (the `neutral` case) yields near-pure phoneme articulation —
-"just lip-sync".
+each 0.0–1.0) that colors the emitted **Blendshapes**. Since #40 the baseline is inferred per
+utterance by **Audio2Emotion** from the audio; the sparse **Emotion tag** vector is an additive
+boost on top (all-zeros/`neutral` tag ⇒ pure A2E). The wire format (`/tts` field → A2F fork →
+helper stdin) is unchanged.
 _Avoid_: emotion state, mood vector
 
 **Kiosk**:
@@ -98,8 +100,9 @@ A message the Agent Worker publishes on the **UI topic** to authoritatively set 
 An inline marker the LLM emits in its response (e.g. `[emotion:happy]`) to express intent.
 The Agent Worker parses it and strips it **before TTS and before the transcript**. Historically
 it mapped to an **Expression** (`.exp3.json`) in a **Motion event**; under **Facial animation**
-(Epic 8) the parsed emotion instead feeds **Audio2Face**'s emotion input so the same enum shapes
-A2F's facial output. The allowed values are a fixed small enum
+(Epic 8) the parsed emotion instead feeds **Audio2Face**'s emotion input — since #40 as an
+additive *boost* on the **Audio2Emotion** baseline (SDK preferred-emotion channel, enabled only
+for a non-zero tag), not as the sole source. The allowed values are a fixed small enum
 (`neutral | happy | sad | surprised | thinking`), the single source of truth shared by SOUL.md,
 the agent, and (via A2F) the avatar; any unknown tag falls back to `neutral`.
 _Avoid_: sentiment, emotion marker
@@ -115,5 +118,5 @@ _Avoid_: sentiment, emotion marker
 > **Domain:** That's an *expression*. The LLM tagged its reply with an *emotion tag* like
 > `[emotion:happy]`; the agent strips the tag before TTS and it becomes part of the *emotion
 > vector* fed to Audio2Face, which shapes the emitted blendshapes. No `.exp3.json` is involved
-> anymore — and once ADR-0016 lands, *Audio2Emotion* infers the baseline vector from the voice
-> itself, the tag only boosting it.
+> anymore — and since ADR-0016 landed (#40), *Audio2Emotion* infers the baseline vector from
+> the voice itself, the tag only boosting it.

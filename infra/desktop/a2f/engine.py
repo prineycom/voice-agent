@@ -6,13 +6,14 @@ Two backends, selected by ``A2F_BACKEND``:
 * ``helper`` (production): drives the compiled C++ ``a2f_stream`` helper built
   from the Audio2Face-3D-SDK against the batch-1 TensorRT engine (see
   ``a2f_stream/`` and ``build_engine.sh``). The helper reads PCM frames + an
-  emotion vector on stdin and writes blendshape frames on stdout. VRAM ≈ 0.3 GB
-  (spike-measured), coexists with STT+TTS. The helper is a **single long-lived
-  process**: it is spawned lazily on the first utterance and kept alive across
-  utterances (the engine loads once), so per-utterance latency ≈ inference. The
-  shared stdin/stdout pipe is guarded by a single-flight lock; a crash sets the
-  process back to ``None`` so the next call respawns lazily. **The helper's
-  inference wiring is still WIP** (SDK InteractiveExecutor + BlendshapeSolve) —
+  emotion vector on stdin and writes blendshape frames on stdout; it runs A2E
+  (Audio2Emotion) on the audio as the baseline emotion source, the stdin vector
+  acting as an additive boost (#40). VRAM ≈ 1.65 GiB with A2E (the A2E TRT
+  engine is ≈ 1.25 GiB of it), coexists with STT+TTS. The helper is a **single
+  long-lived process**: it is spawned lazily on the first utterance and kept
+  alive across utterances (the engines load once), so per-utterance latency ≈
+  inference. The shared stdin/stdout pipe is guarded by a single-flight lock; a
+  crash sets the process back to ``None`` so the next call respawns lazily —
   see a2f_stream/README.
 
 * ``mock`` (default / CI / no-GPU): a dependency-free synthetic generator that
