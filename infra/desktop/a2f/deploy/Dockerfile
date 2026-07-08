@@ -49,11 +49,18 @@ ENV LD_LIBRARY_PATH=/opt/a2f/lib:/usr/local/cuda/lib64 \
 ENV A2E_MODEL_JSON=/opt/a2f/a2e/model.json \
     A2E_ENABLED=1 \
     A2F_HELPER_FIRST_TIMEOUT=60 \
-    A2E_EMOTION_STRENGTH=0.6 \
+    A2E_EMOTION_STRENGTH=0.4 \
     A2E_EMOTION_CONTRAST=1.0 \
     A2E_LIVE_BLEND_COEF=0.7 \
     A2E_LIVE_TRANSITION_TIME=0.5 \
-    A2E_PREFERRED_STRENGTH=0.5
+    A2E_PREFERRED_STRENGTH=0.6
+# ^ EMOTION_STRENGTH 0.4 + PREFERRED_STRENGTH 0.6 are the winning config of the
+# #45 streaming-helper emotion re-tuning (window stays at the code default
+# A2E_BUFFER_LENGTH=16000 — larger windows batch A2E emission into >0.5 s frame
+# bursts and fail streaming health). Restores the #40 criteria (a)-(d) on the
+# streaming helper: preferred 0.6 lifts the joy/anger tag boost (b), strength
+# 0.4 damps the A2E share enough for BrowDownLeft joy-mean < 0.15 (c) while the
+# lower neutral baseline keeps (a) and the boost ratios green.
 
 # --- Tuned emotion expressiveness (#40 Task 8) ---------------------------------
 # Winning config of the bounded tuning pass (docs/research/data/
