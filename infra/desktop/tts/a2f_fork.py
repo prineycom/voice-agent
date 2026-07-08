@@ -4,17 +4,20 @@ Each `/tts` utterance is teed into the A2F `/a2f` WebSocket (loopback) so A2F
 produces ARKit blendshapes bound to the exact audio that reached the client.
 
 The fork PUSHES emotion + PCM16@24k + {"end": true} and FORWARDS the returned
-blendshape frames verbatim via an injected `on_frame` callback; A2F's own
-{"done": true} is suppressed and instead signalled once via `on_done` when the
-stream ends for any reason (drain, failure, or cancel). It is strictly
-best-effort: any A2F failure is logged at WARNING and swallowed — it must NEVER
-affect the `/tts` client stream or barge-in.
+blendshape frames verbatim via an injected `on_frame` callback; send and
+receive run concurrently on the same connection, so frames are forwarded as
+they arrive — possibly while PCM is still streaming. A2F's own {"done": true}
+is suppressed and instead signalled once via `on_done` when the stream ends
+for any reason (drain, failure, or cancel). It is strictly best-effort: any
+A2F failure is logged at WARNING and swallowed — it must NEVER affect the
+`/tts` client stream or barge-in.
 
-Protocol mirrored from infra/desktop/a2f/server.py (per utterance, in order):
+Protocol mirrored from infra/desktop/a2f/server.py (per utterance, send order):
     1. optional JSON {"emotion": "happy"} or {"emotion": [10 floats]}
     2. binary PCM16 @ 24 kHz mono frames
     3. JSON {"end": true}
-then the server streams {"type": "blendshapes", ...} frames + {"done": true}.
+The server streams {"type": "blendshapes", ...} frames + {"done": true};
+frames may arrive at any point once audio starts flowing, not only after end.
 """
 
 from __future__ import annotations
@@ -103,32 +106,53 @@ class A2FFork:
     async def _run(self) -> None:
         try:
             async with websockets.connect(self.url, max_size=None) as a2f:
-                if self.emotion is not None:
-                    await a2f.send(json.dumps({"emotion": self.emotion}))
-                while True:
-                    item = await self._queue.get()
-                    if item is _SENTINEL:
-                        break
-                    await a2f.send(item)
-                await a2f.send(json.dumps({"end": True}))
-                # Forward each blendshape frame; stop on A2F's done/error without
-                # forwarding it (on_done marks the end of the stream instead).
-                while True:
-                    msg = await a2f.recv()
-                    if isinstance(msg, str):
-                        data = json.loads(msg)
-                        if data.get("type") == "blendshapes":
-                            try:
-                                self._on_frame(data)
-                            except Exception:  # noqa: BLE001 — a raising consumer must not kill the drain loop
-                                log.debug("A2F fork on_frame callback raised", exc_info=True)
-                        elif data.get("done") or "error" in data:
-                            break
+                # Interleave send and receive on the same connection so
+                # blendshape frames forward as they arrive, while PCM is still
+                # streaming. Normally the sender finishes on the sentinel and
+                # the receiver on A2F's {"done": true} that follows it.
+                sender = asyncio.ensure_future(self._send_loop(a2f))
+                receiver = asyncio.ensure_future(self._recv_loop(a2f))
+                try:
+                    await asyncio.gather(sender, receiver)
+                finally:
+                    # If one side raised, gather propagates the first exception
+                    # while the sibling task keeps running — reap it so nothing
+                    # outlives the connection. Cancelling a finished task is a
+                    # no-op. On close() cancellation this also kills both sides.
+                    for side in (sender, receiver):
+                        side.cancel()
+                    await asyncio.gather(sender, receiver, return_exceptions=True)
         except Exception:  # noqa: BLE001 — best-effort; A2F must not break /tts
             self._failed = True
             log.warning("A2F fork failed; dropping blendshapes for this utterance", exc_info=True)
         finally:
             self._fire_done()
+
+    async def _send_loop(self, a2f) -> None:
+        """Push emotion + queued PCM, then {"end": true} on the sentinel."""
+        if self.emotion is not None:
+            await a2f.send(json.dumps({"emotion": self.emotion}))
+        while True:
+            item = await self._queue.get()
+            if item is _SENTINEL:
+                break
+            await a2f.send(item)
+        await a2f.send(json.dumps({"end": True}))
+
+    async def _recv_loop(self, a2f) -> None:
+        # Forward each blendshape frame; stop on A2F's done/error without
+        # forwarding it (on_done marks the end of the stream instead).
+        while True:
+            msg = await a2f.recv()
+            if isinstance(msg, str):
+                data = json.loads(msg)
+                if data.get("type") == "blendshapes":
+                    try:
+                        self._on_frame(data)
+                    except Exception:  # noqa: BLE001 — a raising consumer must not kill the drain loop
+                        log.debug("A2F fork on_frame callback raised", exc_info=True)
+                elif data.get("done") or "error" in data:
+                    break
 
     def _fire_done(self) -> None:
         """Invoke on_done exactly once (on drain, failure, or cancel)."""

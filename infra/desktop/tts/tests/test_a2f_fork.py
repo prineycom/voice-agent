@@ -158,6 +158,44 @@ def test_blendshape_frames_forwarded_verbatim():
     assert all("done" not in f for f in frames)
 
 
+def test_frames_forward_while_still_feeding():
+    """Interleaved send/recv: a frame A2F emits after the first PCM chunk must
+    reach on_frame BEFORE end() is called on the fork — not queued until the
+    whole utterance has been sent."""
+    fake = FakeA2F(early_frames=1).start()
+    frames = []
+
+    async def run():
+        got_frame = asyncio.Event()
+
+        def on_frame(frame):
+            frames.append(frame)
+            got_frame.set()
+
+        fork = a2f_fork.A2FFork(fake.url, "happy", on_frame=on_frame)
+        fork.feed(b"\x01\x02")
+        # The early frame must arrive while we are still feeding, i.e. before
+        # end(). A send-all-then-recv fork would time out here.
+        await asyncio.wait_for(got_frame.wait(), timeout=5.0)
+        frames_before_end = len(frames)
+        fork.feed(b"\x03\x04")
+        fork.end()
+        await fork.close()
+        return frames_before_end
+
+    try:
+        frames_before_end = asyncio.run(run())
+    finally:
+        fake.stop()
+
+    assert frames_before_end >= 1
+    assert frames[0].get("early") is True
+    # After a graceful drain the post-end burst (2 frames) arrived too;
+    # done is still suppressed.
+    assert len(frames) == 3
+    assert all(f["type"] == "blendshapes" for f in frames)
+
+
 def test_raising_on_frame_does_not_kill_drain_loop():
     fake = FakeA2F().start()
     received = []

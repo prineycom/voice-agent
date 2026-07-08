@@ -6,6 +6,11 @@ PCM16 frames, then {"end": true}; the server replies with a couple of
 {"type": "blendshapes", ...} text frames + {"done": true}, and loops so a single
 connection can carry multiple utterances.
 
+With `early_frames=N` the fake also emits N blendshape frames (tagged
+"early": true) right after the FIRST PCM chunk of each utterance, before it has
+received {"end": true} — modelling the real A2F streaming frames while audio is
+still being pushed, so tests can pin that the fork forwards them immediately.
+
 Every received message is recorded into a thread-safe queue as a tagged event so
 tests can assert ordering and audio-binding:
     ("emotion", value) | ("pcm", bytes) | ("end", True) | ("closed", None)
@@ -25,7 +30,8 @@ import websockets
 
 
 class FakeA2F:
-    def __init__(self) -> None:
+    def __init__(self, early_frames: int = 0) -> None:
+        self.early_frames = early_frames
         self.events: "queue.Queue" = queue.Queue()
         self.port: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -49,16 +55,34 @@ class FakeA2F:
         return out
 
     async def _handler(self, ws) -> None:
+        pcm_seen = False
         try:
             async for message in ws:
                 if isinstance(message, (bytes, bytearray)):
                     self.events.put(("pcm", bytes(message)))
+                    if not pcm_seen:
+                        pcm_seen = True
+                        # Stream blendshapes EARLY, before {"end": true} — the
+                        # fork must forward these while it is still feeding PCM.
+                        for i in range(self.early_frames):
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "blendshapes",
+                                        "frame": i,
+                                        "t": i / 30.0,
+                                        "arkit": {"JawOpen": 0.1, "MouthSmileLeft": 0.2},
+                                        "early": True,
+                                    }
+                                )
+                            )
                     continue
                 ctrl = json.loads(message)
                 if "emotion" in ctrl:
                     self.events.put(("emotion", ctrl["emotion"]))
                 if ctrl.get("end"):
                     self.events.put(("end", True))
+                    pcm_seen = False  # reset for the next utterance on this connection
                     # Reply with a short blendshape burst, then done.
                     for i in range(2):
                         await ws.send(
