@@ -339,9 +339,12 @@ int main() {
     // of audio and steady-state emotion trails the audio frontier by up to
     // ~bufferLength/2. The SDK sample's 60000 put the first prosody emotion
     // ~1.9 s in (the measured ~2.1 s first-frame gate); 16000 ⇒ 0.5 s,
-    // matching the geometry's own audio lookahead so emotion (almost) never
-    // delays a frame beyond it. The A2E TRT engine is built with dynamic input
-    // shapes 5000..60000 samples — values outside cannot run, clamp + warn.
+    // matching the geometry's own audio lookahead: with the stride derived
+    // below, the emotion frontier trails the audio frontier by 534..8534
+    // samples, so a frame waits at most ~534 samples (~33 ms) beyond the
+    // geometry's 0.5 s lookahead. The A2E TRT engine is built with dynamic
+    // input shapes 5000..60000 samples — values outside cannot run, clamp +
+    // warn.
     long bufferLength = envInt("A2E_BUFFER_LENGTH", 16000);
     if (bufferLength < 5000 || bufferLength > 60000) {
       const long clamped = bufferLength < 5000 ? 5000 : 60000;
@@ -350,13 +353,22 @@ int main() {
                    " — clamping to " << clamped << "\n";
       bufferLength = clamped;
     }
-    // The SDK rejects an execution stride larger than the window:
-    // (inferencesToSkip+1)*16000/30 <= bufferLength. Cap at the sample's 30
-    // (one real inference per second — the 60000-window behavior); smaller
-    // windows get the densest legal skip, i.e. one inference per window's
-    // worth of 30 fps output frames (29 for the 16000 default).
+    // Execution cadence: each Execute runs one real inference and emits
+    // inferencesToSkip+1 post-processed frames reaching AHEAD of the inference
+    // target by skip*533 samples — and the SDK permanently drops (release
+    // build, asserts compiled out) any emitted frame whose target is at/past
+    // the accumulated-audio frontier at Execute time. An execution becomes
+    // ready right at target+targetOffset accumulated samples and the parent
+    // feeds arbitrary-size chunks, so executions routinely run near that
+    // gate: emissions are only safe if the LAST frame offset stays below
+    // targetOffset (bufferLength/2), i.e. (skip+1) <= bufferLength*30/32000.
+    // Default 16000 ⇒ skip 14: stride 8000 samples, last frame offset
+    // 14*533 = 7466 < 8000; 2 real inferences/s (~12 ms GPU) — accepted.
+    // 60000 ⇒ capped at the SDK sample's 30 (last offset 16000 < 30000), its
+    // behavior preserved. The bound also satisfies the SDK's stride <= window
+    // creation check by construction.
     const std::size_t maxSkipPlusOne =
-        static_cast<std::size_t>(bufferLength) * 30 / 16000;  // floor
+        static_cast<std::size_t>(bufferLength) * 30 / 32000;  // floor
     const std::size_t inferencesToSkip = std::min<std::size_t>(30, maxSkipPlusOne - 1);
 
     auto a2eModelParams = a2eInfo->GetExecutorCreationParameters(
@@ -465,7 +477,9 @@ int main() {
       // <= the bridge end are skipped by the monotonicity guard in onEmotions
       // (by design: flat tag emotion covers the first bufferLength/2 of the
       // timeline — where A2E cannot see yet anyway — and prosody takes over
-      // from the first frame past it). The bridge also guarantees emoAcc is
+      // from the first frame past it; at the default window, execution 0's
+      // frames [0, 7466] are ALL absorbed and prosody lands from execution
+      // 1's t=8533 frame on). The bridge also guarantees emoAcc is
       // never empty, so the close-time Close() cannot fail and an A2E-less
       // (short/broken) utterance degrades to constant tag emotion — the
       // bridge IS the tag fallback. ≤ ~17 host Accumulates at the default
