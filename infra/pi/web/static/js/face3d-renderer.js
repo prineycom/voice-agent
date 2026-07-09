@@ -30,7 +30,10 @@ export function createFaceRenderer(container, { log } = {}) {
     if (!renderer || !camera) return;
     const w = container.clientWidth || 1;
     const h = container.clientHeight || 1;
-    renderer.setSize(w, h, false);
+    // updateStyle=true so the canvas CSS box matches the container; false would
+    // leave the canvas at its raw buffer size (container×devicePixelRatio) and
+    // overflow the stage, covering the header controls.
+    renderer.setSize(w, h, true);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
   }
@@ -107,7 +110,8 @@ export function createFaceRenderer(container, { log } = {}) {
 
       renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
       renderer.setPixelRatio(window.devicePixelRatio || 1);
-      renderer.setSize(w, h, false);
+      // updateStyle=true — size the canvas CSS box to the container (see sizeToContainer).
+      renderer.setSize(w, h, true);
       container.appendChild(renderer.domElement);
 
       // Lighting: hemisphere fill so morph deltas read on both sides + a directional

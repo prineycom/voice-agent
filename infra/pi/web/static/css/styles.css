@@ -31,7 +31,7 @@
   aside { border-right: 1px solid #222a35; padding: 16px; display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
   .stage { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   #avatar {
-    position: relative;
+    position: relative; overflow: hidden;
     flex: 1 1 auto; min-height: 0; margin: 16px 16px 0;
     display: flex; align-items: center; justify-content: center; text-align: center;
     border: 1px dashed #2f3b4a; border-radius: 12px; background: #0c1118;
