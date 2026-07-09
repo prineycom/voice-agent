@@ -281,11 +281,12 @@ From issue #46 acceptance criteria:
 - Contract seam: `blendshapes.js:39-52`. ARKit names: `infra/desktop/a2f/arkit.py:13-39`.
 - Reference only (not a dependency): TalkingHead.js (met4citizen).
 
-## Open implementation question
+## Resolved decision — RPM `.glb` sourcing (Task 2)
 
-**RPM `.glb` sourcing (Task 2).** RPM's hosted service is reportedly shut down (2026). Either the
-executor obtains a licensed RPM `.glb` with ARKit-52 morph targets (needs an account/download —
-likely a human step, and the avatar's appearance is a product choice), or milestone 1 signs off
-against a **placeholder glb** carrying ARKit-named morph targets, with the real avatar swapped in
-later (a one-line asset-path change). This changes Task 2 from a potential blocker into a swap;
-the rest of the plan is unaffected either way.
+**Milestone 1 uses a PLACEHOLDER `.glb`** (user decision). Task 2 commits an open/test glTF that
+carries ARKit-52-named morph targets (camelCase); the renderer is asset-agnostic (DD-8), so the
+real RPM avatar is a later one-line asset-path swap. Task 2 is therefore NOT a blocker — no task
+depends on a licensed avatar. The placeholder MUST expose the ARKit morph-target names (else the
+1:1 mapping has nothing to drive); if a ready placeholder with ARKit morphs cannot be found,
+generate a minimal glTF with the ARKit-52 morph targets on a simple head mesh. Real-avatar
+appearance is deferred to a follow-up (product choice).
