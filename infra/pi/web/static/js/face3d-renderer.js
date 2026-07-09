@@ -2,17 +2,43 @@
 // .glb, mounts a WebGL canvas into the given container, gathers the model's
 // morph-target meshes, frames a static camera on the head, and runs a render
 // loop. The only sink into the rig is applyMorphs(map) — driven every A2F frame
-// by a sibling module — which pushes ARKit-style blendshape influences through
-// the pure morph-apply helper.
+// by a sibling module.
+//
+// The render loop decouples INPUT from DISPLAY: applyMorphs records per-morph
+// TARGETS; each rendered frame eases the live influences toward those targets.
+// Lipsync morphs (mouth/jaw/tongue) are written directly so speech stays crisp;
+// expression morphs (brows/eyes/cheeks/nose) are smoothed so they glide instead
+// of snapping between the ~30fps A2F frames. On top of the A2F signal we add
+// procedural life the flat capture lacks: periodic eye blinks and a gentle idle
+// head sway — both always on, so the face never looks frozen.
 //
 // Bare/addons specifiers resolve via an import map added in a later task; do NOT
 // hardcode vendor paths here.
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { applyMorphInfluences } from './morph-apply.js';
 
-// Single-line swap for the real avatar later (DD-8). Placeholder today.
+// Single-line swap for the real avatar later (DD-8).
 const MODEL_URL = '/static/models/rpm/avatar.glb';
+
+// Expression smoothing time constant (ms). Larger = smoother/slower.
+const SMOOTH_TAU_MS = 70;
+// Procedural blink: a full close/open every BLINK_MIN..MAX ms, lasting BLINK_DUR.
+const BLINK_MIN_MS = 2800;
+const BLINK_MAX_MS = 6000;
+const BLINK_DUR_MS = 160;
+// Idle head sway amplitudes (radians) — small, so the head drifts, not bobbles.
+const HEAD_YAW = 0.055;
+const HEAD_PITCH = 0.035;
+const HEAD_ROLL = 0.022;
+
+// Lipsync morphs stay crisp (written directly); everything else is smoothed.
+function isFastMorph(name) {
+  return name.startsWith('mouth') || name.startsWith('jaw') || name.startsWith('tongue');
+}
+
+function nowMs() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}
 
 export function createFaceRenderer(container, { log } = {}) {
   let renderer = null;
@@ -23,8 +49,22 @@ export function createFaceRenderer(container, { log } = {}) {
   let ro = null;
   let ready = false;
   // Meshes carrying BOTH a morph dictionary and an influences array; collected
-  // once on load and reused every frame (keep applyMorphs allocation-light).
+  // once on load and reused every frame (keep the loop allocation-light).
   let morphMeshes = [];
+
+  // Latest per-morph targets from A2F (name -> value). The render loop eases the
+  // live influences toward these; between A2F frames the last value simply holds.
+  let targetMorphs = {};
+  // Idle head sway drives this bone off its bind-pose orientation.
+  let headBone = null;
+  let headBaseQuat = null;
+  // Animation clock + blink scheduler.
+  let lastT = 0;
+  let startT = 0;
+  let nextBlinkAt = 0;
+  let blinkStart = -1;
+  const _euler = new THREE.Euler();
+  const _quat = new THREE.Quaternion();
 
   function sizeToContainer() {
     if (!renderer || !camera) return;
@@ -38,9 +78,70 @@ export function createFaceRenderer(container, { log } = {}) {
     camera.updateProjectionMatrix();
   }
 
+  // 0..1 blink amount; fires a quick sine close/open, then schedules the next.
+  function proceduralBlink(t) {
+    if (blinkStart < 0 && t >= nextBlinkAt) blinkStart = t;
+    if (blinkStart >= 0) {
+      const p = (t - blinkStart) / BLINK_DUR_MS;
+      if (p >= 1) {
+        blinkStart = -1;
+        nextBlinkAt = t + BLINK_MIN_MS + Math.random() * (BLINK_MAX_MS - BLINK_MIN_MS);
+        return 0;
+      }
+      return Math.sin(p * Math.PI); // 0 -> 1 -> 0 across the blink
+    }
+    return 0;
+  }
+
+  function animate(t) {
+    const dt = Math.min(100, t - lastT);
+    lastT = t;
+    const k = 1 - Math.exp(-dt / SMOOTH_TAU_MS); // frame-rate-independent ease
+
+    // 1) Ease/write morph influences toward their targets.
+    for (const mesh of morphMeshes) {
+      const dict = mesh.morphTargetDictionary;
+      const inf = mesh.morphTargetInfluences;
+      for (const name in dict) {
+        const target = targetMorphs[name];
+        if (target === undefined) continue;
+        const idx = dict[name];
+        inf[idx] = isFastMorph(name) ? target : inf[idx] + (target - inf[idx]) * k;
+      }
+    }
+
+    // 2) Procedural blink — max()'d over the A2F blink so both still read.
+    const b = proceduralBlink(t);
+    if (b > 0) {
+      for (const mesh of morphMeshes) {
+        const dict = mesh.morphTargetDictionary;
+        const inf = mesh.morphTargetInfluences;
+        for (const bn of ['eyeBlinkLeft', 'eyeBlinkRight']) {
+          const idx = dict[bn];
+          if (idx !== undefined && b > inf[idx]) inf[idx] = b;
+        }
+      }
+    }
+
+    // 3) Idle head sway — small drift off the bind pose on three slow sines.
+    if (headBone && headBaseQuat) {
+      const s = (t - startT) / 1000;
+      _euler.set(
+        Math.sin(s * 0.62 + 1.3) * HEAD_PITCH,
+        Math.sin(s * 0.47) * HEAD_YAW,
+        Math.sin(s * 0.35 + 2.1) * HEAD_ROLL,
+        'XYZ',
+      );
+      _quat.setFromEuler(_euler);
+      headBone.quaternion.copy(headBaseQuat).multiply(_quat);
+    }
+  }
+
   function renderLoop() {
     rafId = requestAnimationFrame(renderLoop);
-    if (renderer && scene && camera) renderer.render(scene, camera);
+    if (!renderer || !scene || !camera) return;
+    animate(nowMs());
+    renderer.render(scene, camera);
   }
 
   function teardown() {
@@ -85,6 +186,9 @@ export function createFaceRenderer(container, { log } = {}) {
     camera = null;
     gltfRoot = null;
     morphMeshes = [];
+    targetMorphs = {};
+    headBone = null;
+    headBaseQuat = null;
     ready = false;
   }
 
@@ -144,6 +248,14 @@ export function createFaceRenderer(container, { log } = {}) {
         log && log('3D-модель без morph-целей — лицо не будет анимировано');
       }
 
+      // Grab the head bone for the idle sway (RPM rigs name it exactly "Head";
+      // fall back to any head-ish bone). Absent on the placeholder sphere — the
+      // sway then simply no-ops.
+      headBone = null;
+      gltfRoot.traverse((o) => { if (!headBone && o.isBone && /^head$/i.test(o.name)) headBone = o; });
+      if (!headBone) gltfRoot.traverse((o) => { if (!headBone && o.isBone && /head/i.test(o.name)) headBone = o; });
+      headBaseQuat = headBone ? headBone.quaternion.clone() : null;
+
       // Frame the camera on the HEAD, not the whole model — a full-body RPM avatar's
       // bounding box would shrink the face to a distant speck. Prefer the head mesh
       // (RPM's `Wolf3D_Head`); fall back to the whole model, which is correct for the
@@ -179,15 +291,21 @@ export function createFaceRenderer(container, { log } = {}) {
       return false;
     }
 
+    // Start the animation clock and schedule the first blink shortly after load.
+    targetMorphs = {};
+    startT = lastT = nowMs();
+    nextBlinkAt = startT + 1200;
+    blinkStart = -1;
+
     ready = true;
     renderLoop();
     return true;
   }
 
-  // Per-frame sink. Delegates to the pure helper; no allocation of its own.
+  // Per-frame sink: record targets; the render loop applies/eases them.
   function applyMorphs(map) {
     if (!ready || !map) return;
-    applyMorphInfluences(morphMeshes, map);
+    for (const name in map) targetMorphs[name] = map[name];
   }
 
   return {
