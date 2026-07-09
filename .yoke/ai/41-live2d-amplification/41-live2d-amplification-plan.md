@@ -19,11 +19,13 @@ fall back** to motion / physics / auto-blink. Two consequences drive the design:
    base map via `Object.assign`, so an accent writing `ParamEyeLOpen: 1.6` overwrites the
    base's clamped `1`. We bypass the clamp by *layering*, not by un-clamping the pure
    mapper — existing `arkit-map.test.mjs` assertions stay untouched.
-2. **Ship only accents whose params already exist in the base map** (ParamEyeL/ROpen,
-   ParamEyeL/RSmile, ParamBrowL/RY, ParamMouthForm). Their ease-out-then-omit falls back
-   to a *written* base value → seamless release. Head angles (ParamAngleX/Z) are **not**
-   in the base map, so omitting them snaps to whatever motion/physics is mid-keyframe →
-   the documented stutter risk. This is the decisive reason to **defer head-tilt** (DD-4).
+2. **Base-owned accent params release seamlessly** (ParamEyeL/ROpen, ParamEyeL/RSmile,
+   ParamBrowL/RY, ParamMouthForm). Their ease-out-then-omit falls back to a *written* base
+   value. Head angles (ParamAngleX/Z) are **not** in the base map, so a raw omit snaps to
+   whatever motion/physics is mid-keyframe → the documented stutter risk. The head-tilt
+   accent is included (user decision) with an **ease-to-zero-before-omit** release so the
+   handback to motion/physics happens from a near-neutral angle, bounding the snap (DD-4,
+   DD-10).
 
 ## Design decisions
 
@@ -63,21 +65,20 @@ blink/neutral eye-open=1 assertions; the issue's "(brows, eyes, mouth-form, chee
 squint, not lid.
 **Alternative:** Expand every output param — rejected: breaks blink and gaze.
 
-### DD-4: Accents live in a new pure stateful module `accents.js`; head-tilt is deferred
+### DD-4: Accents live in a new pure stateful module `accents.js`; head-tilt included
 
 **Decision:** `createAccents({ now } = {})` returns `{ step(arkit) → {params}, reset() }`.
 It holds per-accent latch + sustain-timer + easing-envelope state (no DOM/globals;
 deterministic given prior state + input + injected clock). `facial.js` layers it over the
-base map; `release()` calls `reset()`. Ship exactly the two required accents (joy-squint,
-amazement-wide-eyes); **defer** the optional head-tilt.
+base map; `release()` calls `reset()`. Ship **three** accents: joy-squint,
+amazement-wide-eyes, and head-tilt (user decision). Head-tilt uses the
+ease-to-zero-before-omit release of DD-10 to bound the motion/physics snap.
 **Rationale:** Keeps stateful hysteresis in a **separately unit-testable** module (the
-constraint: not buried in DOM-coupled `facial.js`). Head-tilt is deferred because its
-target params (ParamAngleX/Z) are not base-owned, so the omit-on-off contract cannot fall
-back cleanly → physics/motion snap (documented risk). AC requires only two accents; both
-shipped accents touch base-owned params exclusively, so "releases cleanly / no stutter" is
-satisfied by construction.
-**Alternative:** Ship head-tilt now behind easing — rejected: still risks the snap on
-mid-motion release and adds an untestable coupling to motion/physics timing.
+constraint: not buried in DOM-coupled `facial.js`). The two eye/brow/mouth accents touch
+base-owned params, so they release by construction; head-tilt is the one accent whose
+params (ParamAngleX/Z) are not base-owned, so it carries the DD-10 special release.
+**Alternative:** Defer head-tilt — rejected by the user, who wants the vtuber head-tilt in
+this iteration; DD-10 mitigates the release risk.
 
 ### DD-5: Anti-flicker = Schmitt dual-threshold + sustain gate + easing envelope
 
@@ -112,12 +113,13 @@ files and touches the scheduler path the issue marks off-limits.
 
 ### DD-7: The two concrete accents
 
-| Accent | Trigger signal (from arkit) | on / off / sustain | Params while active (all base-owned) |
+| Accent | Trigger signal (from arkit) | on / off / sustain | Params while active |
 |---|---|---|---|
-| **joy-squint** | `(MouthSmileLeft+MouthSmileRight)/2` (optionally +CheekSquint) | 0.6 / 0.4 / ~250 ms | `ParamEyeLSmile:1, ParamEyeRSmile:1, ParamMouthForm` boosted (~1.0) |
-| **amazement-wide-eyes** | `max(EyeWideLeft, EyeWideRight)` (optionally +BrowInnerUp) | 0.5 / 0.3 / ~120 ms | `ParamEyeLOpen:1.6, ParamEyeROpen:1.6` (past 1.0 via layering), `ParamBrowLY:1, ParamBrowRY:1` (brow pop) |
+| **joy-squint** | `(MouthSmileLeft+MouthSmileRight)/2` (optionally +CheekSquint) | 0.6 / 0.4 / ~250 ms | `ParamEyeLSmile:1, ParamEyeRSmile:1, ParamMouthForm` boosted (~1.0) — base-owned |
+| **amazement-wide-eyes** | `max(EyeWideLeft, EyeWideRight)` (optionally +BrowInnerUp) | 0.5 / 0.3 / ~120 ms | `ParamEyeLOpen:1.6, ParamEyeROpen:1.6` (past 1.0 via layering), `ParamBrowLY:1, ParamBrowRY:1` (brow pop) — base-owned |
+| **head-tilt** | sustained joy — `(MouthSmileLeft+MouthSmileRight)/2` (distinct longer sustain from joy-squint) | 0.55 / 0.35 / ~600 ms | `ParamAngleZ:~9°` (gentle tilt) — **NOT base-owned**, uses DD-10 ease-to-zero release |
 
-Thresholds/targets are config values in `accents.js`, tunable as data. Neither accent emits
+Thresholds/targets are config values in `accents.js`, tunable as data. No accent emits
 ParamMouthOpenY or JawOpen (mouth *open* stays owned by `mouth.js`; mouth *form* is fair game).
 
 ### DD-8: A/B verdict is recorded in the execution report + issue comment (no new ADR)
@@ -142,6 +144,24 @@ live frontend, gated after the run — the same acceptance model as #44/#45.
 test cannot assert; the agent supplies measurable evidence, the human supplies the verdict.
 **Alternative:** Claim acceptance from automated captures alone — rejected: contradicts the
 issue's stated acceptance bar.
+
+### DD-10: Head-tilt release is ease-to-zero-before-omit (snap mitigation)
+
+**Decision:** The head-tilt accent (ParamAngleZ) never does a raw omit-on-off. Its state
+machine has three phases: **ramp** (env eases 0→1, angle eases toward target while active),
+**hold**, and **release** (on deactivation env eases target→0 with a slow alpha ~0.12).
+`step` keeps writing the eased `ParamAngleZ` while `|angle| > ε`; only once the eased angle
+is within ε of 0 does it **omit** the key, handing control back to motion/physics from a
+near-neutral pose. `reset()` (called by `facial.release()` between turns) snaps state to
+idle and omits the key immediately — acceptable because the avatar is already transitioning
+to idle motion at turn end.
+**Rationale:** The documented stutter risk is the discontinuity between the pinned angle and
+the motion/physics angle at the omit instant. Easing the written angle to ~0 first bounds
+that discontinuity to the small idle-sway amplitude around neutral, instead of the full
+tilt magnitude. The slow release alpha keeps the tilt-down visibly smooth.
+**Alternative:** Instant omit (as the base-owned accents use) — rejected here: snaps from
+the full ~9° tilt to the motion/physics angle. A one-frame cross-fade — rejected: still a
+visible pop at 30 fps; the multi-frame ease reads as an intentional settle.
 
 ## Tasks
 
@@ -199,14 +219,17 @@ issue's stated acceptance bar.
 - **Depends on:** none
 - **Scope:** M
 - **What:** `createAccents({ now } = {})` → `{ step(arkit), reset() }` implementing
-  joy-squint + amazement-wide-eyes per DD-5/DD-7.
+  joy-squint + amazement-wide-eyes + head-tilt per DD-5/DD-7/DD-10.
 - **How:** Config array of accent descriptors
-  `{ id, signal(arkit), on, off, sustainMs, target:{paramId:value} }`. Per-accent state
-  `{ active, sinceAbove, env }`. `step`: for each accent compute signal, apply Schmitt
-  latch + sustain gate (via `now()`), lerp `env` toward 1/0 (one-pole), and add its keys
-  only when `active || env > ε`, scaling target contribution by `env` for a smooth pop-in.
-  `reset`: clear all latches/timers/envelopes. Never emit ParamMouthOpenY/JawOpen. Inject
-  `now` default `() => performance.now()`.
+  `{ id, signal(arkit), on, off, sustainMs, target:{paramId:value}, release }`. Per-accent
+  state `{ active, sinceAbove, env }`. `step`: for each accent compute signal, apply
+  Schmitt latch + sustain gate (via `now()`), lerp `env` toward 1/0 (one-pole), and add its
+  keys only when `active || env > ε`, scaling target contribution by `env` for a smooth
+  pop-in. **Head-tilt** carries `release: 'ease-to-zero'` (DD-10): a slower release alpha
+  (~0.12) and it keeps writing the eased `ParamAngleZ` until `|angle| < ε`, only then
+  omitting the key. `reset`: clear all latches/timers/envelopes (head-tilt included → key
+  omitted immediately). Never emit ParamMouthOpenY/JawOpen. Inject `now` default
+  `() => performance.now()`.
 - **Context:** `infra/pi/web/static/js/mouth.js:140` (one-pole lerp), `mouth.js:21`
   (makeRing, if a time-windowed sustain buffer is preferred); ARKit key names
   `infra/desktop/a2f/arkit.py:13-40`.
@@ -239,8 +262,11 @@ issue's stated acceptance bar.
   on-threshold → `{}`; above on but before `sustainMs` → still `{}`; sustained → params
   present and `ParamEyeLOpen > 1`; alternating just-below/just-above off-threshold → stays
   active (Schmitt, no flicker); drop below off → deactivates and key omitted; `reset()`
-  clears state; both accents active independently; **no `ParamMouthOpenY`/`JawOpen` ever in
-  output**. Reuse the arkit-map.test.mjs counter idiom + `process.exit(0)`.
+  clears state; accents active independently; **no `ParamMouthOpenY`/`JawOpen` ever in
+  output**. **Head-tilt specifics (DD-10):** on deactivation `ParamAngleZ` is still written
+  and its magnitude strictly decreases toward 0 over successive `step`s (ease-to-zero), and
+  the key is omitted only once `|ParamAngleZ| < ε`; `reset()` omits it immediately. Reuse
+  the arkit-map.test.mjs counter idiom + `process.exit(0)`.
 - **Context:** `infra/pi/web/static/js/arkit-map.test.mjs` (test idiom).
 - **Verify:** `node --test infra/pi/web/static/js/*.test.mjs 2>&1 | tail -20` — green.
 
@@ -256,9 +282,10 @@ issue's stated acceptance bar.
   from #40/#44-45), drive repeatable emotional frames via `window.__a2fInject`, and capture
   Live2D param amplitudes with amplification vs without; confirm `?facedebug=1` overlay
   still shows raw frames and `window.__a2fInject` still applies; confirm the face releases
-  to idle between turns and neutral speech is not grotesque (no permanent overacting).
-  Record the written A/B verdict (DD-8). Final perceived acceptance = user visual check
-  (DD-9).
+  to idle between turns and neutral speech is not grotesque (no permanent overacting);
+  confirm the **head-tilt** eases down and does not stutter the idle head-sway when it
+  releases (DD-10). Record the written A/B verdict (DD-8). Final perceived acceptance =
+  user visual check (DD-9).
 - **Context:** —
 - **Verify:** `node --test infra/pi/web/static/js/*.test.mjs 2>&1 | tail -20` — all green;
   A/B verdict written.
@@ -287,13 +314,13 @@ From issue #41 acceptance criteria:
 - Expander curves implemented in the mapping layer, per-group tunable, covered by unit
   tests (extend `arkit-map.test.mjs` style; `node --test infra/pi/web/static/js/*.test.mjs`
   green).
-- At least two discrete accents (joy-squint, amazement-wide-eyes) with thresholds/hysteresis
-  so they don't flicker frame-to-frame.
+- At least two discrete accents (here three: joy-squint, amazement-wide-eyes, head-tilt)
+  with thresholds/hysteresis so they don't flicker frame-to-frame.
 - A/B check recorded (written verdict): emotional reply with A2F vs `?lipsync=volume` — A2F
   variant clearly more expressive; neutral speech does not look grotesque (no permanent
   overacting).
-- Face still releases cleanly to idle between turns; head-angle accents don't stutter idle
-  motions (head-tilt deferred, so no risk this iteration).
+- Face still releases cleanly to idle between turns; the head-tilt accent eases to zero
+  before releasing (DD-10) so it does not stutter idle head-sway motions.
 - `?facedebug=1` overlay and `window.__a2fInject` still work.
 
 ## Materials
