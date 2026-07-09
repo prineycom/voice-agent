@@ -323,7 +323,7 @@ export function createFaceRenderer(container, { log } = {}) {
 
     // Build marker so we can confirm from the on-page Лог panel WHICH renderer
     // code is live (rules out browser caching when diagnosing visual changes).
-    log && log('face3d build B7: lip-roll OFF · blink+sway ON · head bone=' + (headBone ? headBone.name : 'none'));
+    log && log('face3d B8 · pucker=' + MORPH_GAIN.mouthPucker + ' funnel=' + MORPH_GAIN.mouthFunnel + ' rollU=' + (MORPH_GAIN.mouthRollUpper ?? 1) + ' · blink+sway ON · head=' + (headBone ? headBone.name : 'none'));
 
     ready = true;
     renderLoop();
