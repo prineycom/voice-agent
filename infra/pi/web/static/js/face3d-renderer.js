@@ -144,13 +144,16 @@ export function createFaceRenderer(container, { log } = {}) {
         log && log('3D-модель без morph-целей — лицо не будет анимировано');
       }
 
-      // Frame a fixed camera on the head. Use the model's bounding box so the
-      // static placeholder (a small sphere near origin) and a real head-height RPM
-      // mesh both end up filling the view. We aim at the top portion of the box
-      // (roughly where a head sits) and pull the camera back to fit vertically.
-      const box = new THREE.Box3().setFromObject(gltfRoot);
+      // Frame the camera on the HEAD, not the whole model — a full-body RPM avatar's
+      // bounding box would shrink the face to a distant speck. Prefer the head mesh
+      // (RPM's `Wolf3D_Head`); fall back to the whole model, which is correct for the
+      // placeholder sphere (it has no head-named mesh, so it frames the sphere).
+      scene.updateMatrixWorld(true);
+      let focus = null;
+      gltfRoot.traverse((o) => { if (!focus && o.geometry && /head/i.test(o.name)) focus = o; });
+      const box = new THREE.Box3().setFromObject(focus || gltfRoot);
       if (box.isEmpty()) {
-        // Degenerate bounds — fall back to a sane head-height framing.
+        // Degenerate bounds — sane head-height framing.
         camera.position.set(0, 1.6, 0.6);
         camera.lookAt(0, 1.6, 0);
       } else {
@@ -158,19 +161,13 @@ export function createFaceRenderer(container, { log } = {}) {
         const center = new THREE.Vector3();
         box.getSize(size);
         box.getCenter(center);
-        // Target: bias toward the top of the model (head) for full-body-ish meshes;
-        // for a centered sphere the bias is negligible.
-        const target = new THREE.Vector3(
-          center.x,
-          center.y + size.y * 0.35,
-          center.z,
-        );
-        // Distance to fit the head extent in the vertical FOV, with headroom.
-        const headExtent = Math.max(size.y * 0.35, size.x, 0.001);
+        // Fit the head's larger planar extent in the FOV with headroom, and sit the
+        // camera in front (+Z — the side RPM avatars face) at head level.
+        const extent = Math.max(size.x, size.y, 0.001);
         const fov = (camera.fov * Math.PI) / 180;
-        const dist = (headExtent / Math.tan(fov / 2)) * 1.6 + size.z;
-        camera.position.set(target.x, target.y, target.z + dist);
-        camera.lookAt(target);
+        const dist = (extent / 2 / Math.tan(fov / 2)) * 1.5 + size.z;
+        camera.position.set(center.x, center.y, center.z + dist);
+        camera.lookAt(center.x, center.y, center.z);
       }
       camera.updateProjectionMatrix();
 
