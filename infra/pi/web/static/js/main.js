@@ -12,6 +12,7 @@ import { createMotionController } from './motion.js';
 import { createLipSync } from './lipsync.js';
 import { createMouth } from './mouth.js';
 import { createFacial } from './facial.js';
+import { createAccents } from './accents.js';
 import { createBlendshapes } from './blendshapes.js';
 import { createFaceDebug } from './facedebug.js';
 
@@ -56,7 +57,7 @@ const mouth = createMouth(avatar, { log: logger.log, forceVolume });
 const lipsync = createLipSync(mouth.volumeSink, { log: logger.log });
 // A2F loose-sync face (eyes/gaze/brows/squint/mouth-form) + the DataChannel
 // consumer that drives both face and mouth from `voiceagent` blendshape frames.
-const facial = createFacial(avatar);
+const facial = createFacial(avatar, { accents: createAccents() });
 const blendshapes = createBlendshapes({ facial, mouth, log: logger.log, debug: debugFace });
 
 let lastAgentState = null;
