@@ -39,6 +39,16 @@ approx(lookLeft.ParamEyeBallX, 1, 'look-left -> ParamEyeBallX ~+1');
 approx(arkitToLive2D({ MouthSmileLeft: 1, MouthSmileRight: 1 }).ParamMouthForm, 1, 'smile -> ParamMouthForm ~+1');
 approx(arkitToLive2D({ MouthFrownLeft: 1, MouthFrownRight: 1 }).ParamMouthForm, -1, 'frown -> ParamMouthForm ~-1');
 
+// Expander amplifies the mid-range: a 0.3 smile lifts above the old linear 0.3.
+ok(arkitToLive2D({ MouthSmileLeft: 0.3, MouthSmileRight: 0.3 }).ParamMouthForm > 0.3, 'mid smile -> ParamMouthForm amplified >0.3');
+// Noise-floor: a tiny smile compresses toward the rest frame.
+ok(arkitToLive2D({ MouthSmileLeft: 0.03, MouthSmileRight: 0.03 }).ParamMouthForm < 0.03, 'tiny smile -> ParamMouthForm compressed <0.03');
+// Endpoints are preserved (not pushed past 1) — full smile holds exactly +1.
+eq(arkitToLive2D({ MouthSmileLeft: 1, MouthSmileRight: 1 }).ParamMouthForm, 1, 'full smile -> ParamMouthForm exactly 1');
+// Neutral rest frame stays +0 (not -0) on the expander-shaped params.
+ok(Object.is(neutral.ParamMouthForm, 0), 'neutral -> ParamMouthForm +0 not -0');
+ok(Object.is(neutral.ParamBrowLAngle, 0), 'neutral -> ParamBrowLAngle +0 not -0');
+
 // Brow-down sets the angle to -1 and clamps the (negative) height to -1.
 const browDown = arkitToLive2D({ BrowDownLeft: 1 });
 eq(browDown.ParamBrowLAngle, -1, 'BrowDownLeft:1 -> ParamBrowLAngle -1');
