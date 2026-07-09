@@ -36,12 +36,19 @@ const HEAD_ROLL = 0.022;
 // those back so speech reads naturally. jawOpen (the main open/close) and the
 // smile/frown shapes are left at full strength.
 const MORPH_GAIN = {
+  // Root cause of the "upper lip covers the lower on б/п/м" artifact: A2F
+  // over-emits the lip-ROLL channel across all voiced speech (MouthRollUpper
+  // mean ~0.38, pins to 1.0 on bilabials). Rolling tucks the lips inward; at
+  // those magnitudes RPM's mouthRollUpper curls the upper lip down over the
+  // lower. The old Live2D pipeline never showed this because it drove the mouth
+  // with ONLY open (ParamMouthOpenY) + form (ParamMouthForm) and discarded roll
+  // entirely. Bilabial closure is already correct from jawOpen + mouthClose, so
+  // we drop the unreliable roll channel rather than fight its magnitude.
+  mouthRollUpper: 0,
+  mouthRollLower: 0,
+  // Pucker/funnel are also A2F-over-driven ("duck lips") — kept but halved.
   mouthPucker: 0.5,
   mouthFunnel: 0.5,
-  // mouthRollUpper peaks at 1.0 on bilabials (П/Б/М) and on RPM curls the upper
-  // lip down over the lower one — kept low so lip closures read naturally.
-  mouthRollUpper: 0.3,
-  mouthRollLower: 0.5,
   mouthShrugUpper: 0.4,
   mouthShrugLower: 0.6,
 };
