@@ -34,6 +34,7 @@ from livekit.api import AccessToken, DeleteRoomRequest, LiveKitAPI, VideoGrants
 
 HERE = Path(__file__).resolve().parent
 INDEX_HTML = HERE / "index.html"
+FACE3D_HTML = HERE / "face3d.html"
 STATIC_ROOT = HERE / "static"
 # The Agent Worker's .env is the single source of truth for LiveKit creds.
 AGENT_ENV = HERE.parent / "agent" / ".env"
@@ -186,6 +187,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(
                 200,
                 INDEX_HTML.read_bytes(),
+                "text/html; charset=utf-8",
+            )
+            return
+
+        if route == "/face3d" or route == "/face3d.html":
+            if not FACE3D_HTML.exists():
+                self._send(500, b"face3d.html missing", "text/plain; charset=utf-8")
+                return
+            self._send(
+                200,
+                FACE3D_HTML.read_bytes(),
                 "text/html; charset=utf-8",
             )
             return
