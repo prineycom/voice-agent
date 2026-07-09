@@ -49,10 +49,17 @@ const motion = { setState() {}, applyMotionEvent() {} };
 
 let lastAgentState = null;
 
+// Offline demo replayer: ?demo=joy|anger replays a recorded A2F calibration
+// capture through window.__a2fInject after the face is loaded (issue #46 AC#3).
+const demo = new URLSearchParams(location.search).get('demo');
+
 renderer.init().then((ok) => {
   if (ok) {
     const h = document.getElementById('avatarHint');
     if (h) h.remove();
+  }
+  if (ok && (demo === 'joy' || demo === 'anger')) {
+    import('./face3d-demo.js').then((m) => m.startFaceDemo(demo, { log: logger.log }));
   }
 }).catch((e) => logger.log('3D face: ' + e.message));
 
