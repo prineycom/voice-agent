@@ -55,6 +55,18 @@ const MORPH_GAIN = {
   mouthShrugLower: 0.6,
 };
 
+// Hard per-morph ceilings, applied AFTER gain. `mouthClose` is the root cause of
+// the "upper lip rolls over the lower on б/п/м" collapse: this RPM avatar's
+// mouthClose morph is badly authored and drags the upper lip down past ~0.25,
+// but A2F sends it up to 1.0 on bilabials. A gain can't both seal typical values
+// and cap extremes, so we clamp: any mouthClose ≥ the cap renders as a natural
+// gentle lip seal (verified by headless render) instead of collapsing. Live2D
+// avoided this entirely by folding mouthClose into the jaw and never applying the
+// morph; the cap is the 3D equivalent.
+const MORPH_MAX = {
+  mouthClose: 0.15,
+};
+
 // Lipsync morphs stay crisp (written directly); everything else is smoothed.
 function isFastMorph(name) {
   return name.startsWith('mouth') || name.startsWith('jaw') || name.startsWith('tongue');
@@ -323,7 +335,7 @@ export function createFaceRenderer(container, { log } = {}) {
 
     // Build marker so we can confirm from the on-page Лог panel WHICH renderer
     // code is live (rules out browser caching when diagnosing visual changes).
-    log && log('face3d B8 · pucker=' + MORPH_GAIN.mouthPucker + ' funnel=' + MORPH_GAIN.mouthFunnel + ' rollU=' + (MORPH_GAIN.mouthRollUpper ?? 1) + ' · blink+sway ON · head=' + (headBone ? headBone.name : 'none'));
+    log && log('face3d B9 · mouthCloseMax=' + MORPH_MAX.mouthClose + ' pucker=' + MORPH_GAIN.mouthPucker + ' rollU=' + (MORPH_GAIN.mouthRollUpper ?? 1) + ' · blink+sway ON');
 
     ready = true;
     renderLoop();
@@ -334,8 +346,13 @@ export function createFaceRenderer(container, { log } = {}) {
   function applyMorphs(map) {
     if (!ready || !map) return;
     // `?? 1` not `|| 1`: a gain of 0 (roll morphs) is falsy and `|| 1` would
-    // silently restore it to full strength.
-    for (const name in map) targetMorphs[name] = map[name] * (MORPH_GAIN[name] ?? 1);
+    // silently restore it to full strength. Then clamp to any per-morph ceiling.
+    for (const name in map) {
+      let v = map[name] * (MORPH_GAIN[name] ?? 1);
+      const mx = MORPH_MAX[name];
+      if (mx !== undefined && v > mx) v = mx;
+      targetMorphs[name] = v;
+    }
   }
 
   return {
