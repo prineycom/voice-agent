@@ -319,6 +319,10 @@ export function createFaceRenderer(container, { log } = {}) {
     nextBlinkAt = startT + 1200;
     blinkStart = -1;
 
+    // Build marker so we can confirm from the on-page Лог panel WHICH renderer
+    // code is live (rules out browser caching when diagnosing visual changes).
+    log && log('face3d build B7: lip-roll OFF · blink+sway ON · head bone=' + (headBone ? headBone.name : 'none'));
+
     ready = true;
     renderLoop();
     return true;
