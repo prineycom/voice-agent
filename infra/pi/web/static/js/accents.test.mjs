@@ -78,8 +78,8 @@ const smile = v => ({ MouthSmileLeft: v, MouthSmileRight: v });
   ok(stayed, 'Schmitt hysteresis: signal between off/on keeps accent active (no flicker)');
 }
 
-// 4. Deactivate + omit — drop below `off` and decay: the keys are ABSENT from
-// the output (omitted), never written as 0.
+// 4. Deactivate + omit — drop below `off` and decay: the keys joy-squint writes
+// are ABSENT from the output (omitted), never written as 0.
 {
   const m = machine();
   m.run(JOY, 15);
@@ -87,7 +87,6 @@ const smile = v => ({ MouthSmileLeft: v, MouthSmileRight: v });
   const off = m.run({}, 40); // long enough for the envelope to fall below EPS
   ok(!('ParamEyeLSmile' in off), 'released accent OMITS ParamEyeLSmile (not 0)');
   ok(!('ParamEyeRSmile' in off), 'released accent OMITS ParamEyeRSmile');
-  ok(!('ParamMouthForm' in off), 'released accent OMITS ParamMouthForm');
 }
 
 // 5. Wide-eyes floor — amazement opens the eye past base 1 when active, and a

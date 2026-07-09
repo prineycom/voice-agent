@@ -49,6 +49,19 @@ eq(arkitToLive2D({ MouthSmileLeft: 1, MouthSmileRight: 1 }).ParamMouthForm, 1, '
 ok(Object.is(neutral.ParamMouthForm, 0), 'neutral -> ParamMouthForm +0 not -0');
 ok(Object.is(neutral.ParamBrowLAngle, 0), 'neutral -> ParamBrowLAngle +0 not -0');
 
+// Eye-squint smile is expander-wired (GROUP_CURVES.eyes): a 0.3 squint amplifies
+// above the old linear 0.3, a tiny squint compresses toward 0, and rest stays +0.
+ok(arkitToLive2D({ EyeSquintLeft: 0.3 }).ParamEyeLSmile > 0.3, 'mid squint -> ParamEyeLSmile amplified >0.3');
+ok(arkitToLive2D({ EyeSquintRight: 0.3 }).ParamEyeRSmile > 0.3, 'mid squint -> ParamEyeRSmile amplified >0.3');
+ok(arkitToLive2D({ EyeSquintLeft: 0.03 }).ParamEyeLSmile < 0.03, 'tiny squint -> ParamEyeLSmile compressed <0.03');
+ok(Object.is(neutral.ParamEyeLSmile, 0), 'neutral -> ParamEyeLSmile +0 not -0');
+
+// Cheek squint (avg of both sides) is expander-wired (GROUP_CURVES.cheeks): a 0.3
+// cheek amplifies above the old linear 0.3, a tiny cheek compresses, rest stays +0.
+ok(arkitToLive2D({ CheekSquintLeft: 0.3, CheekSquintRight: 0.3 }).ParamCheek > 0.3, 'mid cheek -> ParamCheek amplified >0.3');
+ok(arkitToLive2D({ CheekSquintLeft: 0.03, CheekSquintRight: 0.03 }).ParamCheek < 0.03, 'tiny cheek -> ParamCheek compressed <0.03');
+ok(Object.is(neutral.ParamCheek, 0), 'neutral -> ParamCheek +0 not -0');
+
 // Brow-down sets the angle to -1 and clamps the (negative) height to -1.
 const browDown = arkitToLive2D({ BrowDownLeft: 1 });
 eq(browDown.ParamBrowLAngle, -1, 'BrowDownLeft:1 -> ParamBrowLAngle -1');

@@ -25,7 +25,7 @@
 
 const EPS = 1e-3;        // envelope below this ≈ off; keys omitted
 const EPS_ANGLE = 0.1;   // ease-to-zero release: omit ParamAngleZ within this of 0
-const ALPHA = 0.3;       // base one-pole easing rate (mirrors mouth.js 0.5 lerp)
+const ALPHA = 0.3;       // base one-pole easing rate — same lerp idiom as mouth.js (0.5), deliberately tuned slower (0.3) for accent pacing
 const ALPHA_RELEASE = 0.12; // slower release for ease-to-zero accents (head tilt)
 
 // Accent descriptors — all tunable data. `signal(g)` reads the sparse ARKit
@@ -35,15 +35,18 @@ const ALPHA_RELEASE = 0.12; // slower release for ease-to-zero accents (head til
 // 'ease-to-zero' (non-base-owned param, decay smoothly before dropping).
 const ACCENTS = [
   {
-    // Joy squint: a broad smile crinkles the eyes and forms the mouth. All
-    // three targets are base-owned, so an instant release just hands control
-    // back to the continuous map.
+    // Joy squint: a broad smile crinkles the eyes. Only the eye-smile targets
+    // are the accent's contribution — ParamMouthForm is deliberately NOT a
+    // target because the base map already drives it near-full on a sustained
+    // strong smile, and re-asserting it here would dip-then-ramp (un-smile then
+    // re-smile) as the envelope eases up. Both targets are base-owned, so an
+    // instant release just hands control back to the continuous map.
     id: 'joy-squint',
     signal: g => (g('MouthSmileLeft') + g('MouthSmileRight')) / 2,
     on: 0.6,
     off: 0.4,
     sustainMs: 250,
-    target: { ParamEyeLSmile: 1, ParamEyeRSmile: 1, ParamMouthForm: 1 },
+    target: { ParamEyeLSmile: 1, ParamEyeRSmile: 1 },
     release: 'instant',
   },
   {
@@ -99,7 +102,7 @@ export function createAccents({ now } = {}) {
 
       // Schmitt + sustain latch.
       if (s.active) {
-        if (sig < a.off) s.active = false;
+        if (sig < a.off) { s.active = false; s.sinceAbove = null; }
       } else {
         if (sig >= a.on) {
           if (s.sinceAbove === null) s.sinceAbove = t;
@@ -108,8 +111,6 @@ export function createAccents({ now } = {}) {
           s.sinceAbove = null;
         }
       }
-      // Once inactive again, next rising edge must re-dwell.
-      if (!s.active && sig < a.on) s.sinceAbove = null;
 
       // One-pole easing envelope toward the latch state. Head-tilt style
       // accents ease DOWN slowly (ease-to-zero release) so the pose settles.
