@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Voice Agent — 3D face</title>
+<link rel="stylesheet" href="static/css/styles.css">
+</head>
+<body>
+<header>
+  <button id="sidebarBtn" aria-label="Меню" aria-expanded="false">☰</button>
+  <h1>🎙️ Voice Agent — тест-стенд</h1>
+  <span id="connState" class="badge idle">отключено</span>
+  <span id="agentState" class="badge idle">агент: —</span>
+  <div class="mic">
+    <div class="vu"><div id="vuBar"></div></div>
+    <small id="micLabel" style="color:#8b97a8">не активен</small>
+  </div>
+  <span class="grow"></span>
+  <button id="muteBtn" disabled>🔇 Mute</button>
+  <button id="connectBtn" class="primary">Connect</button>
+</header>
+<main>
+  <aside>
+    <div class="panel">
+      <h2>Латенси (voice-to-voice)</h2>
+      <div class="metric"><span id="latency">—</span> <small>мс</small></div>
+      <small style="color:#5b6675">от конца твоей речи до ответа агента</small>
+    </div>
+    <div class="panel">
+      <h2>⚙️ Фоновые операции</h2>
+      <div id="ops"><div class="ops-empty">нет активных</div></div>
+    </div>
+    <div class="panel">
+      <h2>🔧 Инструменты</h2>
+      <div id="toolfeed"><div class="ops-empty">пока пусто</div></div>
+    </div>
+    <div class="panel">
+      <h2>Лог</h2>
+      <div id="log" style="font-size:12px;color:#8b97a8;max-height:160px;overflow-y:auto;white-space:pre-wrap"></div>
+    </div>
+  </aside>
+  <div class="stage">
+    <div id="avatar">
+      <span class="avatar-hint" id="avatarHint">загрузка аватара…</span>
+    </div>
+    <section id="transcript">
+      <div class="empty" id="emptyHint">Нажми <b>Connect</b> и разреши доступ к микрофону.<br>Агент поздоровается первым.</div>
+    </section>
+    <form id="composer" autocomplete="off">
+      <input id="composerInput" type="text" placeholder="Напиши сообщение агенту…" disabled aria-label="Текстовое сообщение агенту" />
+      <button id="composerSend" type="submit" class="primary" disabled>Отправить</button>
+    </form>
+  </div>
+  <div id="scrim"></div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<script type="importmap">
+{ "imports": {
+    "three": "/static/js/vendor/three.module.js",
+    "three/addons/": "/static/js/vendor/jsm/"
+}}
+</script>
+<script type="module" src="static/js/face3d-main.js"></script>
+</body>
+</html>
