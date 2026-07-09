@@ -31,6 +31,19 @@ const HEAD_YAW = 0.055;
 const HEAD_PITCH = 0.035;
 const HEAD_ROLL = 0.022;
 
+// RPM renders some ARKit lip shapes far more strongly than the A2F signal
+// intends — pucker/funnel/roll drive the "duck lips" and "sucked-in" look. Scale
+// those back so speech reads naturally. jawOpen (the main open/close) and the
+// smile/frown shapes are left at full strength.
+const MORPH_GAIN = {
+  mouthPucker: 0.5,
+  mouthFunnel: 0.5,
+  mouthRollUpper: 0.5,
+  mouthRollLower: 0.5,
+  mouthShrugUpper: 0.6,
+  mouthShrugLower: 0.6,
+};
+
 // Lipsync morphs stay crisp (written directly); everything else is smoothed.
 function isFastMorph(name) {
   return name.startsWith('mouth') || name.startsWith('jaw') || name.startsWith('tongue');
@@ -302,10 +315,10 @@ export function createFaceRenderer(container, { log } = {}) {
     return true;
   }
 
-  // Per-frame sink: record targets; the render loop applies/eases them.
+  // Per-frame sink: record targets (with per-morph gain); the render loop eases them.
   function applyMorphs(map) {
     if (!ready || !map) return;
-    for (const name in map) targetMorphs[name] = map[name];
+    for (const name in map) targetMorphs[name] = map[name] * (MORPH_GAIN[name] || 1);
   }
 
   return {

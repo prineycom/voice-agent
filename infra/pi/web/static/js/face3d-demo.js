@@ -11,6 +11,13 @@
 // and we do NOT call beginA2FStream ourselves — the scheduler opens the stream on
 // the first applied frame and paces by `t` on a wall-clock anchor.
 
+// The #39 A2F calibration captures are emotion-INVERTED at the source: run-joy
+// reads angry (brows down 0.44, mouth-frown) and run-anger reads calm (brows up,
+// barely frowning). Map each demo label to the fixture that actually matches it
+// so the demo is intuitive. This is a data workaround — real emotion fidelity is
+// the deferred "flat A2E source" track, not a rendering fix.
+const FIXTURE = { joy: 'anger', anger: 'joy' };
+
 export function startFaceDemo(label, { log } = {}) {
   const say = (m) => { if (log) log(m); };
 
@@ -35,7 +42,7 @@ export function startFaceDemo(label, { log } = {}) {
   }
   const inject = window.__a2fInject;
 
-  fetch('/static/demo/run-' + label + '.json')
+  fetch('/static/demo/run-' + FIXTURE[label] + '.json')
     .then((r) => {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
