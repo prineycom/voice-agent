@@ -38,9 +38,11 @@ const HEAD_ROLL = 0.022;
 const MORPH_GAIN = {
   mouthPucker: 0.5,
   mouthFunnel: 0.5,
-  mouthRollUpper: 0.5,
+  // mouthRollUpper peaks at 1.0 on bilabials (П/Б/М) and on RPM curls the upper
+  // lip down over the lower one — kept low so lip closures read naturally.
+  mouthRollUpper: 0.3,
   mouthRollLower: 0.5,
-  mouthShrugUpper: 0.6,
+  mouthShrugUpper: 0.4,
   mouthShrugLower: 0.6,
 };
 
