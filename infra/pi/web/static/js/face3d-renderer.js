@@ -327,7 +327,9 @@ export function createFaceRenderer(container, { log } = {}) {
   // Per-frame sink: record targets (with per-morph gain); the render loop eases them.
   function applyMorphs(map) {
     if (!ready || !map) return;
-    for (const name in map) targetMorphs[name] = map[name] * (MORPH_GAIN[name] || 1);
+    // `?? 1` not `|| 1`: a gain of 0 (roll morphs) is falsy and `|| 1` would
+    // silently restore it to full strength.
+    for (const name in map) targetMorphs[name] = map[name] * (MORPH_GAIN[name] ?? 1);
   }
 
   return {
