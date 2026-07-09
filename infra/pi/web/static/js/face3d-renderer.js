@@ -46,9 +46,11 @@ const MORPH_GAIN = {
   // we drop the unreliable roll channel rather than fight its magnitude.
   mouthRollUpper: 0,
   mouthRollLower: 0,
-  // Pucker/funnel are also A2F-over-driven ("duck lips") — kept but halved.
-  mouthPucker: 0.5,
-  mouthFunnel: 0.5,
+  // Pucker/funnel are the real "duck-lips / upper-lip-over-lower" driver: A2F
+  // over-emits them and RPM pushes the lips forward into a pout. Verified by
+  // headless render ablation — 0.5 was still pursed, ~0.2 reads natural.
+  mouthPucker: 0.2,
+  mouthFunnel: 0.2,
   mouthShrugUpper: 0.4,
   mouthShrugLower: 0.6,
 };
