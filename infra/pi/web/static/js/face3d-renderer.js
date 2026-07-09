@@ -86,85 +86,88 @@ export function createFaceRenderer(container, { log } = {}) {
     const w = container.clientWidth || 1;
     const h = container.clientHeight || 1;
 
-    scene = new THREE.Scene();
-    scene.background = null; // transparent — let the page/container show through
-
-    camera = new THREE.PerspectiveCamera(30, w / h, 0.01, 100);
-
-    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(window.devicePixelRatio || 1);
-    renderer.setSize(w, h, false);
-    container.appendChild(renderer.domElement);
-
-    // Lighting: hemisphere fill so morph deltas read on both sides + a directional
-    // key so the head has form and shadowed morph motion is visible.
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x444455, 1.4);
-    scene.add(hemi);
-    const key = new THREE.DirectionalLight(0xffffff, 1.6);
-    key.position.set(0.5, 1.0, 1.0);
-    scene.add(key);
-
-    let gltf;
+    // Wrap the WHOLE setup — scene/camera build, WebGLRenderer construction (which
+    // throws "Error creating WebGL context" on a GPU-less/WebGL-disabled browser),
+    // canvas mount, and model load — so ANY failure cleans up, logs, and resolves
+    // false rather than rejecting. That boolean is the caller's fallback signal.
     try {
+      scene = new THREE.Scene();
+      scene.background = null; // transparent — let the page/container show through
+
+      camera = new THREE.PerspectiveCamera(30, w / h, 0.01, 100);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio || 1);
+      renderer.setSize(w, h, false);
+      container.appendChild(renderer.domElement);
+
+      // Lighting: hemisphere fill so morph deltas read on both sides + a directional
+      // key so the head has form and shadowed morph motion is visible.
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x444455, 1.4);
+      scene.add(hemi);
+      const key = new THREE.DirectionalLight(0xffffff, 1.6);
+      key.position.set(0.5, 1.0, 1.0);
+      scene.add(key);
+
       const loader = new GLTFLoader();
-      gltf = await loader.loadAsync(MODEL_URL);
-    } catch (e) {
-      log && log('загрузка 3D-модели не удалась: ' + (e && e.message ? e.message : e));
-      teardown();
-      return false;
-    }
+      const gltf = await loader.loadAsync(MODEL_URL);
 
-    gltfRoot = gltf.scene || (gltf.scenes && gltf.scenes[0]);
-    if (!gltfRoot) {
-      log && log('3D-модель без сцены');
-      teardown();
-      return false;
-    }
-    scene.add(gltfRoot);
-
-    // Collect every mesh that can be morph-driven (head, teeth, eyes, ...).
-    morphMeshes = [];
-    gltfRoot.traverse((obj) => {
-      if (obj.morphTargetDictionary && obj.morphTargetInfluences) {
-        morphMeshes.push(obj);
+      gltfRoot = gltf.scene || (gltf.scenes && gltf.scenes[0]);
+      if (!gltfRoot) {
+        log && log('3D-модель без сцены');
+        teardown();
+        return false;
       }
-    });
-    if (morphMeshes.length === 0) {
-      log && log('3D-модель без morph-целей — лицо не будет анимировано');
-    }
+      scene.add(gltfRoot);
 
-    // Frame a fixed camera on the head. Use the model's bounding box so the
-    // static placeholder (a small sphere near origin) and a real head-height RPM
-    // mesh both end up filling the view. We aim at the top portion of the box
-    // (roughly where a head sits) and pull the camera back to fit vertically.
-    const box = new THREE.Box3().setFromObject(gltfRoot);
-    if (box.isEmpty()) {
-      // Degenerate bounds — fall back to a sane head-height framing.
-      camera.position.set(0, 1.6, 0.6);
-      camera.lookAt(0, 1.6, 0);
-    } else {
-      const size = new THREE.Vector3();
-      const center = new THREE.Vector3();
-      box.getSize(size);
-      box.getCenter(center);
-      // Target: bias toward the top of the model (head) for full-body-ish meshes;
-      // for a centered sphere the bias is negligible.
-      const target = new THREE.Vector3(
-        center.x,
-        center.y + size.y * 0.35,
-        center.z,
-      );
-      // Distance to fit the head extent in the vertical FOV, with headroom.
-      const headExtent = Math.max(size.y * 0.35, size.x, 0.001);
-      const fov = (camera.fov * Math.PI) / 180;
-      const dist = (headExtent / Math.tan(fov / 2)) * 1.6 + size.z;
-      camera.position.set(target.x, target.y, target.z + dist);
-      camera.lookAt(target);
-    }
-    camera.updateProjectionMatrix();
+      // Collect every mesh that can be morph-driven (head, teeth, eyes, ...).
+      morphMeshes = [];
+      gltfRoot.traverse((obj) => {
+        if (obj.morphTargetDictionary && obj.morphTargetInfluences) {
+          morphMeshes.push(obj);
+        }
+      });
+      if (morphMeshes.length === 0) {
+        log && log('3D-модель без morph-целей — лицо не будет анимировано');
+      }
 
-    ro = new ResizeObserver(() => sizeToContainer());
-    ro.observe(container);
+      // Frame a fixed camera on the head. Use the model's bounding box so the
+      // static placeholder (a small sphere near origin) and a real head-height RPM
+      // mesh both end up filling the view. We aim at the top portion of the box
+      // (roughly where a head sits) and pull the camera back to fit vertically.
+      const box = new THREE.Box3().setFromObject(gltfRoot);
+      if (box.isEmpty()) {
+        // Degenerate bounds — fall back to a sane head-height framing.
+        camera.position.set(0, 1.6, 0.6);
+        camera.lookAt(0, 1.6, 0);
+      } else {
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        box.getSize(size);
+        box.getCenter(center);
+        // Target: bias toward the top of the model (head) for full-body-ish meshes;
+        // for a centered sphere the bias is negligible.
+        const target = new THREE.Vector3(
+          center.x,
+          center.y + size.y * 0.35,
+          center.z,
+        );
+        // Distance to fit the head extent in the vertical FOV, with headroom.
+        const headExtent = Math.max(size.y * 0.35, size.x, 0.001);
+        const fov = (camera.fov * Math.PI) / 180;
+        const dist = (headExtent / Math.tan(fov / 2)) * 1.6 + size.z;
+        camera.position.set(target.x, target.y, target.z + dist);
+        camera.lookAt(target);
+      }
+      camera.updateProjectionMatrix();
+
+      ro = new ResizeObserver(() => sizeToContainer());
+      ro.observe(container);
+    } catch (e) {
+      log && log('инициализация 3D-лица не удалась: ' + (e && e.message ? e.message : e));
+      teardown();
+      return false;
+    }
 
     ready = true;
     renderLoop();
