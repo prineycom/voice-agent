@@ -53,15 +53,21 @@ let lastAgentState = null;
 // capture through window.__a2fInject after the face is loaded (issue #46 AC#3).
 const demo = new URLSearchParams(location.search).get('demo');
 
+// Handle to a running offline demo. A live connection reclaims __a2fInject by
+// calling demoHandle.stop() in doConnect() so replay + stream don't collide.
+let demoHandle = null;
+
 renderer.init().then((ok) => {
+  const h = document.getElementById('avatarHint');
   if (ok) {
-    const h = document.getElementById('avatarHint');
     if (h) h.remove();
+  } else if (h) {
+    h.textContent = 'не удалось загрузить 3D-аватар';
   }
   if (ok && (demo === 'joy' || demo === 'anger')) {
-    import('./face3d-demo.js').then((m) => m.startFaceDemo(demo, { log: logger.log }));
+    import('./face3d-demo.js').then((m) => { demoHandle = m.startFaceDemo(demo, { log: logger.log }); });
   }
-}).catch((e) => logger.log('3D face: ' + e.message));
+});
 
 window.addEventListener('beforeunload', () => { try { renderer.dispose(); } catch (e) {} });
 
@@ -123,6 +129,9 @@ const hooks = {
 };
 
 function doConnect() {
+  // A live stream owns the face: stop any running offline demo so both don't
+  // feed __a2fInject at once.
+  if (demoHandle) demoHandle.stop();
   room.connect(hooks);
 }
 

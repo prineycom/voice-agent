@@ -48,14 +48,23 @@ export function createFaceRenderer(container, { log } = {}) {
     ro && ro.disconnect();
     ro = null;
 
-    // Dispose geometries/materials before dropping the renderer.
+    // Dispose geometries/materials (and their textures) before dropping the renderer.
+    // material.dispose() does NOT free GPU textures, so we dispose them explicitly.
+    const disposeMaterial = (m) => {
+      if (!m) return;
+      for (const key in m) {
+        const value = m[key];
+        if (value && value.isTexture && value.dispose) value.dispose();
+      }
+      if (m.dispose) m.dispose();
+    };
     if (scene) {
       scene.traverse((obj) => {
         if (obj.geometry && obj.geometry.dispose) obj.geometry.dispose();
         const mat = obj.material;
         if (mat) {
-          if (Array.isArray(mat)) mat.forEach((m) => m && m.dispose && m.dispose());
-          else if (mat.dispose) mat.dispose();
+          if (Array.isArray(mat)) mat.forEach(disposeMaterial);
+          else disposeMaterial(mat);
         }
       });
     }

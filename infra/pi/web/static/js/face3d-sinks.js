@@ -51,7 +51,7 @@ export function createFaceSinks(renderer, { log } = {}) {
         if (grew) zeroMorphs = null; // invalidate neutral cache
         renderer.applyMorphs(morphMap);
       } catch (e) {
-        if (log) log('face3d facial.apply error: ' + (e && e.message));
+        if (log) log('face3d ошибка facial.apply: ' + (e && e.message));
         // swallow — the mouth must still update after us
       }
     },
@@ -59,32 +59,28 @@ export function createFaceSinks(renderer, { log } = {}) {
       try {
         renderer.applyMorphs(neutralMorphs());
       } catch (e) {
-        if (log) log('face3d facial.release error: ' + (e && e.message));
+        if (log) log('face3d ошибка facial.release: ' + (e && e.message));
       }
     },
   };
 
   const mouth = {
     beginA2FStream() {
-      try {
-        // stream active — no per-begin renderer work needed for the jaw sink
-      } catch (e) {
-        if (log) log('face3d mouth.beginA2FStream error: ' + (e && e.message));
-      }
+      // stream active — no per-begin renderer work needed for the jaw sink
     },
     ingestA2FFrame(f) {
       try {
         const jawOpen = clamp01(f && f.arkit ? f.arkit.JawOpen : 0);
         renderer.applyMorphs({ jawOpen });
       } catch (e) {
-        if (log) log('face3d mouth.ingestA2FFrame error: ' + (e && e.message));
+        if (log) log('face3d ошибка mouth.ingestA2FFrame: ' + (e && e.message));
       }
     },
     endA2FStream() {
       try {
         renderer.applyMorphs({ jawOpen: 0 }); // rest the jaw at stream end
       } catch (e) {
-        if (log) log('face3d mouth.endA2FStream error: ' + (e && e.message));
+        if (log) log('face3d ошибка mouth.endA2FStream: ' + (e && e.message));
       }
     },
   };

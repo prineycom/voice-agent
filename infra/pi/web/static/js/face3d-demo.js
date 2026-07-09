@@ -14,10 +14,24 @@
 export function startFaceDemo(label, { log } = {}) {
   const say = (m) => { if (log) log(m); };
 
-  if (label !== 'joy' && label !== 'anger') { say('face demo: unknown label ' + label); return; }
+  // Track every scheduled timer so the demo is cancellable: a live stream must
+  // be able to reclaim __a2fInject (both replay and stream feed the same
+  // consumer, so they fight over the jaw/morphs otherwise).
+  const timers = [];
+  let stopped = false;
+  const handle = {
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      for (const id of timers) clearTimeout(id);
+      timers.length = 0;
+    },
+  };
+
+  if (label !== 'joy' && label !== 'anger') { say('демо лица: неизвестная метка ' + label); return handle; }
   if (typeof window === 'undefined' || typeof window.__a2fInject !== 'function') {
-    say('face demo: __a2fInject unavailable');
-    return;
+    say('демо лица: __a2fInject недоступен');
+    return handle;
   }
   const inject = window.__a2fInject;
 
@@ -27,19 +41,23 @@ export function startFaceDemo(label, { log } = {}) {
       return r.json();
     })
     .then((data) => {
+      if (stopped) return;
       const frames = (data && Array.isArray(data.frames)) ? data.frames : [];
-      if (!frames.length) { say('face demo: no frames in ' + label); return; }
-      say('face demo start: ' + label + ' (' + frames.length + ' frames)');
+      if (!frames.length) { say('демо лица: нет кадров в ' + label); return; }
+      say('старт демо лица: ' + label + ' (' + frames.length + ' кадров)');
       let lastMs = 0;
       for (const frame of frames) {
         const ms = (typeof frame.t === 'number' && frame.t > 0) ? frame.t * 1000 : 0;
         if (ms > lastMs) lastMs = ms;
-        setTimeout(() => inject(frame), ms);
+        timers.push(setTimeout(() => { if (!stopped) inject(frame); }, ms));
       }
-      setTimeout(() => {
+      timers.push(setTimeout(() => {
+        if (stopped) return;
         inject({ done: true });
-        say('face demo end: ' + label);
-      }, lastMs + 1);
+        say('конец демо лица: ' + label);
+      }, lastMs + 1));
     })
-    .catch((e) => say('face demo: failed to load ' + label + ' — ' + e.message));
+    .catch((e) => say('демо лица: не удалось загрузить ' + label + ' — ' + e.message));
+
+  return handle;
 }
