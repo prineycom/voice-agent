@@ -105,6 +105,10 @@ additive *boost* on the **Audio2Emotion** baseline (SDK preferred-emotion channe
 for a non-zero tag), not as the sole source. The allowed values are a fixed small enum
 (`neutral | happy | sad | surprised | thinking`), the single source of truth shared by SOUL.md,
 the agent, and (via A2F) the avatar; any unknown tag falls back to `neutral`.
+Per ADR-0018 (proposed, gated on a VoxCPM2 spike) this term changes: the tag will **also drive
+the spoken voice** (mapped to a VoxCPM2 style prompt), the enum expands to a curated subset of the
+A2E 10-dim space, and each tag gains a coarse **intensity** (low/med/high). Until that lands the
+shipped definition above holds.
 _Avoid_: sentiment, emotion marker
 
 ## Example dialogue
