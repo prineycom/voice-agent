@@ -103,3 +103,11 @@ timesteps/Nano-vLLM; won't fit → stop signal for VoxCPM2 on this hardware.
   + a2f_done; full stack VRAM 9.6 / 12 GB. **Rollback:** `.env.qwen-backup` → `.env` + `nssm set
   voice-agent-tts Application …\.venv\Scripts\python.exe` + restart. **Next:** vocabulary expansion
   (ADR-0018 step 4) — curated A2E subset + intensity across SOUL.md / motion_events / emotion.py.
+- 2026-07-10: **ROLLED BACK to Qwen same day — VoxCPM2 too slow for realtime on the 4070.** Warm,
+  through the service WITH the A2F fork (real load), RTF ≈ 2.97 @ t10 and 1.65 @ t4 (both >1 → the
+  agent stutters). Warm Qwen with A2F is RTF 0.67. A2F adds only ~1.6–1.7×; streaming VoxCPM alone is
+  ~1.7 (vs the spike's non-streaming t4=0.95 — streaming overhead). Timesteps alone can't reach
+  realtime. **The go/no-go gate missed this**: it measured raw non-streaming RTF without A2F. Prod
+  restored to Qwen; VoxCPM engine/venv/model stay in place. **Re-deploy needs Nano-vLLM acceleration**
+  (~2.3× per docs → t4≈0.7) proven warm-with-A2F < ~0.8 offline first; cfg_value=1 and non-streaming
+  are secondary levers.
