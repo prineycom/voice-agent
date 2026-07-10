@@ -166,7 +166,7 @@ async def tts_ws(ws: WebSocket):
 
             def produce():
                 try:
-                    for chunk in synthesize.stream_pcm(text, voice):
+                    for chunk in synthesize.stream_pcm(text, voice, emotion):
                         if cancel.is_set():
                             break
                         loop.call_soon_threadsafe(producer_queue.put_nowait, chunk)

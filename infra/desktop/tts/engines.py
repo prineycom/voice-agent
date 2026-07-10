@@ -61,11 +61,13 @@ class TTSEngine(ABC):
         """Load the model into VRAM. Called once at server startup."""
 
     @abstractmethod
-    def stream_pcm(self, text: str, voice: str = "default") -> bytes:
+    def stream_pcm(self, text: str, voice: str = "default", emotion=None) -> bytes:
         """Yield 24kHz mono int16 PCM byte chunks for `text`.
 
         `voice` is engine-specific (speaker name / ref profile / instruction);
-        `default` is the engine's configured fallback.
+        `default` is the engine's configured fallback. `emotion` is the per-sentence
+        emotion tag (enum str, or A2E vector list); engines that cannot express it
+        ignore it — only VoxCPM consumes it (as a style prefix).
         """
         raise NotImplementedError
 
@@ -94,7 +96,7 @@ class CustomVoiceEngine(TTSEngine):
 
         self._model = FasterQwen3TTS.from_pretrained(self.model_name)
 
-    def stream_pcm(self, text: str, voice: str = "default"):
+    def stream_pcm(self, text: str, voice: str = "default", emotion=None):
         speaker = self.speaker if voice in (None, "", "default") else voice
         for audio_chunk, sr, *_ in self._model.generate_custom_voice_streaming(
             text=text,
@@ -196,7 +198,7 @@ class VoiceCloneEngine(TTSEngine):
             f"Configured: {', '.join(self.refs)} (default={self._default_name!r})."
         )
 
-    def stream_pcm(self, text: str, voice: str = "default"):
+    def stream_pcm(self, text: str, voice: str = "default", emotion=None):
         ref = self._resolve(voice)
         for audio_chunk, sr, *_ in self._model.generate_voice_clone_streaming(
             text=text,
@@ -234,7 +236,7 @@ class VoiceDesignEngine(TTSEngine):
 
         self._model = FasterQwen3TTS.from_pretrained(self.model_name)
 
-    def stream_pcm(self, text: str, voice: str = "default"):
+    def stream_pcm(self, text: str, voice: str = "default", emotion=None):
         instruct = self.instruct if voice in (None, "", "default") else voice
         if not instruct:
             raise RuntimeError(
@@ -254,6 +256,104 @@ class VoiceDesignEngine(TTSEngine):
 
 
 # --------------------------------------------------------------------------- #
+# VoxCPM — expressive voice cloning with per-sentence emotion (ADR-0018)
+# --------------------------------------------------------------------------- #
+# Emotion enum -> English style descriptor, injected as a leading "(...)" prefix.
+# VoxCPM2 only interprets the prefix (vs speaking it) in *controllable* cloning
+# mode (reference_wav_path, no transcript) — see the spike doc. `neutral`/unknown
+# => no prefix (plain clone). Curated A2E-subset + intensity lands in a later pass
+# (ADR-0018 step 4); this is the current 5-enum bridge.
+VOXCPM_EMOTION_PROMPTS = {
+    "neutral": "",
+    "happy": "cheerful, upbeat, warm",
+    "sad": "sad, subdued, slow",
+    "surprised": "surprised, astonished",
+    "thinking": "thoughtful, measured, calm",
+}
+
+
+class VoxCPMEngine(TTSEngine):
+    """Expressive voice cloning (VoxCPM2). Emotion = leading English style prefix.
+
+    Uses *controllable* cloning (`reference_wav_path`, no transcript) so the style
+    prefix is interpreted, not spoken. Reuses the `TTS_VOICE_REFS`/`TTS_REF_AUDIO`
+    profiles (only the audio path is used; `ref_text` is ignored here).
+    """
+
+    name = "voxcpm"
+
+    def __init__(self) -> None:
+        self.model_name = os.getenv("TTS_MODEL", "openbmb/VoxCPM2")
+        self.language = os.getenv("TTS_LANGUAGE", "Auto")
+        self.cfg_value = float(os.getenv("VOXCPM_CFG", "2.0"))
+        self.timesteps = int(os.getenv("VOXCPM_TIMESTEPS", "10"))
+        self.refs: dict[str, VoiceRef] = {r.name: r for r in _parse_refs()}
+        self._default_name = next(iter(self.refs))
+        self._sr = 48000  # VoxCPM2 native output; _emit_pcm resamples to 24k
+        self._model = None
+
+    def load(self) -> None:
+        from voxcpm import VoxCPM
+
+        self._model = VoxCPM.from_pretrained(self.model_name, load_denoiser=False)
+        # Cold start is ~13s; warm the CUDA kernels once so the first real
+        # utterance streams at the ~0.4s warm first-chunk latency (spike finding).
+        try:
+            ref = self.refs[self._default_name]
+            for _ in self._model.generate_streaming(
+                text="Прогрев.", reference_wav_path=str(ref.audio_path),
+                cfg_value=self.cfg_value, inference_timesteps=self.timesteps,
+            ):
+                pass
+            log.info("VoxCPM warmup complete")
+        except Exception:  # noqa: BLE001 — warmup is best-effort
+            log.warning("VoxCPM warmup failed", exc_info=True)
+
+    def _resolve(self, voice: str | None) -> VoiceRef:
+        if voice in (None, "", "default"):
+            return self.refs[self._default_name]
+        if voice in self.refs:
+            return self.refs[voice]
+        raise RuntimeError(
+            f"voxcpm: unknown ref profile {voice!r}. Configured: {', '.join(self.refs)}."
+        )
+
+    @staticmethod
+    def _style_prefix(emotion) -> str:
+        """Build the leading '(...)' style prefix from the emotion tag.
+
+        `neutral`/None/unknown/vector => "" (plain clone). String enum only for now.
+        """
+        if not isinstance(emotion, str):
+            return ""
+        desc = VOXCPM_EMOTION_PROMPTS.get(emotion.strip().lower(), "")
+        return f"({desc})" if desc else ""
+
+    def stream_pcm(self, text: str, voice: str = "default", emotion=None):
+        ref = self._resolve(voice)
+        styled = self._style_prefix(emotion) + text
+        kw = dict(
+            reference_wav_path=str(ref.audio_path),
+            cfg_value=self.cfg_value,
+            inference_timesteps=self.timesteps,
+        )
+        try:
+            for chunk in self._model.generate_streaming(text=styled, **kw):
+                yield _emit_pcm(chunk, self._sr)
+        except TypeError:
+            # streaming may reject a kwarg / mode on some builds → one-shot fallback
+            yield _emit_pcm(self._model.generate(text=styled, **kw), self._sr)
+
+    def health_fields(self) -> dict:
+        return {
+            "ref_profiles": list(self.refs),
+            "default_ref": self._default_name,
+            "timesteps": self.timesteps,
+            "emotions": sorted(k for k, v in VOXCPM_EMOTION_PROMPTS.items() if v),
+        }
+
+
+# --------------------------------------------------------------------------- #
 # Registry & selection
 # --------------------------------------------------------------------------- #
 class Engines:
@@ -263,6 +363,7 @@ class Engines:
         "custom_voice": CustomVoiceEngine,
         "voice_clone": VoiceCloneEngine,
         "voice_design": VoiceDesignEngine,
+        "voxcpm": VoxCPMEngine,
     }
 
     @classmethod
@@ -285,6 +386,7 @@ __all__ = [
     "CustomVoiceEngine",
     "VoiceCloneEngine",
     "VoiceDesignEngine",
+    "VoxCPMEngine",
     "Engines",
     "VoiceRef",
     "SAMPLE_RATE",

@@ -55,10 +55,14 @@ def unload_model():
     return _engine
 
 
-def stream_pcm(text: str, voice: str = "default"):
-    """Yield 24kHz mono int16 PCM byte chunks for `text`. Delegates to the engine."""
+def stream_pcm(text: str, voice: str = "default", emotion=None):
+    """Yield 24kHz mono int16 PCM byte chunks for `text`. Delegates to the engine.
+
+    `emotion` (enum str / A2E vector) is forwarded; engines that can't express it
+    ignore it (only VoxCPM uses it, as a style prefix).
+    """
     eng = _ensure_engine()
-    yield from eng.stream_pcm(text, voice)
+    yield from eng.stream_pcm(text, voice, emotion)
 
 
 def engine() -> TTSEngine:
