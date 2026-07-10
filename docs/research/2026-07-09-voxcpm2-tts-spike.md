@@ -93,3 +93,13 @@ timesteps/Nano-vLLM; won't fit → stop signal for VoxCPM2 on this hardware.
   sighs/breaths) are **undocumented** — no tokens like `[laugh]`; probed via free-form prefix
   (`nv_laugh`, `nv_sigh`, `nv_whisper`) — user to judge if they emerge. Corrected samples:
   `/home/priney/voxcpm-samples/v2-correct/` (Pi). Pending user verdict.
+- 2026-07-10: **user approved; engine built + DEPLOYED to production.** `VoxCPMEngine` added to the
+  registry (emotion = English `(…)` prefix, controllable cloning, warmup on load, 48→24k); the
+  `/tts` `emotion` field is now threaded to the engine. Two-venv deploy (transformers 4.57 vs 5.13
+  conflict): new `.venv-voxcpm` beside the untouched Qwen `.venv`; `nssm set voice-agent-tts
+  Application → .venv-voxcpm python`; `.env` → `TTS_ENGINE=voxcpm`, `TTS_MODEL=openbmb/VoxCPM2`,
+  `VOXCPM_TIMESTEPS=10`, `HF_HUB_CACHE=E:\AI\models\hub` (old .env saved as `.env.qwen-backup`).
+  **E2E validated on prod:** `/tts` ws with `emotion=happy` → 2.40 s PCM + 72 A2F blendshape frames
+  + a2f_done; full stack VRAM 9.6 / 12 GB. **Rollback:** `.env.qwen-backup` → `.env` + `nssm set
+  voice-agent-tts Application …\.venv\Scripts\python.exe` + restart. **Next:** vocabulary expansion
+  (ADR-0018 step 4) — curated A2E subset + intensity across SOUL.md / motion_events / emotion.py.
