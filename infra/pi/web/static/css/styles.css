@@ -75,6 +75,10 @@
   .op .lbl { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .op .t { color: #8b97a8; font-size: 11px; font-variant-numeric: tabular-nums; }
   .op.queued { opacity: .55; }
+  .voices { display: flex; flex-wrap: wrap; gap: 6px; }
+  .voice-btn { font-size: 12px; padding: 4px 10px; border-radius: 999px; text-transform: capitalize; }
+  .voice-btn.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .voice-btn.active:hover:not(:disabled) { background: #1d4ed8; }
   .spin { animation: spin 1s linear infinite; display: inline-block; }
   @keyframes spin { to { transform: rotate(360deg); } }
   #toolfeed { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
