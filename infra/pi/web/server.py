@@ -208,6 +208,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as exc:
             self._send_json(400, {"error": str(exc)})
             return
+        except OSError as exc:
+            # Disk full / permission on the state dir: report a clean 500 rather
+            # than letting the handler crash with a traceback + broken response.
+            self._send_json(500, {"error": f"could not persist voice: {exc}"})
+            return
         # Echo the new state so the caller (and the UI) reflects it immediately.
         self._send_json(200, voice_state.state())
 

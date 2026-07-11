@@ -378,9 +378,11 @@ async def entrypoint(ctx: JobContext) -> None:
     desktop_tts.set_emotion_source(lambda: agent.current_emotion)
     # Active Voice (speaker) is a persisted server-side global switched via the
     # voice-switcher HTTP endpoint; read it live per sentence so a switch applies
-    # on the next utterance with no reconnect (ADR-0020 / #48). Falls back to
-    # cfg.tts_voice when nothing is persisted.
-    desktop_tts.set_voice_source(voice_state.get_active_voice)
+    # on the next utterance with no reconnect (ADR-0020 / #48). Uses
+    # active_voice_or_none so an un-switched system keeps sending the engine-
+    # agnostic cfg.tts_voice ("default") rather than a concrete CustomVoice preset
+    # a non-CustomVoice engine could not resolve on rollback.
+    desktop_tts.set_voice_source(voice_state.active_voice_or_none)
 
     await session.start(
         agent=agent,

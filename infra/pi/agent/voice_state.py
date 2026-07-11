@@ -96,6 +96,37 @@ def _read_file(path: Path) -> str:
     return name if is_valid(name) else default_voice()
 
 
+def active_voice_or_none() -> str | None:
+    """The explicitly-persisted Voice, or ``None`` when nothing is set.
+
+    This is what the TTS plugin sends on the wire: ``None`` lets it fall back to
+    its engine-agnostic constructor ``voice`` (``"default"``), so a system that has
+    never used the switcher — or one rolled back to a non-CustomVoice engine —
+    keeps sending ``"default"`` instead of a concrete preset that only the
+    CustomVoice engine can resolve. ``get_active_voice`` (default-filled) stays the
+    source for the GET/UI, which always shows a concrete active Voice.
+    """
+    try:
+        if not _state_path().exists():
+            return None
+    except OSError:
+        return None
+    active = get_active_voice()
+    # Guard the (unreachable-in-practice) case where the file exists but round-trips
+    # to the default because it is empty/corrupt: still prefer the wire fallback.
+    return active if _persisted_matches(active) else None
+
+
+def _persisted_matches(active: str) -> bool:
+    """True if ``active`` is what is actually stored (not just the default)."""
+    path = _state_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("voice") == active and is_valid(active)
+
+
 def set_active_voice(name: str) -> str:
     """Validate + persist ``name`` as the active Voice; return the stored value.
 

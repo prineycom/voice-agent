@@ -95,6 +95,27 @@ def test_state_payload_flags_active():
     assert {v["id"] for v in st["voices"]} == set(voice_state.VOICES)
 
 
+def test_active_or_none_is_none_when_unpersisted():
+    # The wire value: no explicit switch → None so the plugin sends its
+    # engine-agnostic constructor "default" (works on any engine, incl. rollback).
+    assert voice_state.active_voice_or_none() is None
+
+
+def test_active_or_none_returns_persisted_after_switch():
+    voice_state.set_active_voice("aiden")
+    assert voice_state.active_voice_or_none() == "aiden"
+
+
+def test_active_or_none_is_none_on_corrupt_file(tmp_path, monkeypatch):
+    path = tmp_path / "corrupt2"
+    path.write_text("garbage", encoding="utf-8")
+    monkeypatch.setenv("VOICE_STATE_PATH", str(path))
+    voice_state._cache["mtime"] = None
+    assert voice_state.active_voice_or_none() is None
+    # ...while the UI-facing getter still yields a concrete default.
+    assert voice_state.get_active_voice() == "ryan"
+
+
 def test_persists_across_reload(tmp_path, monkeypatch):
     """A new read (cache cleared, mimicking a restart) sees the persisted value."""
     voice_state.set_active_voice("ono_anna")

@@ -11,6 +11,11 @@ WorkingDirectory=/home/priney/repos/voice-agent/infra/pi/web
 Environment=LIVEKIT_WS_URL=wss://rpi.darter-smoot.ts.net:8443
 Environment=WEB_BIND_HOST=127.0.0.1
 Environment=WEB_BIND_PORT=8095
+# Voice-switcher state file (ADR-0020 / #48): pin it explicitly so the web front
+# door and the agent worker share ONE path regardless of each unit's home dir —
+# the worker (voice_state) reads what this server writes. Keep both in sync if you
+# relocate it; the worker defaults to the same location for User=priney.
+Environment=VOICE_STATE_PATH=/home/priney/.local/state/voice-agent/active-voice
 ExecStart=/home/priney/repos/voice-agent/infra/pi/agent/.venv/bin/python /home/priney/repos/voice-agent/infra/pi/web/server.py
 Restart=always
 RestartSec=5
