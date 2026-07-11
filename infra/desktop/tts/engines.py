@@ -87,8 +87,23 @@ class CustomVoiceEngine(TTSEngine):
     def __init__(self) -> None:
         self.model_name = os.getenv("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
         self.language = os.getenv("TTS_LANGUAGE", "Russian")
-        self.speaker = os.getenv("TTS_SPEAKER", "aiden")
+        # `ryan` is the production speaker (ADR-0020): CustomVoice obeys `instruct`
+        # as a trained input and the seed lottery nearly vanishes vs the clone.
+        self.speaker = os.getenv("TTS_SPEAKER", "ryan")
         self.chunk_size = int(os.getenv("TTS_CHUNK_SIZE", "4"))
+        # Sampling knobs (lib defaults: 0.9 / 1.0 / 50 / 1.05). ADR-0020 settles on
+        # temperature 0.8 / top_p 0.9 for a steady delivery. NO fixed seed on purpose
+        # — a global seed freezes one random draw (the sampling lottery); CustomVoice
+        # is seed-stable enough not to need it.
+        self.temperature = float(os.getenv("TTS_TEMPERATURE", "0.8"))
+        self.top_p = float(os.getenv("TTS_TOP_P", "0.9"))
+        self.top_k = int(os.getenv("TTS_TOP_K", "50"))
+        self.repetition_penalty = float(os.getenv("TTS_REPETITION_PENALTY", "1.05"))
+        # Upper bound on generated audio tokens per sentence — the runaway guard
+        # (ADR-0020 watch-out: `calm`/number+latin sentences can over-stretch). The
+        # model is 12Hz, so ~12 tokens/s of audio; the default caps a single
+        # sentence's audio length. Tunable per the #51 emotion pass.
+        self.max_new_tokens = int(os.getenv("TTS_MAX_NEW_TOKENS", "2048"))
         self._model = None
 
     def load(self) -> None:
@@ -103,11 +118,21 @@ class CustomVoiceEngine(TTSEngine):
             language=self.language,
             speaker=speaker,
             chunk_size=self.chunk_size,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
+            max_new_tokens=self.max_new_tokens,
         ):
             yield _emit_pcm(audio_chunk, sr)
 
     def health_fields(self) -> dict:
-        return {"speaker": self.speaker}
+        return {
+            "speaker": self.speaker,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_new_tokens": self.max_new_tokens,
+        }
 
 
 # --------------------------------------------------------------------------- #
