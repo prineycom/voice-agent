@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import threading
 from pathlib import Path
 
 # Switchable CustomVoice preset speakers (ADR-0020 / #48). `ryan` is first = the
@@ -58,73 +57,42 @@ def list_voices() -> list[str]:
     return list(VOICES)
 
 
-# Cache the parsed value keyed by the file's mtime so the per-sentence read on the
-# TTS hot path is a cheap stat, not a full read+parse every time. Guarded by a lock
-# because the worker's async flushes may call get_active_voice concurrently.
-_lock = threading.Lock()
-_cache: dict[str, object] = {"mtime": None, "value": None}
+def _read_persisted() -> str | None:
+    """The explicitly-persisted Voice, or ``None`` if unset/invalid/unreadable.
+
+    Reads the tiny state file fresh on every call — no cache — so a switch is
+    always picked up on the next utterance regardless of filesystem mtime
+    granularity (a stat/mtime cache silently misses same-mtime writes on coarse
+    filesystems). The file is a few bytes, so the per-sentence read is negligible
+    and the OS page cache absorbs it. Any error → ``None`` (treated as unset).
+    """
+    try:
+        data = json.loads(_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    name = data.get("voice") if isinstance(data, dict) else None
+    return name if is_valid(name) else None
 
 
 def get_active_voice() -> str:
-    """Return the persisted active Voice, or the default if unset/invalid.
+    """The active Voice for the GET/UI: the persisted value, or the default.
 
-    Safe to call on the hot path (once per sentence): re-reads the state file only
-    when its mtime changed, so a switch is picked up on the next utterance without
-    a per-call disk parse. Any read/parse error falls back to the default — the
-    agent must never go mute over a bad state file.
+    Always yields a concrete preset (the selector shows a highlighted active
+    voice even before the first switch).
     """
-    path = _state_path()
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return default_voice()
-    with _lock:
-        if _cache["mtime"] == mtime and _cache["value"] is not None:
-            return _cache["value"]  # type: ignore[return-value]
-        value = _read_file(path)
-        _cache["mtime"] = mtime
-        _cache["value"] = value
-        return value
-
-
-def _read_file(path: Path) -> str:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        name = data.get("voice") if isinstance(data, dict) else None
-    except (OSError, ValueError):
-        return default_voice()
-    return name if is_valid(name) else default_voice()
+    return _read_persisted() or default_voice()
 
 
 def active_voice_or_none() -> str | None:
-    """The explicitly-persisted Voice, or ``None`` when nothing is set.
+    """The wire value the TTS plugin sends: the persisted preset, or ``None``.
 
-    This is what the TTS plugin sends on the wire: ``None`` lets it fall back to
-    its engine-agnostic constructor ``voice`` (``"default"``), so a system that has
+    ``None`` (nothing explicitly switched) lets the plugin fall back to its
+    engine-agnostic constructor ``voice`` (``"default"``), so a system that has
     never used the switcher — or one rolled back to a non-CustomVoice engine —
-    keeps sending ``"default"`` instead of a concrete preset that only the
-    CustomVoice engine can resolve. ``get_active_voice`` (default-filled) stays the
-    source for the GET/UI, which always shows a concrete active Voice.
+    keeps sending ``"default"`` instead of a concrete preset only CustomVoice can
+    resolve.
     """
-    try:
-        if not _state_path().exists():
-            return None
-    except OSError:
-        return None
-    active = get_active_voice()
-    # Guard the (unreachable-in-practice) case where the file exists but round-trips
-    # to the default because it is empty/corrupt: still prefer the wire fallback.
-    return active if _persisted_matches(active) else None
-
-
-def _persisted_matches(active: str) -> bool:
-    """True if ``active`` is what is actually stored (not just the default)."""
-    path = _state_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return isinstance(data, dict) and data.get("voice") == active and is_valid(active)
+    return _read_persisted()
 
 
 def set_active_voice(name: str) -> str:
@@ -150,9 +118,6 @@ def set_active_voice(name: str) -> str:
             os.unlink(tmp)
         except OSError:
             pass
-    with _lock:  # invalidate cache so this process reflects the write immediately
-        _cache["mtime"] = None
-        _cache["value"] = None
     return name
 
 

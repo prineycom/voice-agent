@@ -1,7 +1,7 @@
 """Offline tests for voice_state — the persisted active-Voice global (ADR-0020 / #48).
 
 Pure logic + a temp state file; no GPU/SFU/network. Each test points
-VOICE_STATE_PATH at a tmp file and resets the module cache.
+VOICE_STATE_PATH at a fresh tmp file (state is read fresh on every call).
 """
 
 import json
@@ -13,11 +13,9 @@ import voice_state
 
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
-    """Fresh state file + clean cache/env per test."""
+    """Fresh state file + clean env per test."""
     monkeypatch.setenv("VOICE_STATE_PATH", str(tmp_path / "active-voice"))
     monkeypatch.delenv("VOICE_DEFAULT", raising=False)
-    voice_state._cache["mtime"] = None
-    voice_state._cache["value"] = None
     yield
 
 
@@ -66,7 +64,6 @@ def test_get_falls_back_on_corrupt_file(tmp_path, monkeypatch):
     path = tmp_path / "corrupt"
     path.write_text("not json", encoding="utf-8")
     monkeypatch.setenv("VOICE_STATE_PATH", str(path))
-    voice_state._cache["mtime"] = None
     assert voice_state.get_active_voice() == "ryan"
 
 
@@ -74,14 +71,11 @@ def test_get_falls_back_on_unknown_persisted_value(tmp_path, monkeypatch):
     path = tmp_path / "unknown"
     path.write_text(json.dumps({"voice": "eric"}), encoding="utf-8")
     monkeypatch.setenv("VOICE_STATE_PATH", str(path))
-    voice_state._cache["mtime"] = None
     assert voice_state.get_active_voice() == "ryan"
 
 
 def test_set_updates_get_immediately_same_process():
-    # The write must invalidate this process's cache (the switcher process),
-    # not only cross-process via mtime.
-    voice_state.get_active_voice()  # prime the cache with the default
+    voice_state.get_active_voice()  # read once (default) before the switch
     voice_state.set_active_voice("sohee")
     assert voice_state.get_active_voice() == "sohee"
 
@@ -110,15 +104,12 @@ def test_active_or_none_is_none_on_corrupt_file(tmp_path, monkeypatch):
     path = tmp_path / "corrupt2"
     path.write_text("garbage", encoding="utf-8")
     monkeypatch.setenv("VOICE_STATE_PATH", str(path))
-    voice_state._cache["mtime"] = None
     assert voice_state.active_voice_or_none() is None
     # ...while the UI-facing getter still yields a concrete default.
     assert voice_state.get_active_voice() == "ryan"
 
 
-def test_persists_across_reload(tmp_path, monkeypatch):
-    """A new read (cache cleared, mimicking a restart) sees the persisted value."""
+def test_persists_across_reload():
+    """The persisted value survives (file-backed, read fresh each call)."""
     voice_state.set_active_voice("ono_anna")
-    voice_state._cache["mtime"] = None
-    voice_state._cache["value"] = None
     assert voice_state.get_active_voice() == "ono_anna"

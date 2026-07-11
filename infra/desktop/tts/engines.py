@@ -75,6 +75,19 @@ class TTSEngine(ABC):
         """Extra fields this engine contributes to the `/health` response."""
         return {}
 
+    def _read_sampling_env(self) -> None:
+        """Populate the shared sampling knobs from `TTS_*` env vars.
+
+        Shared by the instruct-capable engines (ADR-0020 defaults: temperature 0.8
+        / top_p 0.9 / top_k 50 / repetition_penalty 1.05). NO fixed seed on purpose
+        — a global seed freezes one random draw (the sampling lottery). One place so
+        the engines can never drift apart on defaults.
+        """
+        self.temperature = float(os.getenv("TTS_TEMPERATURE", "0.8"))
+        self.top_p = float(os.getenv("TTS_TOP_P", "0.9"))
+        self.top_k = int(os.getenv("TTS_TOP_K", "50"))
+        self.repetition_penalty = float(os.getenv("TTS_REPETITION_PENALTY", "1.05"))
+
 
 # --------------------------------------------------------------------------- #
 # CustomVoice — predefined speaker IDs
@@ -119,14 +132,8 @@ class CustomVoiceEngine(TTSEngine):
         # as a trained input and the seed lottery nearly vanishes vs the clone.
         self.speaker = os.getenv("TTS_SPEAKER", "ryan")
         self.chunk_size = int(os.getenv("TTS_CHUNK_SIZE", "4"))
-        # Sampling knobs (lib defaults: 0.9 / 1.0 / 50 / 1.05). ADR-0020 settles on
-        # temperature 0.8 / top_p 0.9 for a steady delivery. NO fixed seed on purpose
-        # — a global seed freezes one random draw (the sampling lottery); CustomVoice
-        # is seed-stable enough not to need it.
-        self.temperature = float(os.getenv("TTS_TEMPERATURE", "0.8"))
-        self.top_p = float(os.getenv("TTS_TOP_P", "0.9"))
-        self.top_k = int(os.getenv("TTS_TOP_K", "50"))
-        self.repetition_penalty = float(os.getenv("TTS_REPETITION_PENALTY", "1.05"))
+        # Sampling knobs (ADR-0020: temperature 0.8 / top_p 0.9, no fixed seed).
+        self._read_sampling_env()
         # Upper bound on generated audio tokens per sentence — the runaway guard
         # (ADR-0020 watch-out: `calm`/number+latin sentences can over-stretch). The
         # model is 12Hz, so ~12 tokens/s of audio; the default caps a single
@@ -244,15 +251,10 @@ class VoiceCloneEngine(TTSEngine):
         self.model_name = os.getenv("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
         self.language = os.getenv("TTS_LANGUAGE", "Russian")
         self.chunk_size = int(os.getenv("TTS_CHUNK_SIZE", "8"))
-        # Sampling knobs (faster_qwen3_tts defaults: 0.9 / 1.0 / 50 / 1.05). We
-        # default temperature/top_p a touch tighter for a steadier "stable voice"
-        # (see the 2026-07-11 seed/emotion investigation). NO fixed seed on
-        # purpose: a global seed freezes one random draw that is robotic / wrong
-        # for some utterances — the sampling lottery, confirmed by listening.
-        self.temperature = float(os.getenv("TTS_TEMPERATURE", "0.8"))
-        self.top_p = float(os.getenv("TTS_TOP_P", "0.9"))
-        self.top_k = int(os.getenv("TTS_TOP_K", "50"))
-        self.repetition_penalty = float(os.getenv("TTS_REPETITION_PENALTY", "1.05"))
+        # Sampling knobs (ADR-0020 defaults: 0.8 / 0.9 / 50 / 1.05, no fixed seed —
+        # a global seed freezes one draw, robotic/wrong for some utterances). See
+        # the 2026-07-11 seed/emotion investigation.
+        self._read_sampling_env()
         # Optional single fixed style hint for the baseline voice (empty → none).
         # Per-utterance emotion via instruct is NOT reliable on the clone, so this
         # is one steady mood, not LLM-driven. Kept off by default.

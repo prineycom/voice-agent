@@ -5,11 +5,7 @@
 // `fetchImpl` is injectable so the pure render + switch logic is testable without
 // a browser.
 
-function esc(s) {
-  return String(s == null ? '' : s).replace(/[&<>"]/g, c => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
-  ));
-}
+import { esc } from './html.js';
 
 // Pure: build the selector markup from a {active, voices:[{id,active}]} state.
 // The active voice gets the `active` class + aria-pressed. Empty → a hint.

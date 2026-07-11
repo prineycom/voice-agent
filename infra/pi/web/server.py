@@ -23,9 +23,9 @@ worker uses.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
-import sys
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,11 +35,25 @@ from livekit.api import AccessToken, DeleteRoomRequest, LiveKitAPI, VideoGrants
 
 HERE = Path(__file__).resolve().parent
 
-# The agent worker owns the active-Voice state (catalog + persisted global); this
-# front door just exposes it over HTTP same-origin for the frontend voice switcher
-# (ADR-0020 / #48). Import the pure-stdlib module from the sibling agent package.
-sys.path.insert(0, str(HERE.parent / "agent"))
-import voice_state  # noqa: E402
+
+def _load_voice_state():
+    """Load the agent worker's pure-stdlib `voice_state` module by path.
+
+    The agent worker owns the active-Voice state (catalog + persisted global);
+    this front door just exposes it over HTTP same-origin for the frontend voice
+    switcher (ADR-0020 / #48). Loaded via importlib rather than
+    `sys.path.insert(agent_dir)` so the sibling agent package's modules
+    (config.py, health.py, agent.py, …) can never shadow same-named top-level
+    imports elsewhere in this process.
+    """
+    path = HERE.parent / "agent" / "voice_state.py"
+    spec = importlib.util.spec_from_file_location("voice_state", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+voice_state = _load_voice_state()
 INDEX_HTML = HERE / "index.html"
 FACE3D_HTML = HERE / "face3d.html"
 STATIC_ROOT = HERE / "static"
