@@ -79,8 +79,36 @@ class TTSEngine(ABC):
 # --------------------------------------------------------------------------- #
 # CustomVoice — predefined speaker IDs
 # --------------------------------------------------------------------------- #
+# Emotion enum → English `instruct` clause, applied per sentence on top of the
+# fixed speaker (ADR-0020 decision #3). CustomVoice obeys `instruct` as a trained
+# input, so a short prosody-only clause reliably shifts delivery without changing
+# the speaker's timbre. Keys mirror the shared enum (agent motion_events.EMOTIONS).
+# `neutral` (and any unknown/vector emotion) → no instruct = the plain speaker.
+# English + prosody-focused per the 2026-07-11 tuning (physical descriptors beat
+# feeling-words; Russian output stays clean because language=Russian is forced).
+# No intensity dimension in v1 — each clause encodes a fixed moderate strength.
+CUSTOMVOICE_EMOTION_INSTRUCT = {
+    "neutral": "",
+    "happy": "Speak in a warm, cheerful, upbeat tone with a lively pace and bright pitch.",
+    "sad": "Speak in a soft, subdued, sorrowful tone with a slow pace and low pitch.",
+    "excited": "Speak in an energetic, enthusiastic tone with a fast pace and high, animated pitch.",
+    "calm": "Speak in a relaxed, gentle, reassuring tone with a slow, even pace.",
+    "serious": "Speak in a firm, measured, matter-of-fact tone with a steady pace and level pitch.",
+    "surprised": "Speak in an astonished tone with sudden emphasis and a rising pitch.",
+    "angry": "Speak in a tense, forceful, irritated tone with sharp emphasis and a hard edge.",
+    "tender": "Speak in a soft, affectionate, caring tone with a gentle, warm pace.",
+    "thinking": "Speak in a thoughtful, contemplative tone with a slow, measured, hesitant pace.",
+}
+
+
 class CustomVoiceEngine(TTSEngine):
-    """Predefined speaker IDs (aiden, ryan, serena, …). Model: CustomVoice."""
+    """Predefined speaker IDs (ryan, aiden, serena, …). Model: CustomVoice.
+
+    Per-sentence emotion (ADR-0020): the ``emotion`` enum tag maps to an English
+    ``instruct`` clause (``CUSTOMVOICE_EMOTION_INSTRUCT``); ``neutral``/unknown/a
+    raw A2E vector → no instruct (the plain speaker). The speaker (timbre) and the
+    emotion (delivery) are orthogonal axes.
+    """
 
     name = "custom_voice"
 
@@ -111,12 +139,25 @@ class CustomVoiceEngine(TTSEngine):
 
         self._model = FasterQwen3TTS.from_pretrained(self.model_name)
 
+    @staticmethod
+    def _instruct_for(emotion) -> str | None:
+        """Map the per-sentence emotion tag → an `instruct` clause, or None.
+
+        `neutral`/None/unknown/a raw A2E vector → None (plain speaker). Only a
+        known enum string with a non-empty clause returns an instruct.
+        """
+        if not isinstance(emotion, str):
+            return None
+        clause = CUSTOMVOICE_EMOTION_INSTRUCT.get(emotion.strip().lower(), "")
+        return clause or None
+
     def stream_pcm(self, text: str, voice: str = "default", emotion=None):
         speaker = self.speaker if voice in (None, "", "default") else voice
         for audio_chunk, sr, *_ in self._model.generate_custom_voice_streaming(
             text=text,
             language=self.language,
             speaker=speaker,
+            instruct=self._instruct_for(emotion),
             chunk_size=self.chunk_size,
             temperature=self.temperature,
             top_p=self.top_p,

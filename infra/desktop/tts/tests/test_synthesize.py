@@ -162,6 +162,43 @@ def test_custom_voice_resamples_to_24k(monkeypatch):
     assert abs(len(out) // 2 - 24000) < 100
 
 
+# CustomVoice emotion → instruct (ADR-0020 / #51)
+@pytest.mark.parametrize("emotion", ["happy", "SAD", "  Excited  ", "thinking", "angry"])
+def test_custom_voice_known_emotion_sends_instruct(monkeypatch, emotion):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    eng = engines.Engines.from_env()
+    m = _FakeCustomVoiceModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("привет", emotion=emotion))
+    instruct = m.calls[-1]["instruct"]
+    assert instruct == engines.CUSTOMVOICE_EMOTION_INSTRUCT[emotion.strip().lower()]
+    assert instruct  # non-empty clause
+
+
+@pytest.mark.parametrize("emotion", [None, "neutral", "ecstatic", [0.0, 1.0, 0.0]])
+def test_custom_voice_neutral_unknown_or_vector_sends_no_instruct(monkeypatch, emotion):
+    monkeypatch.setenv("TTS_ENGINE", "custom_voice")
+    eng = engines.Engines.from_env()
+    m = _FakeCustomVoiceModel(_chunks())
+    eng._model = m
+    list(eng.stream_pcm("привет", emotion=emotion))
+    assert m.calls[-1]["instruct"] is None
+
+
+def test_custom_voice_instruct_map_covers_the_shared_enum(monkeypatch):
+    # Every non-neutral value the agent can send must have a usable instruct
+    # clause; neutral maps to empty (→ None). Mirrors motion_events.EMOTIONS.
+    shared_enum = (
+        "neutral", "happy", "sad", "excited", "calm",
+        "serious", "surprised", "angry", "tender", "thinking",
+    )
+    assert set(engines.CUSTOMVOICE_EMOTION_INSTRUCT) == set(shared_enum)
+    assert engines.CUSTOMVOICE_EMOTION_INSTRUCT["neutral"] == ""
+    assert all(
+        engines.CUSTOMVOICE_EMOTION_INSTRUCT[e] for e in shared_enum if e != "neutral"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # VoiceCloneEngine
 # --------------------------------------------------------------------------- #

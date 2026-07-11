@@ -39,6 +39,9 @@ TONGUE_16 = [
 ]
 ARKIT_68 = ARKIT_52 + TONGUE_16
 
-# Emotion enum shared with SOUL.md / the agent (decision #5). Mapped to the A2F
-# emotion input vector by `emotion.py`.
-EMOTIONS = ["neutral", "happy", "sad", "surprised", "thinking"]
+# Emotion enum shared with SOUL.md / the agent (decision #5; expanded 5 → 10 in
+# ADR-0020). Mapped to the A2F emotion input vector by `emotion.py`.
+EMOTIONS = [
+    "neutral", "happy", "sad", "excited", "calm",
+    "serious", "surprised", "angry", "tender", "thinking",
+]
