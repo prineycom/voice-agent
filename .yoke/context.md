@@ -102,14 +102,27 @@ The Agent Worker parses it and strips it **before TTS and before the transcript*
 it mapped to an **Expression** (`.exp3.json`) in a **Motion event**; under **Facial animation**
 (Epic 8) the parsed emotion instead feeds **Audio2Face**'s emotion input — since #40 as an
 additive *boost* on the **Audio2Emotion** baseline (SDK preferred-emotion channel, enabled only
-for a non-zero tag), not as the sole source. The allowed values are a fixed small enum
-(`neutral | happy | sad | surprised | thinking`), the single source of truth shared by SOUL.md,
-the agent, and (via A2F) the avatar; any unknown tag falls back to `neutral`.
-Per ADR-0018 (proposed, gated on a VoxCPM2 spike) this term changes: the tag will **also drive
-the spoken voice** (mapped to a VoxCPM2 style prompt), the enum expands to a curated subset of the
-A2E 10-dim space, and each tag gains a coarse **intensity** (low/med/high). Until that lands the
-shipped definition above holds.
+for a non-zero tag), not as the sole source. The allowed values are a fixed enum, the single
+source of truth shared by SOUL.md, the agent, and (via A2E) the avatar; any unknown tag falls
+back to `neutral`.
+Per **ADR-0020** the tag now **also drives the spoken voice**: it maps to a **Qwen3-TTS
+CustomVoice `instruct` clause** (NOT the abandoned VoxCPM2 path of ADR-0018), applied per
+sentence, translated engine-side. The face is left to **Audio2Emotion** reading the now-expressive
+audio; the tag→A2F boost stays as cheap reinforcement. The enum expands to ~10:
+`neutral | happy | sad | excited | calm | serious | surprised | angry | tender | thinking`.
+No **intensity** dimension in v1 (each clause encodes a fixed moderate strength). Distinct from
+paralinguistics (laughter, `ммм`, sighs) which come from the LLM's **text**, not the tag.
 _Avoid_: sentiment, emotion marker
+
+**Voice**:
+*Who* the agent sounds like — a **CustomVoice speaker**, one of Qwen3-TTS CustomVoice's preset
+timbres (`ryan` is the default; also `aiden, serena, vivian, ono_anna, sohee, uncle_fu`; the
+CN-dialect `eric`/`dylan` are excluded for Russian). Orthogonal to the **Emotion tag**: **Voice** =
+*who* (speaker), the tag = *how* (delivery/`instruct`). The active Voice is one **server-side
+global** owned by the Agent Worker, changed via its **voice-switcher** HTTP endpoint and persisted
+on the Pi across restarts; it reaches TTS over the existing per-session `voice` field. Switching
+between preset speakers is instant (same model loaded). Per ADR-0020 / issue #48.
+_Avoid_: speaker (ambiguous with a human speaker), timbre, persona (reserve for VoiceDesign)
 
 ## Example dialogue
 

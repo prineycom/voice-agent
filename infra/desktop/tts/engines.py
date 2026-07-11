@@ -178,6 +178,19 @@ class VoiceCloneEngine(TTSEngine):
         self.model_name = os.getenv("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
         self.language = os.getenv("TTS_LANGUAGE", "Russian")
         self.chunk_size = int(os.getenv("TTS_CHUNK_SIZE", "8"))
+        # Sampling knobs (faster_qwen3_tts defaults: 0.9 / 1.0 / 50 / 1.05). We
+        # default temperature/top_p a touch tighter for a steadier "stable voice"
+        # (see the 2026-07-11 seed/emotion investigation). NO fixed seed on
+        # purpose: a global seed freezes one random draw that is robotic / wrong
+        # for some utterances — the sampling lottery, confirmed by listening.
+        self.temperature = float(os.getenv("TTS_TEMPERATURE", "0.8"))
+        self.top_p = float(os.getenv("TTS_TOP_P", "0.9"))
+        self.top_k = int(os.getenv("TTS_TOP_K", "50"))
+        self.repetition_penalty = float(os.getenv("TTS_REPETITION_PENALTY", "1.05"))
+        # Optional single fixed style hint for the baseline voice (empty → none).
+        # Per-utterance emotion via instruct is NOT reliable on the clone, so this
+        # is one steady mood, not LLM-driven. Kept off by default.
+        self.instruct = os.getenv("TTS_CLONE_INSTRUCT", "").strip() or None
         self.refs: dict[str, VoiceRef] = {r.name: r for r in _parse_refs()}
         # `default` resolves to the first configured profile.
         self._default_name = next(iter(self.refs))
@@ -206,6 +219,11 @@ class VoiceCloneEngine(TTSEngine):
             ref_audio=str(ref.audio_path),
             ref_text=ref.ref_text,
             chunk_size=self.chunk_size,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
+            instruct=self.instruct,
         ):
             yield _emit_pcm(audio_chunk, sr)
 
