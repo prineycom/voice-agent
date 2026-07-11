@@ -73,6 +73,20 @@ and would make emotion inconsistent, since clones can't do it).
 - New surface area: an HTTP control endpoint + persisted voice state in the agent worker, and a
   frontend voice-selector — tracked by #48.
 
+## Implementation notes
+
+- **Voice-switcher endpoint location (#53).** The active-Voice *state* (preset catalog +
+  persisted global + the value the TTS actually uses) is owned by the agent worker package
+  (`infra/pi/agent/voice_state.py`, pure stdlib). The *HTTP surface* (`GET /voices` /
+  `POST /voice`) is served by the existing Pi web front door (`infra/pi/web/server.py`),
+  which imports that module — rather than opening a new HTTP server + port on the worker as
+  the Decision wording implied. Rationale: the browser voice-selector then calls it
+  **same-origin** (no CORS, no HTTPS mixed-content, no extra port through Traefik/tailscale),
+  reusing the server that already serves the frontend and mints tokens. The worker consumes
+  the global live per sentence via a `voice_source` getter on the TTS plugin, so a switch
+  applies on the next utterance with no restart. Persistence is a small JSON file under XDG
+  state (`VOICE_STATE_PATH`), shared by both processes on the Pi.
+
 ## Alternatives considered
 
 - **Stay on the `pasha` clone (stable, no emotion)** — shippable but flat; rejected as the target is an
