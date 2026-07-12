@@ -81,13 +81,14 @@ def test_filter_strips_wake_when_active():
     assert ws.filter_transcript("Приней, сколько времени") == "сколько времени"
 
 
-def test_stop_phrase_blanks_and_sleeps_on_turn():
+def test_stop_phrase_blanks_and_sleeps_immediately():
     events, pub = _collect()
     ws = WakeState(enabled=True, publish=pub)
     ws.on_wake_detected("hey_jarvis", 0.8)
-    assert ws.filter_transcript("Приней, стоп") == ""      # blanked from display
-    assert ws.should_drop_turn("") is True                 # dropped...
-    assert ws.active is False                              # ...and asleep
+    assert ws.filter_transcript("Приней, стоп") == ""      # blanked from display...
+    assert ws.active is False                              # ...and asleep AT FILTER TIME
+    # (not deferred: an empty-text turn may never reach on_user_turn_completed)
+    assert ws.should_drop_turn("") is True                 # and the turn is dropped
     assert [json.loads(e)["state"] for e in events] == ["active", "dormant"]
 
 
@@ -131,6 +132,15 @@ def test_strict_mode_sleeps_after_each_answer():
     # Next turn needs a wake word again — even a barge-in requires one in strict.
     assert ws.should_transcribe() is False
     assert [json.loads(e)["state"] for e in events] == ["active", "dormant"]
+
+
+def test_strict_mode_bare_wake_still_sleeps():
+    # Regression: a lone wake word in strict mode must NOT leave a lingering Active
+    # window (there is no silence timer in strict mode to rescue it).
+    ws = WakeState(enabled=True, followup=False)
+    ws.on_wake_detected("hey_jarvis", 0.8)
+    assert ws.should_drop_turn("") is True   # bare wake, nothing to answer → dropped
+    assert ws.active is False                # and asleep — not stuck Active forever
 
 
 # -- silence timer ------------------------------------------------------------

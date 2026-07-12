@@ -28,7 +28,11 @@ WAKE_WORDS: tuple[str, ...] = ("Приней", "Приня", "хей джарв�
 # "джарвис" would (a bare surname must NOT match — it is not a wake word).
 #   - Приней / Приня + а few phonetic neighbours whisper emits (принэй, приней…)
 #   - хей|хэй|эй + джарвис (the «хей» is the velar-Х the model is soft on)
-_WAKE_ALT = r"(?:х[эе]?й\s+джарвис|эй\s+джарвис|принэй|приней|приня)"
+# The trailing ``\b`` is essential: without it "приня" would prefix-match and
+# corrupt common Russian words that start the same way — «принять» → «ть»,
+# «принял» → «л». The word boundary makes it a whole-token match (no boundary
+# between «приня» and the «т» of «принять», so it correctly does NOT match).
+_WAKE_ALT = r"(?:х[эе]?й\s+джарвис|эй\s+джарвис|принэй|приней|приня)\b"
 
 # Leading wake word + trailing punctuation/space (one-breath prefix to strip).
 _LEADING_RE = re.compile(rf"^\s*{_WAKE_ALT}\s*[,.!?…—\-]*\s*", re.IGNORECASE)

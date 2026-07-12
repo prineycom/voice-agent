@@ -108,11 +108,18 @@ class WakeWordDetector:
                 if not self._should_detect():
                     continue  # Active already — draining only, no scoring
 
-                # Score off the event loop (predict is ~75 ms of CPU).
-                scores = await loop.run_in_executor(
-                    self._executor, self._model.predict, self._buf.copy()
-                )
-                self._check(scores)
+                # Score off the event loop (predict is ~75 ms of CPU). A transient
+                # predict failure must NOT kill the gate: log once and keep scoring
+                # (otherwise one bad frame would deafen the agent for the session).
+                try:
+                    scores = await loop.run_in_executor(
+                        self._executor, self._model.predict, self._buf.copy()
+                    )
+                    self._check(scores)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("wake-word predict failed; skipping this window")
         except asyncio.CancelledError:
             raise
         except Exception:

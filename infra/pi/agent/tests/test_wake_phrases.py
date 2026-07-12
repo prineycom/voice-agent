@@ -40,6 +40,22 @@ def test_strip_non_wake_unchanged():
     assert strip_wake_word("принеси воды") == "принеси воды"  # near-miss, NOT stripped
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "принять решение",   # «приня» is a prefix — must NOT be stripped to «ть решение»
+        "приняли закон",
+        "принял душ",
+        "принятие мер",
+        "принесите счёт",
+    ],
+)
+def test_strip_does_not_corrupt_prefix_words(raw):
+    # The trailing word boundary keeps «приня»/«приней» a whole-word match.
+    assert strip_wake_word(raw) == raw
+    assert not is_only_wake_word(raw)
+
+
 def test_strip_preserves_inner_text():
     assert strip_wake_word("Приней   —   привет мир") == "привет мир"
 

@@ -32,6 +32,13 @@ export function createAgentState(badgeEl) {
     render('listening'); // the natural just-woken state; the agent's real state follows
   }
 
+  // Clear wake state on disconnect so a stale «спит» from a prior session can't
+  // pin the badge and swallow the next connection's lk.agent.state updates.
+  function reset() {
+    dormant = false;
+    last = null;
+  }
+
   function watch(participant) {
     const apply = () => {
       const st = participant.attributes && participant.attributes['lk.agent.state'];
@@ -41,5 +48,5 @@ export function createAgentState(badgeEl) {
     participant.on('attributesChanged', apply);
   }
 
-  return { set, watch, setDormant, setAwake };
+  return { set, watch, setDormant, setAwake, reset };
 }

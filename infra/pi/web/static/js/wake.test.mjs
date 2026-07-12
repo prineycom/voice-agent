@@ -59,6 +59,25 @@ function fakeBadge() {
   eq(agentState.calls, ['awake', 'dormant'], 'dormant sleeps the badge');
 }
 
+// --- connect-time dormant "announce" is SILENT (no sleep chime) -------------
+{
+  const chimes = [];
+  const motion = fakeMotion();
+  const agentState = fakeAgentState();
+  const wake = createWakeSignal({ motion, agentState, playChime: (k) => chimes.push(k) });
+
+  // First event after connect is the agent's initial dormant sync.
+  wake.handle({ type: 'wake', state: 'dormant' });
+  eq(chimes, [], 'the initial dormant announce plays NO chime (it is a sync, not a sleep)');
+  eq(motion.calls, ['dormant'], 'but the avatar still settles to idle');
+  eq(agentState.calls, ['dormant'], 'and the badge still shows «спит»');
+
+  // A later real active→dormant DOES chime.
+  wake.handle({ state: 'active' });
+  wake.handle({ state: 'dormant' });
+  eq(chimes, ['active', 'dormant'], 'a real active→dormant transition chimes');
+}
+
 // --- de-dup repeated/lossy re-sends -----------------------------------------
 {
   const chimes = [];

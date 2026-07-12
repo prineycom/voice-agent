@@ -70,13 +70,18 @@ export function createWakeSignal({ motion, agentState, log, playChime } = {}) {
     const state = evt && evt.state;
     if (state !== 'active' && state !== 'dormant') return;
     if (state === lastState) return; // de-dup the lossy re-sends / repeats
+    const prev = lastState;
     lastState = state;
 
-    chime(state);
     if (state === 'active') {
+      chime('active'); // waking is always worth an audible cue
       if (motion) motion.applyMotionEvent({ state: 'listening' }); // perk up
       if (agentState) agentState.setAwake();
     } else {
+      // Chime ONLY a real sleep (active → dormant). The connect-time dormant
+      // "announce" (prev === null, a state sync — not a transition) updates the
+      // badge/avatar silently, so the user doesn't hear a sleep blip on connect.
+      if (prev === 'active') chime('dormant');
       if (motion) motion.applyMotionEvent({ state: 'dormant' }); // settle → idle
       if (agentState) agentState.setDormant();
     }

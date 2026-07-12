@@ -116,6 +116,7 @@ const hooks = {
     connectBtn.onclick = doConnect;
     setComposerEnabled(false);
     wake.reset();
+    agentState.reset();
   },
   onAgentState: (state) => {
     // Leaving 'speaking' = agent audio stopped (playout done or barge-in):

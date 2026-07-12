@@ -75,7 +75,6 @@ class WakeState:
         self.silence_timeout = silence_timeout
         self._publish = publish
         self._active = False
-        self._stop_pending = False
         self._timer: asyncio.TimerHandle | None = None
 
     # -- queries ---------------------------------------------------------------
@@ -134,16 +133,18 @@ class WakeState:
 
     # -- transcript side (called from the STT plugin) --------------------------
     def filter_transcript(self, raw: str) -> str:
-        """Strip the leading wake word for display+LLM; flag a stop phrase.
+        """Strip the leading wake word for display+LLM; act on a stop phrase.
 
         Returns the text to show/forward. A stop command is blanked (it is a
-        control phrase, not something to display or answer) and remembered so
-        ``should_drop_turn`` sleeps the agent and drops the turn.
+        control phrase, not something to display or answer) AND sleeps the agent
+        immediately here — not deferred to ``should_drop_turn`` — because the
+        framework may never call ``on_user_turn_completed`` for an empty-text turn,
+        which would otherwise leave the stop unhonored.
         """
         if not self.enabled:
             return raw
         if is_stop_phrase(raw):
-            self._stop_pending = True
+            self.sleep("stop phrase")
             return ""
         return strip_wake_word(raw)
 
@@ -151,26 +152,24 @@ class WakeState:
     def should_drop_turn(self, text: str) -> bool:
         """Whether to drop this user turn instead of answering it.
 
-        ``text`` is the already-stripped transcript. Dropped when: a stop phrase
-        fired (→ sleep), the agent is Dormant (speech not addressed to it), or the
+        ``text`` is the already-stripped transcript. Dropped when the agent is
+        Dormant (speech not addressed to it, incl. right after a stop phrase) or the
         turn was only a wake word (woke it, nothing to answer). A real request in
-        Active mode is kept; in strict (follow-up off) mode the agent sleeps right
-        after so the next turn needs a wake word again.
+        Active mode is answered. In strict (follow-up off) mode the agent sleeps
+        right after THIS turn regardless of content, so there is never a lingering
+        Active window and the next turn needs a wake word again.
         """
         if not self.enabled:
             return False
-        if self._stop_pending:
-            self._stop_pending = False
-            self.sleep("stop phrase")
-            return True
         if not self._active:
             return True  # Dormant: ignore (STT was gated; text is empty anyway)
         self._note_activity()
-        if not text.strip() or is_only_wake_word(text):
-            return True  # woke with no request → stay Active, answer nothing
+        empty = not text.strip() or is_only_wake_word(text)
         if not self.followup:
+            # Strict: one turn per wake word — sleep after this turn no matter what
+            # (a bare wake with no request must not leave a persistent Active window).
             self.sleep("strict follow-up: one turn per wake word")
-        return False
+        return empty  # drop a bare wake / empty; answer a real request
 
     def note_agent_activity(self) -> None:
         """Reset the silence timer on an agent turn boundary (it just spoke)."""

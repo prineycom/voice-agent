@@ -327,15 +327,27 @@ async def entrypoint(ctx: JobContext) -> None:
             return
         if track.sid in wake_detectors:
             return
-        detector = WakeWordDetector(
-            model_paths=list(cfg.wakeword_model_paths),
-            thresholds=cfg.wakeword_thresholds,
-            default_threshold=cfg.wakeword_threshold,
-            on_detected=wake_state.on_wake_detected,
-            should_detect=lambda: not wake_state.active,
-            stride_s=cfg.wakeword_stride_s,
-        )
-        detector.start(track)
+        try:
+            detector = WakeWordDetector(
+                model_paths=list(cfg.wakeword_model_paths),
+                thresholds=cfg.wakeword_thresholds,
+                default_threshold=cfg.wakeword_threshold,
+                on_detected=wake_state.on_wake_detected,
+                should_detect=lambda: not wake_state.active,
+                stride_s=cfg.wakeword_stride_s,
+            )
+            detector.start(track)
+        except Exception:
+            # Fail OPEN: a missing/corrupt model or a detector-start failure must
+            # NOT leave the agent permanently Dormant and deaf (it can never be
+            # woken without the classifier). Disable the gate so the agent reverts
+            # to always-listening — degraded, but responsive — and say so loudly.
+            log.exception(
+                "wake-word detector failed to start; falling back to always-listening "
+                "(WAKEWORD gate disabled for this session)"
+            )
+            wake_state.enabled = False
+            return
         wake_detectors[track.sid] = detector
 
     if wake_state is not None:
@@ -343,6 +355,14 @@ async def entrypoint(ctx: JobContext) -> None:
         @ctx.room.on("track_subscribed")
         def _on_track_subscribed(track, publication, participant) -> None:  # noqa: ANN001
             _start_wake_detector(track)
+
+        @ctx.room.on("track_unsubscribed")
+        def _on_track_unsubscribed(track, publication, participant) -> None:  # noqa: ANN001
+            # A track ended (reconnect, device switch): close + drop its detector
+            # so reconnects don't leak worker threads / AudioStreams.
+            detector = wake_detectors.pop(track.sid, None)
+            if detector is not None:
+                asyncio.create_task(detector.aclose())
 
         # Catch tracks already subscribed before this handler was registered
         # (the participant may have joined before dispatch reached here).
