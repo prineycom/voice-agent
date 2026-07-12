@@ -15,6 +15,7 @@ import { createFacial } from './facial.js';
 import { createAccents } from './accents.js';
 import { createBlendshapes } from './blendshapes.js';
 import { createFaceDebug } from './facedebug.js';
+import { createVoices } from './voices.js';
 
 const connectBtn = document.getElementById('connectBtn');
 const muteBtn = document.getElementById('muteBtn');
@@ -168,5 +169,12 @@ muteBtn.onclick = async () => {
   muteBtn.textContent = muted ? '🎤 Unmute' : '🔇 Mute';
   micLabelEl.textContent = muted ? 'выключен' : 'активен';
 };
+
+// Voice selector: lists the switchable CustomVoice presets from the backend and
+// switches the agent's persisted global Voice (ADR-0020 / #48). Same-origin, so
+// it loads immediately on page load and reflects the persisted active Voice —
+// independent of the LiveKit connection.
+const voices = createVoices(document.getElementById('voices'), { log: logger.log });
+voices.load();
 
 logger.log('готов. SDK ' + (window.LivekitClient.version || '2.x'));

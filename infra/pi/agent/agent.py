@@ -56,6 +56,7 @@ from hermes_tasks import UI_TOPIC
 from motion_events import DEFAULT_EMOTION, EmotionTagStripper, motion_event_json
 from stt_plugin import DesktopSTT
 from tts_plugin import DesktopTTS
+import voice_state
 from worker_tools import (
     cancel_hermes_tasks,
     delegate_to_hermes,
@@ -375,6 +376,13 @@ async def entrypoint(ctx: JobContext) -> None:
     # (same lossy UI_TOPIC channel), and reads the current emotion at each flush.
     desktop_tts.set_publisher(publish_motion)
     desktop_tts.set_emotion_source(lambda: agent.current_emotion)
+    # Active Voice (speaker) is a persisted server-side global switched via the
+    # voice-switcher HTTP endpoint; read it live per sentence so a switch applies
+    # on the next utterance with no reconnect (ADR-0020 / #48). Uses
+    # active_voice_or_none so an un-switched system keeps sending the engine-
+    # agnostic cfg.tts_voice ("default") rather than a concrete CustomVoice preset
+    # a non-CustomVoice engine could not resolve on rollback.
+    desktop_tts.set_voice_source(voice_state.active_voice_or_none)
 
     await session.start(
         agent=agent,

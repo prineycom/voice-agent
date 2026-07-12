@@ -12,6 +12,7 @@ import { createRoomController } from './room.js';
 import { createBlendshapes } from './blendshapes.js';
 import { createFaceRenderer } from './face3d-renderer.js';
 import { createFaceSinks } from './face3d-sinks.js';
+import { createVoices } from './voices.js';
 
 const connectBtn = document.getElementById('connectBtn');
 const muteBtn = document.getElementById('muteBtn');
@@ -170,5 +171,11 @@ muteBtn.onclick = async () => {
   muteBtn.textContent = muted ? '🎤 Unmute' : '🔇 Mute';
   micLabelEl.textContent = muted ? 'выключен' : 'активен';
 };
+
+// Voice selector: same shared backend (/voices, /voice) as the Live2D page, so
+// the switch persists globally and applies to the agent regardless of which
+// frontend chose it (ADR-0020 / #48). Loads on page load, same-origin.
+const voices = createVoices(document.getElementById('voices'), { log: logger.log });
+voices.load();
 
 logger.log('готов. SDK ' + (window.LivekitClient.version || '2.x'));

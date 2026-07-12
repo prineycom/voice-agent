@@ -15,12 +15,21 @@ A2E_DIMS = [
     "anger", "amazement", "cheekiness", "sadness", "fear",
 ]
 
-# Shared enum (SOUL.md / agent) → A2E dimension weights.
+# Shared enum (SOUL.md / agent, expanded 5 → 10 in ADR-0020) → A2E dimension
+# weights. This is a *boost* reinforcing the Audio2Emotion baseline (which now
+# reads the expressive CustomVoice audio), not the sole face source — so enums
+# without a clean A2E dimension (calm, serious) map to `{}` and let A2E drive.
+# Any unknown enum also falls back to `{}` (pure A2E), so new tags never crash.
 _ENUM_TO_A2E = {
     "neutral": {},
     "happy": {"joy": 1.0},
     "sad": {"sadness": 1.0, "grief": 0.3},
+    "excited": {"joy": 0.8, "amazement": 0.4},
+    "calm": {},
+    "serious": {},
     "surprised": {"amazement": 1.0},
+    "angry": {"anger": 1.0},
+    "tender": {"joy": 0.3},
     "thinking": {"cheekiness": 0.4},
 }
 

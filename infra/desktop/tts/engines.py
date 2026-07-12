@@ -75,20 +75,70 @@ class TTSEngine(ABC):
         """Extra fields this engine contributes to the `/health` response."""
         return {}
 
+    def _read_sampling_env(self) -> None:
+        """Populate the shared sampling knobs from `TTS_*` env vars.
+
+        Shared by the instruct-capable engines (ADR-0020 defaults: temperature 0.8
+        / top_p 0.9 / top_k 50 / repetition_penalty 1.05). NO fixed seed on purpose
+        — a global seed freezes one random draw (the sampling lottery). One place so
+        the engines can never drift apart on defaults.
+        """
+        self.temperature = float(os.getenv("TTS_TEMPERATURE", "0.8"))
+        self.top_p = float(os.getenv("TTS_TOP_P", "0.9"))
+        self.top_k = int(os.getenv("TTS_TOP_K", "50"))
+        self.repetition_penalty = float(os.getenv("TTS_REPETITION_PENALTY", "1.05"))
+
 
 # --------------------------------------------------------------------------- #
 # CustomVoice — predefined speaker IDs
 # --------------------------------------------------------------------------- #
+# Emotion enum → English `instruct` clause, applied per sentence on top of the
+# fixed speaker (ADR-0020 decision #3). CustomVoice obeys `instruct` as a trained
+# input, so a short prosody-only clause reliably shifts delivery without changing
+# the speaker's timbre. Keys mirror the shared enum (agent motion_events.EMOTIONS).
+# `neutral` (and any unknown/vector emotion) → no instruct = the plain speaker.
+# English + prosody-focused per the 2026-07-11 tuning (physical descriptors beat
+# feeling-words; Russian output stays clean because language=Russian is forced).
+# No intensity dimension in v1 — each clause encodes a fixed moderate strength.
+CUSTOMVOICE_EMOTION_INSTRUCT = {
+    "neutral": "",
+    "happy": "Speak in a warm, cheerful, upbeat tone with a lively pace and bright pitch.",
+    "sad": "Speak in a soft, subdued, sorrowful tone with a slow pace and low pitch.",
+    "excited": "Speak in an energetic, enthusiastic tone with a fast pace and high, animated pitch.",
+    "calm": "Speak in a relaxed, gentle, reassuring tone with a slow, even pace.",
+    "serious": "Speak in a firm, measured, matter-of-fact tone with a steady pace and level pitch.",
+    "surprised": "Speak in an astonished tone with sudden emphasis and a rising pitch.",
+    "angry": "Speak in a tense, forceful, irritated tone with sharp emphasis and a hard edge.",
+    "tender": "Speak in a soft, affectionate, caring tone with a gentle, warm pace.",
+    "thinking": "Speak in a thoughtful, contemplative tone with a slow, measured, hesitant pace.",
+}
+
+
 class CustomVoiceEngine(TTSEngine):
-    """Predefined speaker IDs (aiden, ryan, serena, …). Model: CustomVoice."""
+    """Predefined speaker IDs (ryan, aiden, serena, …). Model: CustomVoice.
+
+    Per-sentence emotion (ADR-0020): the ``emotion`` enum tag maps to an English
+    ``instruct`` clause (``CUSTOMVOICE_EMOTION_INSTRUCT``); ``neutral``/unknown/a
+    raw A2E vector → no instruct (the plain speaker). The speaker (timbre) and the
+    emotion (delivery) are orthogonal axes.
+    """
 
     name = "custom_voice"
 
     def __init__(self) -> None:
         self.model_name = os.getenv("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
         self.language = os.getenv("TTS_LANGUAGE", "Russian")
-        self.speaker = os.getenv("TTS_SPEAKER", "aiden")
+        # `ryan` is the production speaker (ADR-0020): CustomVoice obeys `instruct`
+        # as a trained input and the seed lottery nearly vanishes vs the clone.
+        self.speaker = os.getenv("TTS_SPEAKER", "ryan")
         self.chunk_size = int(os.getenv("TTS_CHUNK_SIZE", "4"))
+        # Sampling knobs (ADR-0020: temperature 0.8 / top_p 0.9, no fixed seed).
+        self._read_sampling_env()
+        # Upper bound on generated audio tokens per sentence — the runaway guard
+        # (ADR-0020 watch-out: `calm`/number+latin sentences can over-stretch). The
+        # model is 12Hz, so ~12 tokens/s of audio; the default caps a single
+        # sentence's audio length. Tunable per the #51 emotion pass.
+        self.max_new_tokens = int(os.getenv("TTS_MAX_NEW_TOKENS", "2048"))
         self._model = None
 
     def load(self) -> None:
@@ -96,18 +146,41 @@ class CustomVoiceEngine(TTSEngine):
 
         self._model = FasterQwen3TTS.from_pretrained(self.model_name)
 
+    @staticmethod
+    def _instruct_for(emotion) -> str | None:
+        """Map the per-sentence emotion tag → an `instruct` clause, or None.
+
+        `neutral`/None/unknown/a raw A2E vector → None (plain speaker). Only a
+        known enum string with a non-empty clause returns an instruct.
+        """
+        if not isinstance(emotion, str):
+            return None
+        clause = CUSTOMVOICE_EMOTION_INSTRUCT.get(emotion.strip().lower(), "")
+        return clause or None
+
     def stream_pcm(self, text: str, voice: str = "default", emotion=None):
         speaker = self.speaker if voice in (None, "", "default") else voice
         for audio_chunk, sr, *_ in self._model.generate_custom_voice_streaming(
             text=text,
             language=self.language,
             speaker=speaker,
+            instruct=self._instruct_for(emotion),
             chunk_size=self.chunk_size,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
+            max_new_tokens=self.max_new_tokens,
         ):
             yield _emit_pcm(audio_chunk, sr)
 
     def health_fields(self) -> dict:
-        return {"speaker": self.speaker}
+        return {
+            "speaker": self.speaker,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_new_tokens": self.max_new_tokens,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -178,6 +251,14 @@ class VoiceCloneEngine(TTSEngine):
         self.model_name = os.getenv("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
         self.language = os.getenv("TTS_LANGUAGE", "Russian")
         self.chunk_size = int(os.getenv("TTS_CHUNK_SIZE", "8"))
+        # Sampling knobs (ADR-0020 defaults: 0.8 / 0.9 / 50 / 1.05, no fixed seed —
+        # a global seed freezes one draw, robotic/wrong for some utterances). See
+        # the 2026-07-11 seed/emotion investigation.
+        self._read_sampling_env()
+        # Optional single fixed style hint for the baseline voice (empty → none).
+        # Per-utterance emotion via instruct is NOT reliable on the clone, so this
+        # is one steady mood, not LLM-driven. Kept off by default.
+        self.instruct = os.getenv("TTS_CLONE_INSTRUCT", "").strip() or None
         self.refs: dict[str, VoiceRef] = {r.name: r for r in _parse_refs()}
         # `default` resolves to the first configured profile.
         self._default_name = next(iter(self.refs))
@@ -206,6 +287,11 @@ class VoiceCloneEngine(TTSEngine):
             ref_audio=str(ref.audio_path),
             ref_text=ref.ref_text,
             chunk_size=self.chunk_size,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
+            instruct=self.instruct,
         ):
             yield _emit_pcm(audio_chunk, sr)
 

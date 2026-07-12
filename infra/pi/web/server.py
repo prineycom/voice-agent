@@ -23,6 +23,7 @@ worker uses.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 from datetime import timedelta
@@ -33,6 +34,26 @@ from urllib.parse import parse_qs, urlparse
 from livekit.api import AccessToken, DeleteRoomRequest, LiveKitAPI, VideoGrants
 
 HERE = Path(__file__).resolve().parent
+
+
+def _load_voice_state():
+    """Load the agent worker's pure-stdlib `voice_state` module by path.
+
+    The agent worker owns the active-Voice state (catalog + persisted global);
+    this front door just exposes it over HTTP same-origin for the frontend voice
+    switcher (ADR-0020 / #48). Loaded via importlib rather than
+    `sys.path.insert(agent_dir)` so the sibling agent package's modules
+    (config.py, health.py, agent.py, …) can never shadow same-named top-level
+    imports elsewhere in this process.
+    """
+    path = HERE.parent / "agent" / "voice_state.py"
+    spec = importlib.util.spec_from_file_location("voice_state", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+voice_state = _load_voice_state()
 INDEX_HTML = HERE / "index.html"
 FACE3D_HTML = HERE / "face3d.html"
 STATIC_ROOT = HERE / "static"
@@ -176,6 +197,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, status: int, payload: dict) -> None:
+        self._send(status, json.dumps(payload).encode(), "application/json; charset=utf-8")
+
+    def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
+        route = urlparse(self.path).path
+        if route != "/voice":
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+            return
+        # Set the active Voice (persisted global). Body: {"voice": "<preset>"}.
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            body = json.loads(raw or b"{}")
+            name = body.get("voice") if isinstance(body, dict) else None
+        except ValueError:
+            self._send_json(400, {"error": "invalid JSON body"})
+            return
+        try:
+            voice_state.set_active_voice(name)
+        except (ValueError, TypeError) as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            # Disk full / permission on the state dir: report a clean 500 rather
+            # than letting the handler crash with a traceback + broken response.
+            self._send_json(500, {"error": f"could not persist voice: {exc}"})
+            return
+        # Echo the new state so the caller (and the UI) reflects it immediately.
+        self._send_json(200, voice_state.state())
+
     def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
         parsed = urlparse(self.path)
         route = parsed.path
@@ -204,6 +258,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/healthz":
             self._send(200, b"ok", "text/plain; charset=utf-8")
+            return
+
+        if route == "/voices":
+            # The switchable Voice catalog + which is active (persisted global).
+            self._send_json(200, voice_state.state())
             return
 
         if route == "/token":

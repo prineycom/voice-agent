@@ -1,5 +1,7 @@
 // Background-operations + tool-call visualization driven by LiveKit data
 // messages on the `voiceagent` topic.
+import { esc } from './html.js';
+
 export function createOps(opsEl, toolfeedEl, { log, onMotion }) {
   let opsState = { running: [], queued: [] };  // last task snapshot
   let opsBase = 0;                  // performance.now() when the snapshot arrived (for live elapsed)
@@ -83,10 +85,6 @@ export function createOps(opsEl, toolfeedEl, { log, onMotion }) {
     seenEvents.clear();
     drawOps();
     toolfeedEl.innerHTML = '<div class="ops-empty">пока пусто</div>';
-  }
-
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   }
 
   function startTick() {

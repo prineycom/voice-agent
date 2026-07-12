@@ -22,7 +22,16 @@ import json
 import re
 from typing import Callable
 
-EMOTIONS = ("neutral", "happy", "sad", "surprised", "thinking")
+# Emotion enum — the single source of truth shared by SOUL.md, the agent, the
+# Desktop CustomVoice `instruct` map (engines.CUSTOMVOICE_EMOTION_INSTRUCT) and,
+# via the A2E boost, the avatar (a2f/emotion.py, a2f/arkit.py). Expanded 5 → 10 in
+# ADR-0020: the face now rides Audio2Emotion, so the set is chosen for what sounds
+# good on CustomVoice `ryan`, not for what the avatar can render. Any unknown tag
+# clamps to `neutral` (normalize_emotion). Keep these copies in sync when editing.
+EMOTIONS = (
+    "neutral", "happy", "sad", "excited", "calm",
+    "serious", "surprised", "angry", "tender", "thinking",
+)
 DEFAULT_EMOTION = "neutral"
 
 # Matches a well-formed inline emotion tag, e.g. "[emotion:happy]" or "[emotion: Sad ]".

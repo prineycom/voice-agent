@@ -521,6 +521,36 @@ async def test_emotion_threaded_per_sentence(tts_server_factory):
 
 
 @pytest.mark.asyncio
+async def test_voice_source_read_live_per_sentence(tts_server_factory):
+    # The active-Voice getter is read at send time, so a switch mid-reply applies
+    # to the very next sentence (ADR-0020 / #48).
+    srv = await tts_server_factory(
+        lambda i: [_S1_PCM] if i == 0 else [_S2_PCM], loop=True
+    )
+    tts_impl = DesktopTTS(ws_url=srv.url, voice="default")
+
+    voices = iter(["ryan", "aiden"])
+    tts_impl.set_voice_source(lambda: next(voices, "ryan"))
+    await _drive(tts_impl.stream(), "First sentence here. Second sentence now.")
+    assert [r["voice"] for r in srv.received] == ["ryan", "aiden"]
+
+    # A falsy/raising getter falls back to the constructor voice ("default").
+    srv.received.clear()
+    tts_impl.set_voice_source(lambda: "")
+    await _drive(tts_impl.stream(), "Fallback one.")
+    assert srv.received[0]["voice"] == "default"
+
+    srv.received.clear()
+    def _boom():
+        raise RuntimeError("lookup failed")
+    tts_impl.set_voice_source(_boom)
+    await _drive(tts_impl.stream(), "Fallback two.")
+    assert srv.received[0]["voice"] == "default"
+
+    await tts_impl.aclose()
+
+
+@pytest.mark.asyncio
 async def test_blendshape_t_rebased_monotonic_across_reply(tts_server_factory):
     # Each sentence's PCM is 4800 bytes = 2400 samples @24kHz = exactly 0.1s of
     # audio, so sentence-2's frames must be offset by 0.1s from their sentence-

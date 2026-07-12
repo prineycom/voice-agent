@@ -151,6 +151,10 @@ class DesktopTTS(tts.TTS):
         # Zero-arg getter returning the current emotion tag, read at flush time so
         # the latest expression before each sentence wins. None → "neutral".
         self._emotion_source = None
+        # Zero-arg getter returning the current active Voice (speaker), read at
+        # send time so a voice switch takes effect on the next sentence with no
+        # reconnect. None → the constructor `voice` (static default).
+        self._voice_source = None
 
     def set_publisher(self, publish) -> None:
         """Set the `voiceagent` data-channel publisher (async or sync, bytes)."""
@@ -159,6 +163,26 @@ class DesktopTTS(tts.TTS):
     def set_emotion_source(self, getter) -> None:
         """Set the zero-arg getter for the current emotion tag."""
         self._emotion_source = getter
+
+    def set_voice_source(self, getter) -> None:
+        """Set the zero-arg getter for the current active Voice (speaker)."""
+        self._voice_source = getter
+
+    def _current_voice(self) -> str:
+        """Current Voice for the outgoing request, read live at send time.
+
+        Falls back to the constructor `voice` when no source is set or it returns
+        a falsy value, so the static default (cfg.tts_voice) still applies.
+        """
+        source = self._voice_source
+        if source is not None:
+            try:
+                voice = source()
+            except Exception:  # noqa: BLE001 — never let voice lookup break TTS
+                voice = None
+            if voice:
+                return voice
+        return self._voice
 
     def _current_emotion(self) -> str:
         """Current emotion for the outgoing request, clamped to the known enum.
@@ -252,7 +276,7 @@ class ChunkedStream(tts.ChunkedStream):
                 json.dumps(
                     {
                         "text": self._input_text,
-                        "voice": self._tts._voice,
+                        "voice": self._tts._current_voice(),
                         "emotion": self._tts._current_emotion(),
                     }
                 )
@@ -378,7 +402,7 @@ class DesktopSynthesizeStream(tts.SynthesizeStream):
                             json.dumps(
                                 {
                                     "text": text,
-                                    "voice": self._tts._voice,
+                                    "voice": self._tts._current_voice(),
                                     "emotion": self._tts._current_emotion(),
                                 }
                             )
