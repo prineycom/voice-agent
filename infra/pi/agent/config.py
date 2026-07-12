@@ -93,9 +93,10 @@ class AgentConfig:
     wakeword_thresholds: dict[str, float]
     wakeword_threshold: float  # fallback for models absent from thresholds.json
     wakeword_stride_s: float
-    # Active window: auto-sleep after this much silence (the follow-up strict-mode
-    # flag is added in #59).
+    # Active window (#59): auto-sleep after this much silence; follow-up OFF =
+    # strict (every user turn needs a wake word).
     wakeword_silence_timeout: float
+    wakeword_followup: bool
 
 
 def load_config() -> AgentConfig:
@@ -198,4 +199,5 @@ def load_config() -> AgentConfig:
         wakeword_threshold=_env_float("WAKEWORD_THRESHOLD", 0.5),
         wakeword_stride_s=_env_float("WAKEWORD_STRIDE_S", 0.5),
         wakeword_silence_timeout=_env_float("WAKEWORD_SILENCE_TIMEOUT", 8.0),
+        wakeword_followup=_env_bool("WAKEWORD_FOLLOWUP", default=True),
     )

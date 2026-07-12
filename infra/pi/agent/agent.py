@@ -311,6 +311,7 @@ async def entrypoint(ctx: JobContext) -> None:
     if cfg.wakeword_enabled:
         wake_state = WakeState(
             enabled=True,
+            followup=cfg.wakeword_followup,
             silence_timeout=cfg.wakeword_silence_timeout,
             publish=publish_motion,
         )

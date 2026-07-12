@@ -64,6 +64,25 @@ def test_filter_strips_wake_when_active():
     assert ws.filter_transcript("Приней, сколько времени") == "сколько времени"
 
 
+def test_stop_phrase_blanks_and_sleeps_on_turn():
+    events, pub = _collect()
+    ws = WakeState(enabled=True, publish=pub)
+    ws.on_wake_detected("hey_jarvis", 0.8)
+    assert ws.filter_transcript("Приней, стоп") == ""      # blanked from display
+    assert ws.should_drop_turn("") is True                 # dropped...
+    assert ws.active is False                              # ...and asleep
+    assert [json.loads(e)["state"] for e in events] == ["active", "dormant"]
+
+
+def test_bare_stop_does_not_sleep():
+    ws = WakeState(enabled=True)
+    ws.on_wake_detected("hey_jarvis", 0.8)
+    assert ws.filter_transcript("стоп") == "стоп"          # not a stop phrase
+    # a bare «стоп» is a normal (if odd) request → answered, still Active
+    assert ws.should_drop_turn("стоп") is False
+    assert ws.active is True
+
+
 # -- turn dropping ------------------------------------------------------------
 def test_dormant_turn_dropped():
     ws = WakeState(enabled=True)
@@ -79,18 +98,29 @@ def test_bare_wake_word_turn_dropped_but_stays_active():
     assert ws.active is True
 
 
-def test_real_request_kept_when_active():
-    ws = WakeState(enabled=True)
+def test_real_request_kept_in_followup():
+    ws = WakeState(enabled=True, followup=True)
     ws.on_wake_detected("hey_jarvis", 0.8)
     assert ws.should_drop_turn("сколько времени") is False
-    assert ws.active is True  # conversation window stays open
+    assert ws.active is True  # conversation window stays open (barge-in needs no wake)
+
+
+def test_strict_mode_sleeps_after_each_answer():
+    events, pub = _collect()
+    ws = WakeState(enabled=True, followup=False, publish=pub)
+    ws.on_wake_detected("hey_jarvis", 0.8)
+    assert ws.should_drop_turn("сколько времени") is False  # answered...
+    assert ws.active is False                               # ...then Dormant (strict)
+    # Next turn needs a wake word again — even a barge-in requires one in strict.
+    assert ws.should_transcribe() is False
+    assert [json.loads(e)["state"] for e in events] == ["active", "dormant"]
 
 
 # -- silence timer ------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_silence_timeout_sleeps():
     events, pub = _collect()
-    ws = WakeState(enabled=True, silence_timeout=0.05, publish=pub)
+    ws = WakeState(enabled=True, followup=True, silence_timeout=0.05, publish=pub)
     ws.on_wake_detected("hey_jarvis", 0.8)
     assert ws.active is True
     await asyncio.sleep(0.12)
@@ -100,7 +130,7 @@ async def test_silence_timeout_sleeps():
 
 @pytest.mark.asyncio
 async def test_activity_resets_timer():
-    ws = WakeState(enabled=True, silence_timeout=0.08)
+    ws = WakeState(enabled=True, followup=True, silence_timeout=0.08)
     ws.on_wake_detected("hey_jarvis", 0.8)
     for _ in range(3):
         await asyncio.sleep(0.05)
@@ -108,3 +138,13 @@ async def test_activity_resets_timer():
     assert ws.active is True
     await asyncio.sleep(0.12)  # now let it expire
     assert ws.active is False
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_has_no_persistent_timer():
+    ws = WakeState(enabled=True, followup=False, silence_timeout=0.05)
+    ws.on_wake_detected("hey_jarvis", 0.8)
+    # Strict mode: no conversation window, so the timer never auto-sleeps here;
+    # sleep happens on the answered turn instead (tested above).
+    await asyncio.sleep(0.1)
+    assert ws.active is True

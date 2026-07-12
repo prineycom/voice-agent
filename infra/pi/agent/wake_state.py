@@ -3,9 +3,9 @@
 One agent = one attention: a single `WakeState` per session holds whether the
 agent is **Dormant** (user speech ignored, heavy GPU STT gated off) or **Active**
 (speech processed normally). The audio classifier (`wake_detector`) flips it to
-Active on a wake-word hit; a silence timeout returns it to Dormant. Transitions
-are published on the `voiceagent` UI channel so the frontend can play the
-Activation signal (#60).
+Active on a wake-word hit; a silence timeout or a stop phrase returns it to
+Dormant. Transitions are published on the `voiceagent` UI channel so the frontend
+can play the Activation signal (#60).
 
 The class concentrates all the gating decisions so the framework wiring in
 `agent.py` stays thin:
@@ -14,17 +14,21 @@ The class concentrates all the gating decisions so the framework wiring in
   Desktop GPU round-trip entirely (only the cheap Pi-side classifier runs).
 - ``filter_transcript(raw)`` — strips the wake word from a finalized transcript
   (one-breath ``«Приней, сколько времени»`` → ``«сколько времени»``) for BOTH the
-  displayed transcript and the LLM.
+  displayed transcript and the LLM, and detects the stop phrase.
 - ``should_drop_turn(text)`` — after STT, decides whether the turn reaches the LLM
-  (drop a bare wake word or any turn while Dormant).
+  (drop a stop command, a bare wake word, or any turn while Dormant).
 
 Config:
 - ``enabled`` (WAKEWORD_ENABLED, default on) gates the whole feature. When off,
   ``should_transcribe`` is always True and nothing is stripped/dropped — today's
   always-listening behavior.
-- ``silence_timeout`` (default 8 s) — Active→Dormant after this much quiet (reset
-  on every user OR agent turn boundary). This is the trivial auto-sleep of the
-  core slice; the stop phrase and the strict follow-up mode arrive in #59.
+- ``followup`` (WAKEWORD_FOLLOWUP, default on) — Active is a conversation window
+  that auto-sleeps after ``silence_timeout``. Off = strict: every user turn needs
+  a wake word (the agent sleeps again right after each answered turn), so a
+  barge-in during the agent's reply also requires a wake word in strict mode
+  (in follow-up mode barge-in without a wake word works — Active stays open).
+- ``silence_timeout`` (WAKEWORD_SILENCE_TIMEOUT, default 8 s) — Active→Dormant
+  after this much quiet (reset on every user OR agent turn boundary).
 
 Thread/loop model: every method runs on the agent's asyncio loop (the detector,
 STT hooks and agent-state hooks all do). The silence timer uses ``loop.call_later``
@@ -38,7 +42,7 @@ import json
 import logging
 from typing import Callable
 
-from wake_phrases import is_only_wake_word, strip_wake_word
+from wake_phrases import is_only_wake_word, is_stop_phrase, strip_wake_word
 
 log = logging.getLogger("agent")
 
@@ -62,13 +66,16 @@ class WakeState:
         self,
         *,
         enabled: bool = True,
+        followup: bool = True,
         silence_timeout: float = DEFAULT_SILENCE_TIMEOUT,
         publish: Callable[[bytes], None] | None = None,
     ) -> None:
         self.enabled = enabled
+        self.followup = followup
         self.silence_timeout = silence_timeout
         self._publish = publish
         self._active = False
+        self._stop_pending = False
         self._timer: asyncio.TimerHandle | None = None
 
     # -- queries ---------------------------------------------------------------
@@ -106,7 +113,7 @@ class WakeState:
         self._arm_timer()
 
     def sleep(self, reason: str) -> None:
-        """Return to Dormant (silence timeout)."""
+        """Return to Dormant (silence timeout, stop phrase, or strict one-shot)."""
         self._cancel_timer()
         if not self._active:
             return
@@ -117,26 +124,42 @@ class WakeState:
 
     # -- transcript side (called from the STT plugin) --------------------------
     def filter_transcript(self, raw: str) -> str:
-        """Strip the leading wake word for the display + LLM (one-breath)."""
+        """Strip the leading wake word for display+LLM; flag a stop phrase.
+
+        Returns the text to show/forward. A stop command is blanked (it is a
+        control phrase, not something to display or answer) and remembered so
+        ``should_drop_turn`` sleeps the agent and drops the turn.
+        """
         if not self.enabled:
             return raw
+        if is_stop_phrase(raw):
+            self._stop_pending = True
+            return ""
         return strip_wake_word(raw)
 
     # -- turn side (called from Agent.on_user_turn_completed) ------------------
     def should_drop_turn(self, text: str) -> bool:
         """Whether to drop this user turn instead of answering it.
 
-        ``text`` is the already-stripped transcript. Dropped when the agent is
-        Dormant (speech not addressed to it) or the turn was only a wake word
-        (woke it, nothing to answer). A real request in Active mode is kept.
+        ``text`` is the already-stripped transcript. Dropped when: a stop phrase
+        fired (→ sleep), the agent is Dormant (speech not addressed to it), or the
+        turn was only a wake word (woke it, nothing to answer). A real request in
+        Active mode is kept; in strict (follow-up off) mode the agent sleeps right
+        after so the next turn needs a wake word again.
         """
         if not self.enabled:
             return False
+        if self._stop_pending:
+            self._stop_pending = False
+            self.sleep("stop phrase")
+            return True
         if not self._active:
             return True  # Dormant: ignore (STT was gated; text is empty anyway)
         self._note_activity()
         if not text.strip() or is_only_wake_word(text):
             return True  # woke with no request → stay Active, answer nothing
+        if not self.followup:
+            self.sleep("strict follow-up: one turn per wake word")
         return False
 
     def note_agent_activity(self) -> None:
@@ -147,9 +170,15 @@ class WakeState:
     # -- silence timer ---------------------------------------------------------
     def _note_activity(self) -> None:
         """A user or agent turn happened while Active: re-arm the silence timer."""
-        self._arm_timer()
+        if self.followup:
+            self._arm_timer()
+        else:
+            # Strict mode has no persistent window; the timer is moot.
+            self._cancel_timer()
 
     def _arm_timer(self) -> None:
+        if not self.followup:
+            return
         self._cancel_timer()
         try:
             loop = asyncio.get_running_loop()

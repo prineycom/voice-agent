@@ -6,8 +6,8 @@ module handles the *transcript* side of wake-word activation (ADR-0021):
 - ``strip_wake_word`` removes a leading wake word from a finalized transcript so a
   one-breath ``«Приней, сколько времени»`` reaches the LLM and the displayed
   transcript as just ``«сколько времени»`` (#58).
-- ``is_stop_phrase`` (added in #59) recognizes ``{wake} + стоп`` adjacent so
-  ``«Приней, стоп»`` sleeps the agent — while a bare ``«стоп»`` does not.
+- ``is_stop_phrase`` recognizes ``{wake} + стоп`` adjacent (any of the three names)
+  so ``«Приней, стоп»`` sleeps the agent — while a bare ``«стоп»`` does not (#59).
 
 Matching is deliberately lenient about the exact spelling the STT returns for the
 short Russian names: faster-whisper transcribes ``«хей джарвис»`` variably
@@ -33,6 +33,10 @@ _WAKE_ALT = r"(?:х[эе]?й\s+джарвис|эй\s+джарвис|принэй
 # Leading wake word + trailing punctuation/space (one-breath prefix to strip).
 _LEADING_RE = re.compile(rf"^\s*{_WAKE_ALT}\s*[,.!?…—\-]*\s*", re.IGNORECASE)
 
+# {wake} immediately followed by «стоп» (adjacent, punctuation/space allowed
+# between). Anchored on the wake word so a bare «стоп» never matches.
+_STOP_RE = re.compile(rf"{_WAKE_ALT}\s*[,.!?…—\-]*\s*стоп\b", re.IGNORECASE)
+
 # A transcript that is ONLY a wake word (nothing to answer) — user just woke it.
 _ONLY_WAKE_RE = re.compile(rf"^\s*{_WAKE_ALT}\s*[,.!?…—\-]*\s*$", re.IGNORECASE)
 
@@ -56,3 +60,13 @@ def is_only_wake_word(text: str) -> bool:
     nothing (stays Active, silent) rather than sending an empty prompt to the LLM.
     """
     return bool(_ONLY_WAKE_RE.match(text))
+
+
+def is_stop_phrase(text: str) -> bool:
+    """True if ``text`` contains ``{wake} + стоп`` adjacent (the Stop phrase).
+
+    Matches «Приней, стоп» / «хей джарвис стоп» / «Приня стоп». A bare «стоп»
+    (no wake word) returns False — stopping requires naming the agent, so an
+    incidental «стоп» mid-conversation never sleeps it (ADR-0021).
+    """
+    return bool(_STOP_RE.search(text))
