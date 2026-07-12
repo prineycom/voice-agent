@@ -49,6 +49,23 @@ def test_wake_activates_and_publishes():
     assert [json.loads(e)["state"] for e in events] == ["active"]
 
 
+def test_announce_publishes_current_state():
+    # A fresh session announces Dormant so the UI badge shows «спит» on connect.
+    events, pub = _collect()
+    ws = WakeState(enabled=True, publish=pub)
+    ws.announce()
+    assert [json.loads(e)["state"] for e in events] == ["dormant"]
+    ws.on_wake_detected("hey_jarvis", 0.8)
+    ws.announce()  # now Active
+    assert json.loads(events[-1])["state"] == "active"
+
+
+def test_announce_noop_when_disabled():
+    events, pub = _collect()
+    WakeState(enabled=False, publish=pub).announce()
+    assert events == []
+
+
 def test_repeated_wake_publishes_once():
     events, pub = _collect()
     ws = WakeState(enabled=True, publish=pub)

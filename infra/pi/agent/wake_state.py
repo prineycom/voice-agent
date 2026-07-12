@@ -112,6 +112,16 @@ class WakeState:
             self._publish(wake_event_json(STATE_ACTIVE))
         self._arm_timer()
 
+    def announce(self) -> None:
+        """Publish the CURRENT state (not a transition) so a fresh UI learns it.
+
+        Called once after the session starts: the agent begins Dormant and silent,
+        and this lets the frontend badge show «спит» immediately instead of waiting
+        for the first real transition (#60). Lossy channel, best-effort.
+        """
+        if self.enabled and self._publish is not None:
+            self._publish(wake_event_json(STATE_ACTIVE if self._active else STATE_DORMANT))
+
     def sleep(self, reason: str) -> None:
         """Return to Dormant (silence timeout, stop phrase, or strict one-shot)."""
         self._cancel_timer()

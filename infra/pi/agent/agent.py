@@ -491,6 +491,10 @@ async def entrypoint(ctx: JobContext) -> None:
         agent=agent,
         room=ctx.room,
     )
+    # Announce the initial Dormant state so a freshly-connected frontend shows the
+    # «спит» badge immediately (the agent starts Dormant and silent under wake).
+    if wake_state is not None:
+        wake_state.announce()
     log.info("Session started; greeting on agent enter, then STT → LLM → TTS loop.")
 
 
