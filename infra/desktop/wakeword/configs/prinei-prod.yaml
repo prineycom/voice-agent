@@ -1,0 +1,135 @@
+# =============================================================================
+# Voice Agent wake-word — production training config (livekit-wakeword + VoxCPM2)
+# =============================================================================
+# Trains ONE combined multi-keyword classifier that fires on all three project
+# wake words and rejects general Russian speech (epic #57 / ADR-0021). Runs on
+# the Desktop (RTX 4070) in the livekit-wakeword `train`+`voxcpm` env — NOT on the
+# Pi (the Pi only runs inference).
+#
+#   Install:   uv sync --extra train --extra voxcpm      (in a livekit-wakeword checkout)
+#   Prefetch:  livekit-wakeword setup --config prinei-prod.yaml
+#   Train:     livekit-wakeword run   prinei-prod.yaml
+#   Export ->  output/prinei_ru/prinei_ru.onnx  (copy to ../models/prinei.onnx)
+#   Evaluate:  livekit-wakeword eval  prinei-prod.yaml     # DET curve, AUT, FPPH
+#
+# VoxCPM2 backend is REQUIRED for the Russian phrases (the default Piper backbone
+# is English-US only). VoxCPM2 is stood up on the Desktop — see repo memory
+# desktop-tts-voxcpm2-prod and ADR-0018 for the env; point voxcpm_tts.local_model_path
+# at that snapshot to skip re-downloading weights.
+#
+# Multilingual accuracy is documented as LOWER than English and the names are
+# short — expect threshold tuning (see ../README.md "Thresholds"). The knobs to
+# push if recall is poor: raise n_samples / n_samples_val and add voice_design_prompts.
+# =============================================================================
+
+model_name: prinei_ru
+
+# All three project wake words in one model. "хей джарвис" is trained uniformly
+# here too; until this model is trained the interim gate uses the pretrained
+# openWakeWord hey_jarvis.onnx for that phrase (see ../README.md).
+target_phrases:
+  - "Приней"
+  - "Приня"
+  - "хей джарвис"
+
+tts_backend: voxcpm
+
+# Multilingual + short names → more data than the English default (README caveat).
+n_samples: 50000
+n_samples_val: 10000
+n_background_samples: 2000
+n_background_samples_val: 500
+tts_batch_size: 50
+
+# Russian false-friends the short names must be defended against. "принеси",
+# "принять", "при мне", "привет" are the dangerous near-misses for "Приней/Приня";
+# "джаз/джинсы" stress the "джарвис" side. Auto adversarial negatives are
+# English/CMUdict-biased, so these manual Russian negatives matter.
+custom_negative_phrases:
+  - "принеси"
+  - "принесите"
+  - "принять"
+  - "при мне"
+  - "привет"
+  - "приятно"
+  - "принтер"
+  - "Андрей"
+  - "джаз"
+  - "сервис"
+  - "Джарвис"        # bare surname without "хей" should NOT wake it
+  - "эй"
+
+data_dir: ./data
+output_dir: ./output
+
+# VoxCPM2 voice-design personas. Keep the persona text English (it describes the
+# voice; VoxCPM speaks the Russian target_phrases regardless). 34 personas ≈ the
+# library prod grid; add more (target 50-100) if Russian recall is weak.
+voxcpm_tts:
+  model_id: openbmb/VoxCPM2
+  model_cache_relpath: voxcpm/VoxCPM2
+  # Point at the Desktop's existing VoxCPM2 snapshot to skip the download:
+  # local_model_path: /path/to/voxcpm/VoxCPM2
+  local_model_path: null
+  load_denoiser: false
+  cfg_values: [1.5, 2.0, 2.5, 3.0]
+  inference_timesteps_list: [8, 10, 12]
+  voice_design_prompts:
+    - "A young adult woman, clear mid-pitch voice, moderate pace, calm and professional"
+    - "A young adult man, warm baritone, steady pace, friendly and articulate"
+    - "A middle-aged woman, slightly low pitch, measured pace, confident tone"
+    - "A middle-aged man, deep resonant voice, slow deliberate pace"
+    - "An older adult woman, soft gentle voice, slower pace, kind tone"
+    - "An older adult man, gravelly tenor, moderate pace, matter-of-fact"
+    - "A young woman, bright energetic tone, slightly faster pace"
+    - "A young man, light tenor, quick conversational pace"
+    - "A woman in her thirties, smooth alto, even pace"
+    - "A man in his thirties, clear baritone, businesslike pace"
+    - "A speaker with a higher pitch, enthusiastic and upbeat, medium-fast pace"
+    - "A speaker with a lower pitch, relaxed and laid-back, slower pace"
+    - "A young adult, gender-neutral delivery, soft volume, careful enunciation"
+    - "A confident presenter voice, strong projection, moderate speed"
+    - "A quiet intimate voice, close-mic feel, slow and clear"
+    - "A news-anchor style voice, authoritative, even rhythm"
+    - "A friendly customer-service tone, slightly smiling, medium pace"
+    - "A tired but clear voice, subdued energy, steady pace"
+    - "A cheerful animated voice, wide pitch range, lively pace"
+    - "A serious formal voice, minimal emotion, precise articulation"
+    - "A warm conversational voice, relaxed, medium pace"
+    - "A clear radio-DJ voice, smooth delivery, moderate pace"
+    - "A speaker with slight vocal fry, casual young adult, medium pace"
+    - "A very smooth polished voice, studio quality, slow to medium pace"
+    - "A nasal bright tone, energetic, faster than average pace"
+    - "A breathy soft voice, gentle, slower pace"
+    - "A robust athletic-sounding voice, strong and direct, medium pace"
+    - "A scholarly tone, thoughtful pauses, slower academic pace"
+    - "A teenager-sounding voice, casual, slightly fast, light pitch"
+    - "A mature executive voice, controlled low dynamics, steady"
+    - "A sing-song playful tone, varied pitch, medium pace"
+    - "A monotone flat delivery, robotic clarity, even speed"
+    - "A husky voice, low energy, medium-slow pace"
+    - "A crisp precise voice, minimal accent, fast clear speech"
+
+augmentation:
+  clip_duration: 2.0
+  batch_size: 16
+  rounds: 3
+  background_paths: [./data/backgrounds]
+  rir_paths: [./data/rirs]
+
+model:
+  model_type: conv_attention   # lowest false-positive head (README "Why conv-attention")
+  model_size: medium
+
+steps: 100000
+learning_rate: 0.0001
+weight_decay: 0.01
+label_smoothing: 0.05
+max_negative_weight: 3000
+target_fp_per_hour: 0.1        # < 0.5 FPPH is production-typical; the gate is always-on
+
+batch_n_per_class:
+  positive: 50
+  adversarial_negative: 50
+  ACAV100M_sample: 1024
+  background_noise: 50
