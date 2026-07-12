@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import Callable
 
 import websockets
 from livekit import rtc
@@ -41,7 +42,13 @@ class DesktopSTT(stt.STT):
     """
 
     def __init__(
-        self, *, ws_url: str, language: str = "ru", sample_rate: int = SAMPLE_RATE
+        self,
+        *,
+        ws_url: str,
+        language: str = "ru",
+        sample_rate: int = SAMPLE_RATE,
+        gate: Callable[[], bool] | None = None,
+        transcript_filter: Callable[[str], str] | None = None,
     ) -> None:
         super().__init__(
             capabilities=stt.STTCapabilities(streaming=False, interim_results=False)
@@ -49,6 +56,15 @@ class DesktopSTT(stt.STT):
         self._ws_url = ws_url
         self._language = language
         self._sample_rate = sample_rate
+        # Wake-word gate (ADR-0021 / #58). Both default to None → no behavior
+        # change (always-listening). When wired:
+        #   gate() False  → skip the Desktop GPU round-trip and return an empty
+        #                   transcript (Dormant: don't pay for STT on speech not
+        #                   addressed to the agent).
+        #   transcript_filter → transform the final text (strip the wake word) for
+        #                   both the LLM and the displayed transcript.
+        self._gate = gate
+        self._transcript_filter = transcript_filter
         self._lock = asyncio.Lock()
         self._ws: websockets.ClientConnection | None = None
 
@@ -91,6 +107,19 @@ class DesktopSTT(stt.STT):
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions,
     ) -> stt.SpeechEvent:
+        out_language = language if isinstance(language, str) else self._language
+
+        # Wake-word gate: while Dormant, do not send audio to the Desktop GPU STT
+        # at all — return an empty final transcript so the turn produces no LLM
+        # reply (the cheap Pi-side classifier is what wakes the agent). This is the
+        # "don't pay for GPU STT while Dormant" guarantee (ADR-0021).
+        if self._gate is not None and not self._gate():
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                request_id=utils.shortuuid("stt_"),
+                alternatives=[stt.SpeechData(language=out_language, text="")],
+            )
+
         async with self._lock:
             try:
                 ws = await self._ensure_ws()
@@ -161,7 +190,13 @@ class DesktopSTT(stt.STT):
                 await self._reset_buffer()
                 raise APIError(f"STT recognition failed: {e}") from e
 
-        out_language = language if isinstance(language, str) else self._language
+        # Wake-word transcript filter (strip the leading wake word) — applied to
+        # the returned text so BOTH the LLM input and the displayed transcript
+        # (forwarded from this event) show «сколько времени», not «Приней,
+        # сколько времени» (ADR-0021 one-breath handling).
+        if self._transcript_filter is not None and text:
+            text = self._transcript_filter(text)
+
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             request_id=utils.shortuuid("stt_"),

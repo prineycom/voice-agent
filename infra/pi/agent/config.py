@@ -3,8 +3,9 @@
 Required keys (LIVEKIT_API_KEY / LIVEKIT_API_SECRET) fail fast if missing.
 """
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,6 +13,14 @@ from dotenv import load_dotenv
 DEFAULT_GREETING = "Привет! Я голосовой ассистент. Чем могу помочь?"
 
 _TRUTHY = {"1", "true", "yes", "on"}
+
+# Wake-word artifacts live under infra/desktop/wakeword/ (committed with #57);
+# the Pi checks them out with the repo. Resolve relative to this file so the
+# defaults work regardless of cwd.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_WAKEWORD_DIR = _REPO_ROOT / "infra" / "desktop" / "wakeword"
+_DEFAULT_WAKEWORD_MODELS = str(_WAKEWORD_DIR / "models" / "hey_jarvis.onnx")
+_DEFAULT_WAKEWORD_THRESHOLDS = str(_WAKEWORD_DIR / "models" / "thresholds.json")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -24,6 +33,28 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in _TRUTHY
+
+
+def _load_thresholds(path: str) -> dict[str, float]:
+    """Load the per-model wake-word threshold map (best-effort).
+
+    Missing/unreadable file or non-numeric entries → empty map; the detector then
+    falls back to WAKEWORD_THRESHOLD for every model. Keys prefixed with ``_``
+    (``_comment``, ``_default``) are metadata and skipped.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, float] = {}
+    for name, value in data.items():
+        if name.startswith("_"):
+            continue
+        if isinstance(value, (int, float)):
+            out[name] = float(value)
+    return out
 
 
 @dataclass(frozen=True)
@@ -55,6 +86,16 @@ class AgentConfig:
     # Worker skill (Hermes CLI patterns) appended to instructions. Optional —
     # missing file is warned, not fatal (unlike SOUL).
     worker_skill_path: Path
+    # Wake-word activation (ADR-0021 / Epic #56). Master flag OFF = today's
+    # always-listening behavior (no gate, greeting kept).
+    wakeword_enabled: bool
+    wakeword_model_paths: tuple[str, ...]
+    wakeword_thresholds: dict[str, float]
+    wakeword_threshold: float  # fallback for models absent from thresholds.json
+    wakeword_stride_s: float
+    # Active window: auto-sleep after this much silence (the follow-up strict-mode
+    # flag is added in #59).
+    wakeword_silence_timeout: float
 
 
 def load_config() -> AgentConfig:
@@ -99,6 +140,23 @@ def load_config() -> AgentConfig:
             f"Invalid AGENT_WORKER_PORT={raw_worker_port!r}: expected an integer."
         ) from exc
 
+    def _env_float(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid {name}={raw!r}: expected a number.") from exc
+
+    # Wake-word activation (ADR-0021). Model paths are comma-separated so the gate
+    # runs one combined multi-keyword model or several single-keyword ones.
+    raw_models = os.environ.get("WAKEWORD_MODEL_PATHS", _DEFAULT_WAKEWORD_MODELS)
+    wakeword_model_paths = tuple(p.strip() for p in raw_models.split(",") if p.strip())
+    wakeword_thresholds = _load_thresholds(
+        os.environ.get("WAKEWORD_THRESHOLDS_PATH", _DEFAULT_WAKEWORD_THRESHOLDS)
+    )
+
     return AgentConfig(
         livekit_url=os.environ.get("LIVEKIT_URL", "ws://localhost:7880"),
         livekit_api_key=os.environ["LIVEKIT_API_KEY"],
@@ -134,4 +192,10 @@ def load_config() -> AgentConfig:
                 str(Path(__file__).resolve().parent / "skills" / "hermes.md"),
             )
         ),
+        wakeword_enabled=_env_bool("WAKEWORD_ENABLED", default=True),
+        wakeword_model_paths=wakeword_model_paths,
+        wakeword_thresholds=wakeword_thresholds,
+        wakeword_threshold=_env_float("WAKEWORD_THRESHOLD", 0.5),
+        wakeword_stride_s=_env_float("WAKEWORD_STRIDE_S", 0.5),
+        wakeword_silence_timeout=_env_float("WAKEWORD_SILENCE_TIMEOUT", 8.0),
     )

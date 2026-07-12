@@ -15,6 +15,11 @@ python-dotenv==1.2.2
 # websockets pinned <16 to satisfy livekit-plugins-openai==1.6.2 (it requires websockets<16);
 # 15.0.1 keeps the new asyncio client API (ClientConnection, max_size) the STT/TTS plugins rely on.
 websockets==15.0.1
+# Wake-word gate (ADR-0021 / Epic #56). Inference-only: pulls just numpy + onnxruntime
+# (both already present transitively), no torch/training extras — the model is trained
+# off-box on the Desktop (infra/desktop/wakeword/). Bundles the mel + speech-embedding
+# ONNX front-ends; only the small keyword classifier ONNX is loaded from the repo.
+livekit-wakeword==0.2.1
 
 # dev
 pytest

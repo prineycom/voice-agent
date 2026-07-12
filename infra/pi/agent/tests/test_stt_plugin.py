@@ -57,6 +57,51 @@ async def test_single_turn_final_transcript(stt_server_factory):
 
 
 @pytest.mark.asyncio
+async def test_wake_gate_dormant_skips_desktop(stt_server_factory):
+    """Wake-word gate: while Dormant the plugin returns empty WITHOUT connecting.
+
+    This is the "don't pay for GPU STT while Dormant" guarantee (ADR-0021): the
+    server must never see a connection for a gated-off turn.
+    """
+    srv = await stt_server_factory(transcript="привет мир")
+    frame = _make_frame(320)
+
+    stt_impl = DesktopSTT(ws_url=srv.url, gate=lambda: False)
+    event = await stt_impl.recognize(buffer=frame)
+
+    assert event.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+    assert event.alternatives[0].text == ""  # empty → no LLM turn
+    assert srv.connections == 0  # never touched the Desktop
+    assert srv.received_bytes == 0
+
+    await stt_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_wake_gate_active_transcribes(stt_server_factory):
+    """Gate open (Active) → normal transcription against the Desktop."""
+    srv = await stt_server_factory(transcript="привет мир")
+    stt_impl = DesktopSTT(ws_url=srv.url, gate=lambda: True)
+    event = await stt_impl.recognize(buffer=_make_frame(320))
+    assert event.alternatives[0].text == "привет мир"
+    assert srv.connections == 1
+    await stt_impl.aclose()
+
+
+@pytest.mark.asyncio
+async def test_wake_transcript_filter_strips_wake_word(stt_server_factory):
+    """The transcript_filter transforms the final text (wake-word strip)."""
+    srv = await stt_server_factory(transcript="Приней сколько времени")
+    stt_impl = DesktopSTT(
+        ws_url=srv.url,
+        transcript_filter=lambda t: t.replace("Приней ", ""),
+    )
+    event = await stt_impl.recognize(buffer=_make_frame(320))
+    assert event.alternatives[0].text == "сколько времени"
+    await stt_impl.aclose()
+
+
+@pytest.mark.asyncio
 async def test_resamples_48k_to_16k(stt_server_factory):
     srv = await stt_server_factory()
     # 480 samples @48kHz (10ms) downsample to 160 samples @16kHz → 320 bytes.
