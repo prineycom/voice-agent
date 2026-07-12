@@ -144,3 +144,15 @@ Config knobs that matter for the short Russian names (all in
 
 After training, re-run the harness on real recordings and, if needed, tune
 `thresholds.json`.
+
+### Training feasibility snapshot (why it's a scheduled step, not automated here)
+
+Probed on the Desktop during the epic build: the RTX 4070 (12 GB) had only
+**~4.3 GB free** — the live STT + TTS + A2F prod services hold ~7.6 GB — and no
+`uv` / VoxCPM2 / `livekit-wakeword[train]` env was set up (base Python 3.10). A
+full run (50k+ VoxCPM syntheses → 100k training steps) is hours of GPU work that
+would contend with and degrade the live voice agent, so it must be **scheduled**
+(free the GPU or run off-hours), not fired off alongside production. Combined with
+the positive-recall caveat above (needs the primary user's recorded voice), custom
+`Приней`/`Приня` training is an intentional human/GPU step. The software pipeline
+(#58–#60) is complete and runs today on the out-of-box `hey_jarvis` model.
