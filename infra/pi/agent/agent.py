@@ -40,7 +40,16 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from livekit.agents import NOT_GIVEN, Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit import rtc
+from livekit.agents import (
+    NOT_GIVEN,
+    Agent,
+    AgentSession,
+    JobContext,
+    StopResponse,
+    WorkerOptions,
+    cli,
+)
 from livekit.agents import metrics as agent_metrics
 from livekit.agents.voice.events import MetricsCollectedEvent
 from livekit.plugins import openai, silero
@@ -57,6 +66,8 @@ from motion_events import DEFAULT_EMOTION, EmotionTagStripper, motion_event_json
 from stt_plugin import DesktopSTT
 from tts_plugin import DesktopTTS
 import voice_state
+from wake_detector import WakeWordDetector
+from wake_state import WakeState
 from worker_tools import (
     cancel_hermes_tasks,
     delegate_to_hermes,
@@ -85,12 +96,17 @@ class GreetingAgent(Agent):
         tools: list,
         greeting: str,
         publish_motion: Callable[[bytes], None] | None = None,
+        wake_state: WakeState | None = None,
     ) -> None:
         super().__init__(instructions=instructions, tools=tools)
         self._greeting = greeting
         # Authoritative motion publisher (ADR-0009): emits motion/expression
         # events on the voiceagent data channel. None disables publishing.
         self._publish_motion = publish_motion
+        # Wake-word state machine (ADR-0021). None → feature off: greet on enter
+        # and never drop a turn (today's always-listening behavior). When set, the
+        # agent starts Dormant and silent, and on_user_turn_completed gates turns.
+        self._wake_state = wake_state
         # Current expression, parsed from inline LLM emotion tags in llm_node;
         # the state-change hook in the entrypoint pairs it with the motion state.
         self.current_emotion = DEFAULT_EMOTION
@@ -100,8 +116,29 @@ class GreetingAgent(Agent):
         self.current_state = "initializing"
 
     async def on_enter(self) -> None:
+        # With wake-word activation on, the agent starts Dormant and SILENT — the
+        # greeting is removed (ADR-0021); it speaks only once woken. With the
+        # feature off, greet as before.
+        if self._wake_state is not None:
+            log.info("Agent entered session; Dormant and silent (wake-word gate on).")
+            return
         log.info("Agent entered session; speaking greeting.")
         self.session.say(self._greeting)
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """Gate the finalized user turn through the wake-word state machine.
+
+        Runs after STT, before the LLM. The transcript is already wake-word-
+        stripped (the STT ``transcript_filter``); here we decide whether the turn
+        reaches the LLM at all: a stop phrase, a turn while Dormant, or a bare wake
+        word is dropped with StopResponse (no reply). A real request in Active mode
+        proceeds. No-op when the feature is off.
+        """
+        if self._wake_state is None:
+            return
+        text = new_message.text_content or ""
+        if self._wake_state.should_drop_turn(text):
+            raise StopResponse()
 
     async def llm_node(self, chat_ctx, tools, model_settings):
         """Strip inline emotion tags from the LLM stream, driving expressions.
@@ -263,6 +300,84 @@ async def entrypoint(ctx: JobContext) -> None:
 
         asyncio.create_task(_send())
 
+    # Wake-word activation (ADR-0021 / Epic #56). When enabled the agent starts
+    # Dormant: a lightweight always-on classifier scores the user's raw audio track
+    # on the Pi CPU, and only a wake word ("Приней"/"Приня"/"хей джарвис") flips it
+    # Active so the heavy Desktop GPU STT runs. Transitions publish on the same
+    # lossy voiceagent channel as motion, so the frontend plays the activation
+    # signal (#60). Disabled (WAKEWORD_ENABLED=0) → wake_state is None everywhere
+    # and the pipeline behaves exactly as before (always listening + greeting).
+    wake_state: WakeState | None = None
+    if cfg.wakeword_enabled:
+        wake_state = WakeState(
+            enabled=True,
+            followup=cfg.wakeword_followup,
+            silence_timeout=cfg.wakeword_silence_timeout,
+            publish=publish_motion,
+        )
+
+    # One wake-word detector per subscribed remote audio track. State is room-global
+    # (one agent = one attention), so anyone's wake word wakes it for all screens.
+    # The detector pauses scoring while Active (nothing to detect when the gate is
+    # already open), keeping the always-on cost low.
+    wake_detectors: dict[str, WakeWordDetector] = {}
+
+    def _start_wake_detector(track: rtc.Track) -> None:
+        if wake_state is None or track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+        if track.sid in wake_detectors:
+            return
+        try:
+            detector = WakeWordDetector(
+                model_paths=list(cfg.wakeword_model_paths),
+                thresholds=cfg.wakeword_thresholds,
+                default_threshold=cfg.wakeword_threshold,
+                on_detected=wake_state.on_wake_detected,
+                should_detect=lambda: not wake_state.active,
+                stride_s=cfg.wakeword_stride_s,
+                debug=cfg.wakeword_debug,
+            )
+            detector.start(track)
+        except Exception:
+            # Fail OPEN: a missing/corrupt model or a detector-start failure must
+            # NOT leave the agent permanently Dormant and deaf (it can never be
+            # woken without the classifier). Disable the gate so the agent reverts
+            # to always-listening — degraded, but responsive — and say so loudly.
+            log.exception(
+                "wake-word detector failed to start; falling back to always-listening "
+                "(WAKEWORD gate disabled for this session)"
+            )
+            wake_state.enabled = False
+            return
+        wake_detectors[track.sid] = detector
+
+    if wake_state is not None:
+
+        @ctx.room.on("track_subscribed")
+        def _on_track_subscribed(track, publication, participant) -> None:  # noqa: ANN001
+            _start_wake_detector(track)
+
+        @ctx.room.on("track_unsubscribed")
+        def _on_track_unsubscribed(track, publication, participant) -> None:  # noqa: ANN001
+            # A track ended (reconnect, device switch): close + drop its detector
+            # so reconnects don't leak worker threads / AudioStreams.
+            detector = wake_detectors.pop(track.sid, None)
+            if detector is not None:
+                asyncio.create_task(detector.aclose())
+
+        # Catch tracks already subscribed before this handler was registered
+        # (the participant may have joined before dispatch reached here).
+        for participant in ctx.room.remote_participants.values():
+            for publication in participant.track_publications.values():
+                if publication.track is not None:
+                    _start_wake_detector(publication.track)
+
+        async def _close_wake_detectors() -> None:
+            for detector in list(wake_detectors.values()):
+                await detector.aclose()
+
+        ctx.add_shutdown_callback(_close_wake_detectors)
+
     # Full STT → LLM → TTS session with local VAD; turn_detection="vad" uses the
     # loaded Silero VAD to bound user turns. The LLM is the local LiteLLM proxy
     # spoken to via the OpenAI-compatible plugin (base_url must carry the /v1
@@ -299,6 +414,10 @@ async def entrypoint(ctx: JobContext) -> None:
             ws_url=cfg.stt_ws_url,
             language=cfg.stt_language,
             sample_rate=cfg.stt_sample_rate,
+            # Wake-word gate: skip the Desktop GPU while Dormant; strip the wake
+            # word from the final transcript. Both None when the feature is off.
+            gate=wake_state.should_transcribe if wake_state else None,
+            transcript_filter=wake_state.filter_transcript if wake_state else None,
         ),
         llm=openai.LLM(
             model=cfg.llm_model,
@@ -338,6 +457,10 @@ async def entrypoint(ctx: JobContext) -> None:
         # parsed in llm_node pair their expression with the right motion state.
         agent.current_state = ev.new_state
         publish_motion(motion_event_json(ev.new_state, agent.current_emotion))
+        # An agent turn boundary counts as activity: reset the Active silence
+        # timer so the agent's own speech keeps the conversation window open (#59).
+        if wake_state is not None:
+            wake_state.note_agent_activity()
 
     # --- Diagnostics for the "transcript stops on long output" bug (issue under
     # investigation). These are cheap, high-signal hooks: which conversation items
@@ -368,6 +491,7 @@ async def entrypoint(ctx: JobContext) -> None:
         tools=[delegate_to_hermes, cancel_hermes_tasks, list_hermes_tasks, run_command],
         greeting=cfg.agent_greeting,
         publish_motion=publish_motion,
+        wake_state=wake_state,
     )
 
     # Wire the TTS plugin to the voiceagent data channel now that the agent (and
@@ -388,6 +512,10 @@ async def entrypoint(ctx: JobContext) -> None:
         agent=agent,
         room=ctx.room,
     )
+    # Announce the initial Dormant state so a freshly-connected frontend shows the
+    # «спит» badge immediately (the agent starts Dormant and silent under wake).
+    if wake_state is not None:
+        wake_state.announce()
     log.info("Session started; greeting on agent enter, then STT → LLM → TTS loop.")
 
 

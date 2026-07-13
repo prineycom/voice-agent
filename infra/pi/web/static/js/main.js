@@ -6,6 +6,7 @@ import { createAgentState } from './agent-state.js';
 import { createVuMeter } from './vu.js';
 import { createTranscript } from './transcript.js';
 import { createOps } from './ops.js';
+import { createWakeSignal } from './wake.js';
 import { createRoomController } from './room.js';
 import { createAvatar } from './avatar.js';
 import { createMotionController } from './motion.js';
@@ -90,7 +91,13 @@ const transcript = createTranscript(transcriptEl, {
   onLatency: (ms) => { latencyEl.textContent = ms; },
   log: logger.log,
 });
-const ops = createOps(opsEl, toolfeedEl, { log: logger.log, onMotion: (evt) => motion.applyMotionEvent(evt) });
+// Wake activation signal: chime + avatar reaction + badge on Dormant/Active (#60).
+const wake = createWakeSignal({ motion, agentState, log: logger.log });
+const ops = createOps(opsEl, toolfeedEl, {
+  log: logger.log,
+  onMotion: (evt) => motion.applyMotionEvent(evt),
+  onWake: (evt) => wake.handle(evt),
+});
 
 // Hook set room.js destructures from connect(opts) and reuses on disconnect.
 const hooks = {
@@ -108,6 +115,8 @@ const hooks = {
     connectBtn.disabled = false;
     connectBtn.onclick = doConnect;
     setComposerEnabled(false);
+    wake.reset();
+    agentState.reset();
   },
   onAgentState: (state) => {
     // Leaving 'speaking' = agent audio stopped (playout done or barge-in):

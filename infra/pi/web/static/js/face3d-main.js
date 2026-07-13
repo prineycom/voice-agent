@@ -8,6 +8,7 @@ import { createAgentState } from './agent-state.js';
 import { createVuMeter } from './vu.js';
 import { createTranscript } from './transcript.js';
 import { createOps } from './ops.js';
+import { createWakeSignal } from './wake.js';
 import { createRoomController } from './room.js';
 import { createBlendshapes } from './blendshapes.js';
 import { createFaceRenderer } from './face3d-renderer.js';
@@ -88,7 +89,15 @@ const transcript = createTranscript(transcriptEl, {
   onLatency: (ms) => { latencyEl.textContent = ms; },
   log: logger.log,
 });
-const ops = createOps(opsEl, toolfeedEl, { log: logger.log, onMotion: (evt) => motion.applyMotionEvent(evt) });
+// Wake activation signal: chime + badge on Dormant/Active (#60). `motion` is the
+// no-op stub here (static 3D head), so the chime + «спит»/«слушает» badge are the
+// signal on this page.
+const wake = createWakeSignal({ motion, agentState, log: logger.log });
+const ops = createOps(opsEl, toolfeedEl, {
+  log: logger.log,
+  onMotion: (evt) => motion.applyMotionEvent(evt),
+  onWake: (evt) => wake.handle(evt),
+});
 
 // Hook set room.js destructures from connect(opts) and reuses on disconnect.
 // No `lipsync` key: room.js guards every lipsync call with `if (opts.lipsync)`,
@@ -108,6 +117,8 @@ const hooks = {
     connectBtn.disabled = false;
     connectBtn.onclick = doConnect;
     setComposerEnabled(false);
+    wake.reset();
+    agentState.reset();
   },
   onAgentState: (state) => {
     // Leaving 'speaking' = agent audio stopped (playout done or barge-in):

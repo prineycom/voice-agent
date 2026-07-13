@@ -1,0 +1,7 @@
+# The parent infra/desktop/.gitignore ignores models/ and *.wav (for the heavy
+# STT/TTS weights and scratch audio). The wake-word artifacts here are DELIBERATELY
+# tracked (epic #57): the committed model(s), thresholds, and the reference/negative
+# test clips are force-added and version-controlled. Ad-hoc recordings you drop in
+# clips/ stay ignored — force-add intentionally, like the committed set.
+__pycache__/
+*.pyc

@@ -2,7 +2,7 @@
 // messages on the `voiceagent` topic.
 import { esc } from './html.js';
 
-export function createOps(opsEl, toolfeedEl, { log, onMotion }) {
+export function createOps(opsEl, toolfeedEl, { log, onMotion, onWake }) {
   let opsState = { running: [], queued: [] };  // last task snapshot
   let opsBase = 0;                  // performance.now() when the snapshot arrived (for live elapsed)
   let opsTick = null;               // interval id for the live elapsed counter
@@ -21,6 +21,7 @@ export function createOps(opsEl, toolfeedEl, { log, onMotion }) {
       if (evt.type === 'tasks') renderOps(evt);
       else if (evt.type === 'event') addToolEvent(evt);
       else if (evt.type === 'motion') { if (onMotion) onMotion(evt); }
+      else if (evt.type === 'wake') { if (onWake) onWake(evt); }
     });
   }
 

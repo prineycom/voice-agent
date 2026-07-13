@@ -124,6 +124,54 @@ on the Pi across restarts; it reaches TTS over the existing per-session `voice` 
 between preset speakers is instant (same model loaded). Per ADR-0020 / issue #48.
 _Avoid_: speaker (ambiguous with a human speaker), timbre, persona (reserve for VoiceDesign)
 
+### Wake word activation
+
+**Wake word**:
+A short spoken trigger phrase that moves the agent from **Dormant** to **Active**. Configured
+set: `Приней`, `Приня`, `хей джарвис`. Detected by the **Wake-word gate**, independently of the
+main **STT**.
+_Avoid_: hotword, trigger, keyword (reserve those for the detector's internal terms)
+
+**Dormant**:
+The agent's *listening-disabled* mode: incoming user speech is ignored — nothing reaches the
+LLM and no reply is produced — **except** a **Wake word**. Orthogonal to **Motion state**
+(a Dormant agent still shows some idle/asleep motion). Entered on connect, on **Silence
+timeout**, or on a **Stop phrase**.
+_Avoid_: asleep (ok informally), muted (that is the mic control), idle (that is a Motion state)
+
+**Active**:
+The agent's *listening-enabled* mode: user speech is processed normally (**STT** → LLM → TTS)
+**without** requiring a **Wake word**. Entered on **Wake word** detection.
+_Avoid_: awake (ok informally), listening (that is a Motion state / `lk.agent.state`)
+
+**Wake-word gate**:
+The lightweight always-on detector that scores incoming audio for a **Wake word** and gates the
+heavy speech pipeline. Runs **server-side in the Agent Worker on the Pi** (livekit-wakeword ONNX
+classifier scoring the user's WebRTC frames) — NOT in the browser (livekit-wakeword ships no
+JS/WASM SDK). Distinct from the **STT** (which stays gated behind it).
+_Avoid_: hotword engine, VAD (VAD is the separate Silero turn detector)
+
+**Silence timeout**:
+The span of no speech (neither user nor agent) after which an **Active** agent returns to
+**Dormant**. A few seconds; a config parameter.
+_Avoid_: session timeout
+
+**Stop phrase**:
+`{Wake word} + стоп` (e.g. "Приней, стоп"). Forces **Active** → **Dormant** immediately,
+regardless of the **Silence timeout**.
+_Avoid_: mute command
+
+**Activation signal**:
+The feedback emitted on a **Dormant** → **Active** transition (and possibly the reverse) so the
+user knows they were heard. Delivered from the Pi over the **UI topic**.
+_Avoid_: chime (that presumes it is a sound; nature is undecided)
+
+**Follow-up listening**:
+The behavior where, once **Active**, the agent keeps listening without a **Wake word** during and
+shortly after its own speech. A config parameter toggles this against a *strict* mode where every
+user turn requires a **Wake word**.
+_Avoid_: conversation mode
+
 ## Example dialogue
 
 > **Dev:** When the agent starts answering, the avatar should open its mouth, right?
