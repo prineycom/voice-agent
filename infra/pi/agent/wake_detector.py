@@ -50,6 +50,7 @@ class WakeWordDetector:
         on_detected: Callable[[str, float], None],
         should_detect: Callable[[], bool] | None = None,
         stride_s: float = 0.5,
+        debug: bool = False,
     ) -> None:
         # Import here so the whole agent doesn't hard-depend on livekit-wakeword
         # when the feature is disabled (WAKEWORD_ENABLED=0 never constructs this).
@@ -62,6 +63,7 @@ class WakeWordDetector:
         self._on_detected = on_detected
         self._should_detect = should_detect or (lambda: True)
         self._stride = int(stride_s * SAMPLE_RATE)
+        self._debug = debug
 
         self._buf = np.zeros(WINDOW, dtype=np.int16)  # rolling 2 s window
         self._filled = 0  # samples seen (capped at WINDOW) — gate first predict
@@ -115,6 +117,14 @@ class WakeWordDetector:
                     scores = await loop.run_in_executor(
                         self._executor, self._model.predict, self._buf.copy()
                     )
+                    if self._debug and scores:
+                        mx = max(scores.values())
+                        if mx > 0.02:  # above the ~0.005 silence noise floor
+                            log.info(
+                                "wake-debug: %s (threshold %.2f)",
+                                {k: round(v, 3) for k, v in scores.items()},
+                                min(self._threshold_for(n) for n in scores),
+                            )
                     self._check(scores)
                 except asyncio.CancelledError:
                     raise

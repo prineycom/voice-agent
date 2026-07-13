@@ -88,6 +88,13 @@ observed on this hardware:
   0.3–0.4 and re-check `neg_*` stays silent at that cutoff. The trained
   `conv_attention` model's own eval reports an optimal threshold (often ~0.5–0.7);
   prefer that once `livekit-wakeword eval` has run.
+- **Confirmed on live prod (2026-07-13):** with the out-of-box `hey_jarvis` model at
+  a lowered `WAKEWORD_THRESHOLD=0.4`, a real user wakes the agent reliably when
+  «хей джарвис» is pronounced the **English** way ("hey JAR-vis") — a heavily
+  Russian-accented «хей» (velar Х) does not fire. This is the expected out-of-box
+  gap; the custom VoxCPM2 model (trained on Russian «Приней/Приня/хей джарвис») is
+  what makes natural Russian pronunciation work. Set `WAKEWORD_DEBUG=1` to log live
+  scores while tuning the threshold.
 
 ### Testing positives (the human-in-the-loop step)
 

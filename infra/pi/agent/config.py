@@ -97,6 +97,9 @@ class AgentConfig:
     # strict (every user turn needs a wake word).
     wakeword_silence_timeout: float
     wakeword_followup: bool
+    # WAKEWORD_DEBUG: log the classifier's per-window scores (throttled to when
+    # something is heard) so a live wake attempt's scores can be inspected.
+    wakeword_debug: bool
 
 
 def load_config() -> AgentConfig:
@@ -200,4 +203,5 @@ def load_config() -> AgentConfig:
         wakeword_stride_s=_env_float("WAKEWORD_STRIDE_S", 0.5),
         wakeword_silence_timeout=_env_float("WAKEWORD_SILENCE_TIMEOUT", 8.0),
         wakeword_followup=_env_bool("WAKEWORD_FOLLOWUP", default=True),
+        wakeword_debug=_env_bool("WAKEWORD_DEBUG", default=False),
     )

@@ -335,6 +335,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 on_detected=wake_state.on_wake_detected,
                 should_detect=lambda: not wake_state.active,
                 stride_s=cfg.wakeword_stride_s,
+                debug=cfg.wakeword_debug,
             )
             detector.start(track)
         except Exception:
