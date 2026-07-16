@@ -58,6 +58,26 @@ DEFAULT_OUTPUT_LIMIT = 600  # chars of Hermes output handed to the LLM per resul
 # long session can still answer "как там та задача?" without unbounded growth.
 _FINISHED_KEEP = 20
 
+# -- Milestone narration (ADR-0022 "Progress") -------------------------------
+# Short template phrases spoken via ``session.say`` on a tool-call START edge —
+# no LLM call, never written to chat_ctx, skipped (not queued) when the channel
+# is busy. Keyed on the ACP tool ``kind``, refined first by the tool name parsed
+# from the event ``title`` ("terminal: uname -a" → "terminal"). Keep phrases
+# SHORT — they are spoken while the user waits.
+NARRATION_MIN_GAP_S = 8.0  # at most one narration per task per this many seconds
+NARRATION_BY_TOOL = {
+    "terminal": "секунду, выполняю команду…",
+}
+NARRATION_BY_KIND = {
+    "execute": "секунду, выполняю команду…",
+    "read": "смотрю файлы…",
+    "edit": "правлю файлы…",
+    "fetch": "ищу информацию…",
+    "search": "ищу информацию…",
+    "think": "так, думаю…",
+}
+NARRATION_DEFAULT = "работаю над задачей «{label}»…"
+
 # Terminal states — a task in one of these is settled and its status must be read
 # straight from `state` (never reported as "still running").
 _FINISHED_STATES = ("done", "failed", "cancelled")
@@ -119,6 +139,10 @@ class HermesTask:
     # the single settle point (_maybe_run_completion) rather than twice.
     awaiting_sync: bool = False
     completion_pending: bool = False
+    # Milestone-narration throttle: the last tool kind spoken for this task (no
+    # same-milestone repeats back-to-back) and when (rate limit, NARRATION_MIN_GAP_S).
+    last_narrated_kind: str | None = None
+    last_narrated_at: float | None = None
     session_id: str | None = None
     first_result: "asyncio.Future[str] | None" = field(default=None, repr=False)
     runner: "asyncio.Task | None" = field(default=None, repr=False)
@@ -469,14 +493,67 @@ class HermesTaskManager:
     def _on_tool_event(self, task: HermesTask, ev) -> None:
         """Update live per-task state from one streamed ACP tool event.
 
-        HOOK: the narration task extends this to speak key milestones via
-        ``session.say`` when the channel is free. The ``tool_call_update`` (finish)
-        edge carries no title, so ``last_tool`` keeps the last named tool.
+        Live state FIRST — ``last_tool`` / ``steps`` feed ``list_tasks`` / "как
+        там?" and must update on every event, whether or not anything is spoken.
+        The ``tool_call_update`` (finish) edge carries no title, so ``last_tool``
+        keeps the last named tool. Narration is a best-effort afterthought.
         """
         if getattr(ev, "title", None):
             task.last_tool = ev.title
         task.steps += 1
         self._emit_tasks()
+        self._maybe_narrate(task, ev)
+
+    def _maybe_narrate(self, task: HermesTask, ev) -> None:
+        """Speak a short milestone phrase for a tool-call START edge (ADR-0022).
+
+        Ephemeral template speech via ``session.say`` — no LLM call, and
+        ``add_to_chat_ctx=False`` so it never enters the conversation context.
+        Strictly bounded: only the ``tool_call`` START edge (never the
+        ``tool_call_update`` completion edge), only when the conversation channel
+        is free, never the same tool kind twice in a row, and at most one phrase
+        per task per ``NARRATION_MIN_GAP_S``. A narration that cannot be spoken
+        right now is SKIPPED, never queued — live state already captured the step.
+        """
+        if getattr(ev, "kind_of_update", None) != "tool_call":
+            return  # completion edges are progress data, not milestones
+        if getattr(ev, "status", None) not in (None, "pending", "in_progress"):
+            return  # not a START edge
+        # While this task's fast window is open the user is silently waiting for
+        # the synchronous answer of THIS delegation — narrating mid-window would
+        # talk over that wait, so milestones stay quiet until the race resolves.
+        if task.awaiting_sync:
+            return
+        if self._session is None or not self._session_is_idle():
+            return  # channel busy: skip, never queue
+        kind = getattr(ev, "kind", None) or ""
+        if kind and kind == task.last_narrated_kind:
+            return  # same milestone as last time — don't repeat it
+        now = self._now()
+        if (
+            task.last_narrated_at is not None
+            and now - task.last_narrated_at < NARRATION_MIN_GAP_S
+        ):
+            return  # rate limit: tool-heavy tasks must not chatter
+
+        # Phrase: tool-name refinement first ("terminal: uname -a" → "terminal"),
+        # then the ACP kind, then the generic fallback.
+        title = getattr(ev, "title", None) or ""
+        tool = title.split(":", 1)[0].strip().lower() if ":" in title else ""
+        phrase = (
+            NARRATION_BY_TOOL.get(tool)
+            or NARRATION_BY_KIND.get(kind)
+            or NARRATION_DEFAULT.format(label=task.label)
+        )
+        try:
+            # Fire-and-forget: say() is synchronous and returns a SpeechHandle;
+            # we deliberately do not await its playout.
+            self._session.say(phrase, add_to_chat_ctx=False, allow_interruptions=True)
+        except Exception as e:  # noqa: BLE001 — narration must never break the task loop
+            log.debug("milestone narration skipped: %r", e)
+            return
+        task.last_narrated_kind = kind
+        task.last_narrated_at = now
 
     def _on_task_complete(self, task: HermesTask) -> None:
         """Settle bookkeeping for a task that just reached a terminal state.

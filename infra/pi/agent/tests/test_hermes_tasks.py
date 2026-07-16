@@ -43,12 +43,24 @@ class FakeSession:
 
     def __init__(self):
         self.replies: list[str] = []
+        self.said: list[dict] = []  # recorded say() calls (milestone narration)
         self.agent_state = "listening"
         self.user_state = "listening"
         self.current_speech = None
 
     def generate_reply(self, *, instructions=None, allow_interruptions=None, **kwargs):
         self.replies.append(instructions or "")
+        return FakeHandle()
+
+    def say(self, text, *, allow_interruptions=None, add_to_chat_ctx=True, **kwargs):
+        """Mirrors AgentSession.say (synchronous, returns a SpeechHandle)."""
+        self.said.append(
+            {
+                "text": text,
+                "allow_interruptions": allow_interruptions,
+                "add_to_chat_ctx": add_to_chat_ctx,
+            }
+        )
         return FakeHandle()
 
 
@@ -639,3 +651,162 @@ async def test_cancel_during_open_window_returns_cancelled_ack(
     assert task.awaiting_sync is False
     # No dangling pending future (its resolution was consumed by the racer).
     assert task.first_result.done()
+
+
+# --------------------------------------------------------------------------- #
+# Milestone narration (ADR-0022 "Progress"): short template phrases via
+# session.say on tool START edges — never in chat_ctx, never over the user.
+# --------------------------------------------------------------------------- #
+def make_tool_event(
+    kind_of_update="tool_call",
+    title="terminal: ls",
+    kind="execute",
+    status="pending",
+):
+    """Build an AcpToolEvent like the ones acp_client parses from the stream."""
+    from acp_client import AcpToolEvent
+
+    return AcpToolEvent(
+        kind_of_update=kind_of_update,
+        tool_call_id="tc-1",
+        title=title,
+        kind=kind,
+        status=status,
+        raw={},
+    )
+
+
+def running_task(mgr, request="тестовая задача"):
+    """Register a task in `running` state without spawning an ACP driver —
+    _on_tool_event only touches live state + narration, so no runner is needed."""
+    task = mgr._make_task(request)
+    task.state = "running"
+    return task
+
+
+@pytest.mark.asyncio
+async def test_narrates_tool_start_when_idle(monkeypatch, fake_acp_exec):
+    """Streamed tool_call events (behavioural, via the scripted ACP peer) narrate
+    once the fast window has closed and the channel is free."""
+    from conftest import FakeAcpProc
+
+    from hermes_tasks import NARRATION_BY_KIND, NARRATION_BY_TOOL
+
+    proc = FakeAcpProc()
+    # First tool event lands ~instantly (inside the 0.1s window → silent), the
+    # second at ~0.3s (window closed → narrated), result at ~0.6s.
+    proc.script_prompt(
+        updates=[
+            acp_tool_call("t1", "terminal: ls"),
+            acp_tool_call("t2", "web: поиск погоды", kind="fetch"),
+        ],
+        result={"text": "готово"},
+        delay=0.3,
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.1)
+
+    await mgr.delegate("проверь погоду")
+    await mgr.join()
+
+    session = mgr._session
+    assert len(session.said) == 1  # in-window event silent, post-window narrated
+    call = session.said[0]
+    assert call["text"] == NARRATION_BY_KIND["fetch"]
+    assert call["add_to_chat_ctx"] is False  # never enters the conversation context
+    assert call["allow_interruptions"] is True
+    # Known template vocabulary only — no free-form/LLM text.
+    assert call["text"] in (
+        set(NARRATION_BY_KIND.values()) | set(NARRATION_BY_TOOL.values())
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_narration_when_channel_busy_but_state_updates(
+    monkeypatch, fake_acp_exec
+):
+    from conftest import FakeAcpProc
+
+    mgr = make_manager(monkeypatch, FakeAcpProc(), fake_acp_exec)
+    task = running_task(mgr)
+    mgr._session.agent_state = "speaking"  # channel busy
+
+    mgr._on_tool_event(task, make_tool_event(title="terminal: df -h"))
+
+    assert mgr._session.said == []  # skipped, not queued
+    assert task.last_tool == "terminal: df -h"  # live state still updated
+    assert task.steps == 1
+
+
+@pytest.mark.asyncio
+async def test_narration_dedupes_same_kind_and_rate_limits(
+    monkeypatch, fake_acp_exec
+):
+    from conftest import FakeAcpProc
+
+    mgr = make_manager(monkeypatch, FakeAcpProc(), fake_acp_exec)
+    task = running_task(mgr)
+
+    # Two same-kind starts back-to-back → exactly one phrase.
+    mgr._on_tool_event(task, make_tool_event(title="terminal: ls"))
+    mgr._on_tool_event(task, make_tool_event(title="terminal: pwd"))
+    assert len(mgr._session.said) == 1
+    assert task.steps == 2
+
+    # A different kind arriving inside NARRATION_MIN_GAP_S is rate-limited too.
+    mgr._on_tool_event(task, make_tool_event(title="web: график", kind="fetch"))
+    assert len(mgr._session.said) == 1
+
+    # Past the gap, a different kind narrates again.
+    task.last_narrated_at -= 100  # rewind the throttle clock
+    mgr._on_tool_event(task, make_tool_event(title="web: график", kind="fetch"))
+    assert len(mgr._session.said) == 2
+
+
+@pytest.mark.asyncio
+async def test_no_narration_while_fast_window_open(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    mgr = make_manager(monkeypatch, FakeAcpProc(), fake_acp_exec)
+    task = running_task(mgr)
+    task.awaiting_sync = True  # fast window open: user silently awaits the answer
+
+    mgr._on_tool_event(task, make_tool_event())
+
+    assert mgr._session.said == []
+    assert task.last_tool == "terminal: ls"  # live state still updated
+    assert task.steps == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_kind_narrates_generic_phrase(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    mgr = make_manager(monkeypatch, FakeAcpProc(), fake_acp_exec)
+    task = running_task(mgr, request="разобрать почту")
+
+    mgr._on_tool_event(
+        task, make_tool_event(title="странный инструмент", kind="mystery")
+    )
+
+    assert len(mgr._session.said) == 1
+    text = mgr._session.said[0]["text"]
+    assert "работаю" in text
+    assert task.label in text  # generic phrase carries the task label
+
+
+@pytest.mark.asyncio
+async def test_completion_edge_does_not_narrate(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    mgr = make_manager(monkeypatch, FakeAcpProc(), fake_acp_exec)
+    task = running_task(mgr)
+
+    mgr._on_tool_event(
+        task,
+        make_tool_event(
+            kind_of_update="tool_call_update", title=None, kind=None, status="completed"
+        ),
+    )
+
+    assert mgr._session.said == []  # finish edges are progress data, not milestones
+    assert task.steps == 1
