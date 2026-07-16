@@ -1,18 +1,24 @@
-"""Async Hermes delegation manager.
+"""ACP-based hybrid delegation task manager (ADR-0022).
 
-Runs Hermes CLI tasks in the background so the Agent Worker stays conversational:
-the delegating tool returns immediately, the agent voices a short acknowledgement,
-and when Hermes finishes the manager makes the agent speak the result proactively
-via ``session.generate_reply``. See docs/superpowers/specs/2026-06-25-hermes-async-delegation-design.md.
+Owns the background Hermes tasks for one Agent Worker job/session. Each delegated
+request drives ONE ACP session end-to-end over the long-lived ``hermes acp``
+process (:class:`acp_client.AcpClient`): ``session/new`` → ``session/prompt`` →
+consume the streamed tool events → the final result. There is one live
+:class:`HermesTask` per request — the single source of truth for status ("как
+там?"), the UI feed, and (in later tasks) fast-window racing, milestone
+narration, synthetic-tool-turn reintegration, and bounded proactive delivery.
 
-Proactive delivery is deliberately conservative to avoid flooding the framework's
-speech queue (the failure mode that made the agent natter and garble audio):
-- NO progress nudges — a long task stays silent until it actually finishes.
-- Results are buffered and delivered by ONE worker that waits for the conversation
-  to go idle (agent listening, user not speaking, no current speech), so a result
-  never cuts off the user or the agent mid-utterance.
-- Multiple results that pile up are coalesced into a SINGLE reply, and each task's
-  raw output is trimmed before it reaches the LLM/TTS.
+This module is the SKELETON of that manager (first of a serial chain). It
+implements the state model, admission/queue, the lossy-channel UI feed,
+``list_tasks`` / ``cancel`` / ``shutdown``, and a working :meth:`_run_task` that
+drives an ACP session to completion and stores the result in live state. Two
+hooks mark where later tasks plug in without changing this file's shape:
+
+- :meth:`_on_tool_event` — called per streamed tool event (extended by the
+  narration task to speak milestones).
+- :meth:`_on_task_complete` — called once a task settles (extended by the
+  reintegration + bounded-delivery tasks to speak the result and write a
+  synthetic tool turn into ``chat_ctx``).
 
 The manager is plain (no livekit decorators) so it is fully unit-testable; the
 ``@function_tool`` adapters in worker_tools.py are thin wrappers that fetch the
@@ -26,15 +32,14 @@ import contextlib
 import json
 import logging
 from collections import deque
+from dataclasses import dataclass, field
+
+from acp_client import AcpCancelled
 
 log = logging.getLogger("agent")
 
 UI_TOPIC = "voiceagent"  # LiveKit data topic the web UI subscribes to
 UI_FULL_OUTPUT_CAP = 4000  # chars of full Hermes output sent to the UI (data-msg size guard)
-# chars of a completed background result injected into the agent's chat context
-# so it can be referenced in later turns (larger than the TTS trim, bounded so a
-# wall of Hermes output never bloats the prompt).
-CONTEXT_RESULT_CAP = 2000
 # UI data is published lossy (decoupled from the transcript's reliable channel,
 # issue #23), so a datagram can be dropped on the Tailscale path. Re-send each
 # message after these delays (seconds, after the immediate first send) so the UI
@@ -42,79 +47,113 @@ CONTEXT_RESULT_CAP = 2000
 # id the client dedups on.
 _UI_RESEND_DELAYS = (0.5, 1.2)
 
+DEFAULT_FAST_WINDOW_S = 8.0
 DEFAULT_MAX_CONCURRENT = 3
-DEFAULT_MAX_QUEUED = 5
 DEFAULT_TASK_TIMEOUT = 300.0
-DEFAULT_IDLE_POLL_INTERVAL = 0.3
+DEFAULT_DELIVERY_FALLBACK_S = 15.0
+DEFAULT_MAX_QUEUED = 5
 DEFAULT_OUTPUT_LIMIT = 600  # chars of Hermes output handed to the LLM per result
 
-DIRECTIVE_BACKGROUND = (
-    "Запущено в фоне (running in background). Дай пользователю одну короткую "
-    "фразу-подтверждение и продолжай разговор — результат придёт позже сам. "
-    "НЕ перезапускай эту задачу, чтобы узнать статус — результат озвучится автоматически."
-)
+# Keep at most this many settled (done/failed/cancelled) tasks in live state so a
+# long session can still answer "как там та задача?" without unbounded growth.
+_FINISHED_KEEP = 20
+
+# Terminal states — a task in one of these is settled and its status must be read
+# straight from `state` (never reported as "still running").
+_FINISHED_STATES = ("done", "failed", "cancelled")
+
 DIRECTIVE_QUEUED = (
-    "Принято, но я уже занят другими задачами — поставил в очередь (queued). "
-    "Скажи пользователю, что возьмёшься чуть позже, и продолжай разговор."
+    "Принято (id: {task_id}), но я уже занят другими задачами — поставил в очередь "
+    "(queued). Скажи пользователю, что возьмёшься чуть позже, и продолжай разговор."
 )
 DIRECTIVE_FULL = (
     "Слишком много задач уже в работе и очередь полна. Попроси пользователя "
     "подождать, пока освободишься, и не запускай эту задачу сейчас."
 )
+DIRECTIVE_BACKGROUND = (
+    "Запущено в фоне (id: {task_id}). Дай пользователю одну короткую "
+    "фразу-подтверждение и продолжай разговор — результат придёт позже сам. "
+    "НЕ перезапускай эту задачу, чтобы узнать статус — результат озвучится автоматически."
+)
 
 
-def build_hermes_argv(request: str, *, resume_session_id: str | None = None) -> list[str]:
-    """Compose the Hermes CLI argv for a single delegated request.
+@dataclass
+class HermesTask:
+    """Live state for one delegated Hermes task (the single source of truth).
 
-    -Q (quiet: final answer + session_id only), --yolo (no approval prompts; no
-    TTY in a subprocess), --source tool (mark as tool-originated). --resume keeps
-    one continuous Hermes dialog across delegations.
+    ``state`` walks ``queued`` → ``running`` → one of ``done`` / ``failed`` /
+    ``cancelled``; status readers key off it directly. ``last_tool`` / ``steps``
+    are updated from the ACP tool-event stream. ``first_result`` is resolved with
+    the (trimmed) answer text the moment the task settles — the future the
+    fast-window racer awaits (wired in a later task).
     """
-    argv = ["hermes", "chat", "-q", request, "-Q", "--yolo", "--source", "tool"]
-    if resume_session_id:
-        argv += ["--resume", resume_session_id]
-    return argv
+
+    task_id: str
+    request: str
+    label: str
+    state: str = "queued"
+    last_tool: str | None = None
+    steps: int = 0
+    started_at: float | None = None
+    finished_at: float | None = None
+    result: str | None = None
+    delivered_synchronously: bool = False
+    session_id: str | None = None
+    first_result: "asyncio.Future[str] | None" = field(default=None, repr=False)
+    runner: "asyncio.Task | None" = field(default=None, repr=False)
+
+    @property
+    def finished(self) -> bool:
+        return self.state in _FINISHED_STATES
+
+    def elapsed(self, now: float) -> float:
+        """Seconds the task has run: wall time since start, frozen at finish."""
+        if self.started_at is None:
+            return 0.0
+        end = self.finished_at if self.finished_at is not None else now
+        return round(end - self.started_at, 1)
 
 
 class HermesTaskManager:
-    """Owns background Hermes tasks for one Agent Worker job/session."""
+    """Owns the background Hermes tasks for one Agent Worker job/session (ADR-0022)."""
 
     def __init__(
         self,
+        acp_client,
         *,
+        fast_window_s: float = DEFAULT_FAST_WINDOW_S,
         max_concurrent: int = DEFAULT_MAX_CONCURRENT,
+        task_timeout_s: float = DEFAULT_TASK_TIMEOUT,
+        delivery_fallback_s: float = DEFAULT_DELIVERY_FALLBACK_S,
         max_queued: int = DEFAULT_MAX_QUEUED,
-        task_timeout: float = DEFAULT_TASK_TIMEOUT,
-        idle_poll_interval: float = DEFAULT_IDLE_POLL_INTERVAL,
         output_limit: int = DEFAULT_OUTPUT_LIMIT,
     ) -> None:
+        self._acp = acp_client
+        self.fast_window_s = fast_window_s
         self.max_concurrent = max_concurrent
+        self.task_timeout_s = task_timeout_s
+        self.delivery_fallback_s = delivery_fallback_s
         self.max_queued = max_queued
-        self.task_timeout = task_timeout
-        self.idle_poll_interval = idle_poll_interval
         self.output_limit = output_limit
 
-        self._session = None
-        self._session_id: str | None = None
+        # Single source of truth: every task (queued, running, and recently
+        # finished) lives here, keyed by task_id, in creation order.
+        self._tasks: dict[str, HermesTask] = {}
+        self._queue: deque[HermesTask] = deque()  # queued tasks, FIFO
+        self._seq = 0  # task-id counter ("t1", "t2", …)
+
+        self._session = None  # bound AgentSession (proactive delivery, later tasks)
         self._publish = None  # async (data: bytes) -> None, or None
-        self._tasks: set[asyncio.Task] = set()
-        self._labels: dict[asyncio.Task, str] = {}
-        self._started_at: dict[asyncio.Task, float] = {}
-        self._queue: deque[str] = deque()
-        self._running = 0
-        # Completed results awaiting a quiet moment to be spoken: (label, ok, text).
-        self._pending: list[tuple[str, bool, str]] = []
-        self._delivery_task: asyncio.Task | None = None
-        self._delivering = False
         self._event_seq = 0  # monotonic id for feed events (client dedups repeats)
         self._ui_tasks: set[asyncio.Task] = set()  # in-flight UI (re)publish tasks
-        # Set whenever nothing is running, queued, pending, or being delivered.
+        self._closing = False
+        # Set whenever nothing is running or queued (test/shutdown join point).
         self._idle = asyncio.Event()
         self._idle.set()
 
     # -- wiring -------------------------------------------------------------
     def attach_session(self, session) -> None:
-        """Bind the live AgentSession used for proactive replies."""
+        """Bind the live AgentSession used for proactive replies (later tasks)."""
         self._session = session
 
     def set_publisher(self, publish) -> None:
@@ -124,119 +163,321 @@ class HermesTaskManager:
 
     # -- public API ---------------------------------------------------------
     async def delegate(self, request: str) -> str:
-        """Admit, queue, or refuse a Hermes task; return a directive for the LLM."""
-        self._idle.clear()
-        self._emit({"type": "event", "kind": "delegated", "label": self._label(request)})
-        if self._running < self.max_concurrent:
-            self._start(request)
+        """Admit, queue, or refuse a Hermes task; return a directive for the LLM.
+
+        SEAM: the immediate-run path returns a plain ack here. The next task in
+        the chain replaces this return with a race of ``task.first_result``
+        against the ``fast_window_s`` timer (synchronous reply when Hermes is
+        quick, background hand-off otherwise).
+        """
+        if self._running_count() >= self.max_concurrent:
+            if len(self._queue) >= self.max_queued:
+                return DIRECTIVE_FULL
+            task = self._make_task(request)
+            task.state = "queued"
+            self._queue.append(task)
+            self._emit_delegated(task)
             self._emit_tasks()
-            return DIRECTIVE_BACKGROUND
-        if len(self._queue) < self.max_queued:
-            self._queue.append(request)
-            self._emit_tasks()
-            return DIRECTIVE_QUEUED
-        self._update_idle()
-        return DIRECTIVE_FULL
+            return DIRECTIVE_QUEUED.format(task_id=task.task_id)
+
+        task = self._start_task(request)
+        self._emit_delegated(task)
+        self._emit_tasks()
+        return DIRECTIVE_BACKGROUND.format(task_id=task.task_id)
 
     async def cancel(self, hint: str = "") -> str:
         """Cancel active Hermes tasks (running + queued); return a directive.
 
-        Empty hint cancels everything; a hint cancels only tasks whose request
-        label contains it (case-insensitive). Cancelled tasks deliver no result.
+        Empty hint cancels everything; a hint matches a task by ``task_id`` or by
+        a case-insensitive substring of its label. Cancelled tasks deliver no
+        result and are kept in state as ``cancelled``.
         """
         hint_l = hint.strip().lower()
 
-        def matches(label: str) -> bool:
-            return not hint_l or hint_l in label.lower()
+        def matches(task: HermesTask) -> bool:
+            return (
+                not hint_l
+                or hint_l == task.task_id.lower()
+                or hint_l in task.label.lower()
+            )
 
-        running_targets = [t for t in list(self._tasks) if matches(self._labels.get(t, ""))]
-        queued_kept = deque(r for r in self._queue if not matches(self._label(r)))
-        queued_cancelled = len(self._queue) - len(queued_kept)
-        self._queue = queued_kept
-
-        if not running_targets and queued_cancelled == 0:
-            self._update_idle()
+        targets = [
+            t
+            for t in self._tasks.values()
+            if t.state in ("running", "queued") and matches(t)
+        ]
+        if not targets:
             return "Сейчас нет активных задач для отмены. Так и скажи пользователю."
 
-        for task in running_targets:
-            task.cancel()
-        await asyncio.gather(*running_targets, return_exceptions=True)
-        self._update_idle()
+        for task in targets:
+            await self._cancel_task(task)
 
-        total = len(running_targets) + queued_cancelled
-        self._emit({"type": "event", "kind": "cancelled", "count": total})
+        self._emit({"type": "event", "kind": "cancelled", "count": len(targets)})
+        self._promote_queued()
+        self._prune_finished()
         self._emit_tasks()
+        self._update_idle()
         return (
-            f"Отменил задач(и): {total}. Подтверди пользователю, что остановил их, "
-            "и продолжай разговор."
+            f"Отменил задач(и): {len(targets)}. Подтверди пользователю, что остановил "
+            "их, и продолжай разговор."
         )
 
     async def shutdown(self) -> None:
-        """Cancel everything and kill subprocesses — called when the session ends.
+        """Cancel every running task, drain the queue, close the ACP client.
 
-        Silent (no proactive speech): the room is gone, there is no one to tell.
+        Silent (no proactive speech): the room is gone. Safe and idempotent —
+        registered via ``ctx.add_shutdown_callback`` and may be called more than once.
         """
+        self._closing = True
+
+        for task in list(self._queue):
+            task.state = "cancelled"
+            task.finished_at = self._now()
         self._queue.clear()
-        self._pending.clear()
-        targets = list(self._tasks) + list(self._ui_tasks)
-        if self._delivery_task is not None:
-            targets.append(self._delivery_task)
-        for task in targets:
-            task.cancel()
-        await asyncio.gather(*targets, return_exceptions=True)
+
+        runners = [
+            t.runner
+            for t in self._tasks.values()
+            if t.runner is not None and not t.runner.done()
+        ]
+        for runner in runners:
+            runner.cancel()
+        for ui_task in list(self._ui_tasks):
+            ui_task.cancel()
+        await asyncio.gather(*runners, *self._ui_tasks, return_exceptions=True)
+
+        for task in self._tasks.values():
+            if task.state == "running":
+                task.state = "cancelled"
+                task.finished_at = self._now()
+
+        with contextlib.suppress(Exception):
+            await self._acp.aclose()
         self._update_idle()
 
     def list_tasks(self) -> str:
-        """A short summary of running and queued tasks for the agent to read out."""
-        running = list(self._labels.values())
-        queued = [self._label(r) for r in self._queue]
-        if not running and not queued:
+        """Human-readable live status, read straight from task state.
+
+        Never reports a finished task as "still running": running / queued /
+        finished are partitioned by ``state``.
+        """
+        now = self._now()
+        running = [t for t in self._tasks.values() if t.state == "running"]
+        queued = [t for t in self._tasks.values() if t.state == "queued"]
+        finished = [t for t in self._tasks.values() if t.finished]
+
+        if not running and not queued and not finished:
             return "Сейчас никаких фоновых задач нет."
-        parts = []
+
+        parts: list[str] = []
         if running:
-            parts.append("в работе: " + "; ".join(running))
+            items = []
+            for t in running:
+                desc = f"«{t.label}» ({t.elapsed(now):.0f}с, шагов: {t.steps}"
+                if t.last_tool:
+                    desc += f", сейчас: {t.last_tool}"
+                desc += ")"
+                items.append(desc)
+            parts.append("в работе: " + "; ".join(items))
         if queued:
-            parts.append("в очереди: " + "; ".join(queued))
+            parts.append("в очереди: " + "; ".join(f"«{t.label}»" for t in queued))
+        if finished:
+            state_ru = {"done": "готово", "failed": "ошибка", "cancelled": "отменено"}
+            items = []
+            for t in finished[-5:]:
+                preview = self._trim(t.result, 80) if t.result else ""
+                tail = f": {preview}" if preview else ""
+                items.append(f"«{t.label}» [{state_ru[t.state]}]{tail}")
+            parts.append("завершено: " + "; ".join(items))
         return ". ".join(parts) + "."
 
     async def join(self) -> None:
-        """Test/shutdown helper: wait until nothing is running, queued, or pending."""
+        """Test/shutdown helper: wait until nothing is running or queued."""
         await self._idle.wait()
 
-    # -- internals: scheduling ---------------------------------------------
+    # -- internals: labelling / trimming -----------------------------------
     @staticmethod
     def _label(request: str) -> str:
-        """A short human label for a request, for status/cancel messages."""
+        """A short human label for a request, for status/cancel/UI messages."""
         label = " ".join(request.split())
         return label if len(label) <= 48 else label[:47] + "…"
 
-    def _trim(self, text: str, limit: int | None = None) -> str:
+    def _trim(self, text: str | None, limit: int | None = None) -> str:
         """Collapse whitespace and cap length so TTS never chokes on a wall of text."""
-        t = " ".join(text.split())
+        t = " ".join((text or "").split())
         cap = self.output_limit if limit is None else limit
         return t if len(t) <= cap else t[:cap] + "…"
 
-    def _start(self, request: str) -> None:
-        """Admit a request: occupy a slot and spawn its background task."""
-        self._running += 1
-        task = asyncio.create_task(self._run(request))
-        self._tasks.add(task)
-        self._labels[task] = self._label(request)
-        self._started_at[task] = asyncio.get_event_loop().time()
-        task.add_done_callback(self._on_task_done)
+    def _now(self) -> float:
+        return asyncio.get_event_loop().time()
 
-    def _on_task_done(self, task: asyncio.Task) -> None:
-        """Free the slot and pull the next queued request, if any."""
-        self._tasks.discard(task)
-        self._labels.pop(task, None)
-        self._started_at.pop(task, None)
-        self._running -= 1
-        if self._queue:
-            self._start(self._queue.popleft())
-        self._update_idle()
+    # -- internals: scheduling ---------------------------------------------
+    def _next_id(self) -> str:
+        self._seq += 1
+        return f"t{self._seq}"
+
+    def _running_count(self) -> int:
+        return sum(1 for t in self._tasks.values() if t.state == "running")
+
+    def _make_task(self, request: str) -> HermesTask:
+        """Create + register a task (still ``queued``) in the single source of truth."""
+        task = HermesTask(
+            task_id=self._next_id(), request=request, label=self._label(request)
+        )
+        self._tasks[task.task_id] = task
+        return task
+
+    def _start_task(self, request: str) -> HermesTask:
+        """Create a task and launch it immediately as a running background task."""
+        task = self._make_task(request)
+        self._launch(task)
+        return task
+
+    def _launch(self, task: HermesTask) -> None:
+        """Move a task into ``running`` and spawn its ACP driver."""
+        task.state = "running"
+        task.started_at = self._now()
+        task.finished_at = None
+        task.first_result = asyncio.get_event_loop().create_future()
+        self._idle.clear()
+        task.runner = asyncio.create_task(self._run_task(task))
+        task.runner.add_done_callback(lambda _t: self._update_idle())
+
+    def _promote_queued(self) -> None:
+        """Fill freed slots from the FIFO queue."""
+        while self._queue and self._running_count() < self.max_concurrent:
+            self._launch(self._queue.popleft())
+
+    def _prune_finished(self) -> None:
+        """Keep at most ``_FINISHED_KEEP`` settled tasks; drop the oldest beyond that."""
+        finished_ids = [tid for tid, t in self._tasks.items() if t.finished]
+        for tid in finished_ids[:-_FINISHED_KEEP] if len(finished_ids) > _FINISHED_KEEP else []:
+            self._tasks.pop(tid, None)
+
+    async def _run_task(self, task: HermesTask) -> None:
+        """Drive one ACP session end-to-end and store the result in live state.
+
+        session/new → session/prompt → consume tool events (updating live state)
+        → final result. On success the task settles ``done`` with the trimmed
+        answer; on an ACP crash/error it settles ``failed`` with the error text.
+        A local cancellation (``AcpCancelled`` or ``CancelledError``) is owned by
+        :meth:`_cancel_task`, which sets ``cancelled`` — so it never settles here.
+        """
+        try:
+            session_id = await self._acp.new_session()
+            task.session_id = session_id
+            handle = await self._acp.prompt(session_id, task.request)
+            async for ev in handle.events:
+                self._on_tool_event(task, ev)
+            answer = await handle.result
+            task.result = self._trim(answer)
+            task.state = "done"
+        except AcpCancelled:
+            return  # cancellation is settled by _cancel_task
+        except asyncio.CancelledError:
+            raise  # cancellation is settled by _cancel_task
+        except Exception as exc:  # noqa: BLE001 — surface any failure honestly
+            task.result = self._trim(str(exc))
+            task.state = "failed"
+            log.warning("hermes task %s (%s) failed: %r", task.task_id, task.label, exc)
+
+        task.finished_at = self._now()
+        if task.first_result is not None and not task.first_result.done():
+            task.first_result.set_result(task.result or "")
+        self._on_task_complete(task)
+
+    def _on_tool_event(self, task: HermesTask, ev) -> None:
+        """Update live per-task state from one streamed ACP tool event.
+
+        HOOK: the narration task extends this to speak key milestones via
+        ``session.say`` when the channel is free. The ``tool_call_update`` (finish)
+        edge carries no title, so ``last_tool`` keeps the last named tool.
+        """
+        if getattr(ev, "title", None):
+            task.last_tool = ev.title
+        task.steps += 1
         self._emit_tasks()
 
+    def _on_task_complete(self, task: HermesTask) -> None:
+        """Settle bookkeeping for a task that just reached a terminal state.
+
+        HOOK: the reintegration + bounded-delivery tasks extend this to write a
+        synthetic tool turn into ``chat_ctx`` and speak the result. For now it
+        emits the UI feed event, promotes the next queued task, and prunes memory.
+        """
+        kind = "done" if task.state == "done" else "error"
+        body = task.result or ""
+        self._emit(
+            {
+                "type": "event",
+                "kind": kind,
+                "label": task.label,
+                "task_id": task.task_id,
+                "summary": self._trim(body),
+                "full": body[:UI_FULL_OUTPUT_CAP],
+            }
+        )
+        self._promote_queued()
+        self._prune_finished()
+        self._emit_tasks()
+        self._update_idle()
+
+    async def _cancel_task(self, task: HermesTask) -> None:
+        """Cancel one task (queued or running); leave it in state ``cancelled``."""
+        if task.state == "queued":
+            with contextlib.suppress(ValueError):
+                self._queue.remove(task)
+            task.state = "cancelled"
+            task.finished_at = self._now()
+            return
+
+        if task.session_id is not None:
+            with contextlib.suppress(Exception):
+                await self._acp.cancel_prompt(task.session_id)
+        if task.runner is not None:
+            task.runner.cancel()
+            await asyncio.gather(task.runner, return_exceptions=True)
+        # Only claim it as cancelled if it did not settle on its own meanwhile.
+        if task.state == "running":
+            task.state = "cancelled"
+            task.finished_at = self._now()
+
+    def _update_idle(self) -> None:
+        """Set the idle event iff nothing is running or queued."""
+        active = any(
+            t.state in ("running", "queued") for t in self._tasks.values()
+        )
+        if active:
+            self._idle.clear()
+        else:
+            self._idle.set()
+
+    def _session_is_idle(self) -> bool:
+        """Whether the conversation is quiet enough to speak a result into.
+
+        Used by the proactive-delivery worker (later tasks) as the fallback idle
+        probe when the framework's own ``wait_for_idle`` primitive is unavailable.
+        """
+        s = self._session
+        if s is None:
+            return True
+        return (
+            getattr(s, "agent_state", "listening") == "listening"
+            and getattr(s, "user_state", "listening") != "speaking"
+            and getattr(s, "current_speech", None) is None
+        )
+
     # -- internals: UI publishing ------------------------------------------
+    def _emit_delegated(self, task: HermesTask) -> None:
+        self._emit(
+            {
+                "type": "event",
+                "kind": "delegated",
+                "label": task.label,
+                "task_id": task.task_id,
+            }
+        )
+
     def _spawn(self, coro) -> None:
         """Run a fire-and-forget UI publish task, tracked so shutdown can cancel it."""
         task = asyncio.create_task(coro)
@@ -283,12 +524,16 @@ class HermesTaskManager:
         self._spawn(self._resend_tasks())
 
     def _publish_tasks_once(self) -> None:
-        now = asyncio.get_event_loop().time()
-        running = [
-            {"label": label, "elapsed": round(now - self._started_at.get(task, now), 1)}
-            for task, label in self._labels.items()
-        ]
-        queued = [self._label(r) for r in self._queue]
+        now = self._now()
+        running = []
+        for t in self._tasks.values():
+            if t.state != "running":
+                continue
+            entry = {"label": t.label, "elapsed": t.elapsed(now)}
+            if t.last_tool:
+                entry["last_tool"] = t.last_tool  # optional (ops.js ignores unknown keys)
+            running.append(entry)
+        queued = [t.label for t in self._tasks.values() if t.state == "queued"]
         self._emit({"type": "tasks", "running": running, "queued": queued})
 
     async def _resend_tasks(self) -> None:
@@ -297,187 +542,3 @@ class HermesTaskManager:
             if self._publish is None:
                 return
             self._publish_tasks_once()
-
-    def _update_idle(self) -> None:
-        """Set the idle event iff there is no outstanding work of any kind."""
-        if self._running == 0 and not self._queue and not self._pending and not self._delivering:
-            self._idle.set()
-
-    async def _run(self, request: str) -> None:
-        label = self._label(request)
-        argv = build_hermes_argv(request, resume_session_id=self._session_id)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            self._enqueue_result(label, False, "Hermes не найден на этом хосте")
-            return
-
-        comm = asyncio.create_task(proc.communicate())
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(comm, timeout=self.task_timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            comm.cancel()
-            # await on a cancelled task raises CancelledError (a BaseException),
-            # which suppress(Exception) would NOT catch — suppress everything so
-            # cleanup never escapes before we enqueue the failure result.
-            with contextlib.suppress(BaseException):
-                await comm
-            self._enqueue_result(label, False, "не уложилась в отведённое время — отменил")
-            return
-        except asyncio.CancelledError:
-            proc.kill()
-            comm.cancel()
-            # await on a cancelled task raises CancelledError (a BaseException),
-            # which suppress(Exception) would NOT catch — suppress everything so
-            # cleanup never escapes before we enqueue the failure result.
-            with contextlib.suppress(BaseException):
-                await comm
-            raise  # cancelled tasks deliver nothing
-
-        stdout = stdout_b.decode("utf-8", errors="replace").strip()
-        stderr = stderr_b.decode("utf-8", errors="replace").strip()
-        for line in stderr.splitlines():
-            if line.strip().startswith("session_id:"):
-                self._session_id = line.split("session_id:", 1)[1].strip()
-
-        if proc.returncode not in (0, None):
-            self._enqueue_result(label, False, (stderr or stdout)[-self.output_limit:])
-            return
-        self._enqueue_result(label, True, stdout or "(no output)")
-
-    # -- internals: delivery ------------------------------------------------
-    def _enqueue_result(self, label: str, ok: bool, text: str) -> None:
-        """Buffer a finished result and make sure the delivery worker is running."""
-        self._idle.clear()
-        self._emit({
-            "type": "event",
-            "kind": "done" if ok else "error",
-            "label": label,
-            "summary": self._trim(text),
-            "full": text[:UI_FULL_OUTPUT_CAP],
-        })
-        self._pending.append((label, ok, text))
-        if not self._delivering:
-            self._delivering = True
-            self._delivery_task = asyncio.create_task(self._delivery_worker())
-
-    async def _delivery_worker(self) -> None:
-        """Speak buffered results when the conversation is idle, coalesced into one
-        reply per quiet moment so the speech queue never floods."""
-        try:
-            while self._pending:
-                await self._wait_until_idle()
-                batch = self._pending[:]
-                self._pending.clear()
-                if self._session is None:
-                    return
-                # Persist the raw result into the chat context BEFORE speaking, so
-                # the agent can answer about it in later turns — and so it survives
-                # even if the proactive generate_reply below fails (the result is no
-                # longer carried only by the ephemeral `instructions=`). See #23 /
-                # "agent loses background results": instructions are not added to history.
-                await self._inject_results(batch)
-                instructions = self._build_delivery(batch)
-                handle = self._session.generate_reply(
-                    instructions=instructions, allow_interruptions=True
-                )
-                try:
-                    await handle
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    log.warning("hermes proactive delivery failed: %r", e)
-        finally:
-            # Drop the delivering flag, then re-arm if a result landed during the
-            # final delivery (the window after the while-check) so it is not stranded.
-            self._delivering = False
-            if self._pending:
-                self._delivering = True
-                self._delivery_task = asyncio.create_task(self._delivery_worker())
-            else:
-                self._update_idle()
-
-    async def _wait_until_idle(self) -> None:
-        """Block until the agent is listening and the user is not speaking.
-
-        Prefer the framework's own idle primitive (it knows about every speech
-        source, not just the ones we poll); fall back to the state poll when it
-        is unavailable or errors. A non-cancellation error from the primitive
-        falls through to the state poll so idle-gating is still attempted; the
-        worker's ``_session is None`` guard handles a session that has gone away.
-        """
-        if self._session is not None and hasattr(self._session, "wait_for_idle"):
-            try:
-                await self._session.wait_for_idle()
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.debug("wait_for_idle unavailable, falling back to poll: %r", e)
-        while not self._session_is_idle():
-            await asyncio.sleep(self.idle_poll_interval)
-
-    def _session_is_idle(self) -> bool:
-        s = self._session
-        if s is None:
-            return True
-        return (
-            getattr(s, "agent_state", "listening") == "listening"
-            and getattr(s, "user_state", "listening") != "speaking"
-            and getattr(s, "current_speech", None) is None
-        )
-
-    async def _inject_results(self, batch: list[tuple[str, bool, str]]) -> None:
-        """Durably append each finished result to the agent's chat context.
-
-        ``generate_reply(instructions=...)`` does NOT persist its instructions in
-        history, so a background result delivered only that way is forgotten the
-        moment the reply ends (the agent cannot answer "what did that task find?"
-        later). Writing the result as a system message into the live chat context
-        makes it durable and recallable across turns.
-        """
-        agent = getattr(self._session, "current_agent", None)
-        if agent is None or not hasattr(agent, "update_chat_ctx"):
-            return
-        try:
-            chat_ctx = agent.chat_ctx.copy()
-            for label, ok, text in batch:
-                status = "" if ok else " — ошибка"
-                body = " ".join(text.split())[:CONTEXT_RESULT_CAP]
-                chat_ctx.add_message(
-                    role="system",
-                    content=f"[Результат фоновой задачи «{label}»{status}]: {body}",
-                )
-            await agent.update_chat_ctx(chat_ctx)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.warning("failed to inject hermes result into chat ctx: %r", e)
-
-    def _build_delivery(self, batch: list[tuple[str, bool, str]]) -> str:
-        """Build ONE generate_reply instruction for a batch of finished results."""
-        if len(batch) == 1:
-            label, ok, text = batch[0]
-            if ok:
-                return (
-                    f"Фоновая задача «{label}» готова. Результат Hermes: {self._trim(text)}. "
-                    "Передай пользователю суть кратко, своими словами, без markdown."
-                )
-            return (
-                f"Фоновая задача «{label}» завершилась с ошибкой: {self._trim(text, 200)}. "
-                "Скажи пользователю кратко, что не получилось."
-            )
-        lines = []
-        for label, ok, text in batch:
-            status = "готово" if ok else "ошибка"
-            lines.append(f"- «{label}» [{status}]: {self._trim(text, 200)}")
-        joined = "\n".join(lines)
-        return (
-            "Готовы несколько фоновых задач. Сведи их в одну короткую устную сводку "
-            f"для пользователя, без markdown:\n{joined}"
-        )

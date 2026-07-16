@@ -54,7 +54,10 @@ import yaml
 from livekit.agents import function_tool
 from livekit.agents.voice.events import RunContext
 
+from acp_client import AcpClient
 from hermes_tasks import (
+    DEFAULT_DELIVERY_FALLBACK_S,
+    DEFAULT_FAST_WINDOW_S,
     DEFAULT_MAX_CONCURRENT,
     DEFAULT_MAX_QUEUED,
     DEFAULT_OUTPUT_LIMIT,
@@ -201,10 +204,14 @@ async def run_command(args: str) -> str:
 # Async Hermes delegation: background task manager + thin function_tool adapters
 # --------------------------------------------------------------------------- #
 def make_hermes_manager() -> HermesTaskManager:
-    """Construct a HermesTaskManager using worker_tools.* knobs from config.yaml.
+    """Construct a HermesTaskManager over a fresh AcpClient using config.yaml knobs.
 
-    Missing keys fall back to the module defaults so the worker always boots.
-    Stored in AgentSession.userdata; the tool adapters reach it from there.
+    Reads the ACP hybrid-delegation knobs from ``worker_tools.*`` (ADR-0022);
+    missing keys fall back to the module defaults so the worker always boots. The
+    AcpClient is spawned lazily on first delegation (respawn-on-demand), so this
+    never blocks startup. Stored in AgentSession.userdata; the tool adapters reach
+    it from there. NOTE: the manager now owns an AcpClient rather than the old
+    subprocess knobs; the full startup/prewarm wiring lands in a later task.
     """
     try:
         raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
@@ -219,10 +226,13 @@ def make_hermes_manager() -> HermesTaskManager:
             return default
 
     return HermesTaskManager(
-        max_concurrent=_num("hermes_max_concurrent", DEFAULT_MAX_CONCURRENT, int),
-        max_queued=_num("hermes_max_queued", DEFAULT_MAX_QUEUED, int),
-        task_timeout=_num("hermes_task_timeout_seconds", DEFAULT_TASK_TIMEOUT, float),
-        output_limit=_num("hermes_output_limit_chars", DEFAULT_OUTPUT_LIMIT, int),
+        AcpClient(),
+        fast_window_s=_num("fast_window_s", DEFAULT_FAST_WINDOW_S, float),
+        max_concurrent=_num("max_concurrent", DEFAULT_MAX_CONCURRENT, int),
+        task_timeout_s=_num("task_timeout_s", DEFAULT_TASK_TIMEOUT, float),
+        delivery_fallback_s=_num("delivery_fallback_s", DEFAULT_DELIVERY_FALLBACK_S, float),
+        max_queued=_num("max_queued", DEFAULT_MAX_QUEUED, int),
+        output_limit=_num("output_limit_chars", DEFAULT_OUTPUT_LIMIT, int),
     )
 
 

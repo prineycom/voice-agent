@@ -1,21 +1,28 @@
-"""Tests for the async Hermes delegation manager (HermesTaskManager).
+"""Tests for the ACP-based Hermes task manager (HermesTaskManager, ADR-0022).
 
-No real subprocess and no real LiveKit session are used: asyncio.create_subprocess_exec
-is monkeypatched with controllable FakeProcs, and a FakeSession records the
-proactive generate_reply() calls the manager makes. This keeps the tests
-CI-friendly (no Hermes install, no Pi, no SFU) while exercising the real
-queueing / progress / cancellation logic.
+No real Hermes process and no real LiveKit session are used. The manager drives a
+REAL :class:`acp_client.AcpClient` whose ``asyncio.create_subprocess_exec`` is
+monkeypatched with the scripted :class:`conftest.FakeAcpProc` peer (real ACP
+transport, scripted answers, every message recorded). This keeps the tests
+behavioural — the manager's admission / live-state / cancel / UI logic runs
+against the same codec production uses — while staying CI-friendly (no Hermes
+install, no Pi, no SFU).
 """
 
 import asyncio
 import json
-import logging
 
 import pytest
 
+from acp_client import AcpClient
+from conftest import acp_tool_call, acp_tool_call_update
 from hermes_tasks import HermesTaskManager
 
 
+# --------------------------------------------------------------------------- #
+# Fakes reused/extended by this and later tasks in the chain (delivery /
+# reintegration write into a chat context and speak proactive replies).
+# --------------------------------------------------------------------------- #
 class FakeHandle:
     """Stand-in for a SpeechHandle — awaitable, resolves immediately."""
 
@@ -29,9 +36,9 @@ class FakeHandle:
 class FakeSession:
     """Records proactive replies; mimics AgentSession.generate_reply + idle state.
 
-    Defaults to idle (agent listening, user not speaking, no current speech) so
-    the delivery worker speaks immediately; tests set ``agent_state`` /
-    ``user_state`` to simulate a busy conversation and exercise idle-gating.
+    Defaults to idle (agent listening, user not speaking, no current speech) so a
+    later delivery worker speaks immediately; tests set ``agent_state`` /
+    ``user_state`` to simulate a busy conversation.
     """
 
     def __init__(self):
@@ -46,16 +53,23 @@ class FakeSession:
 
 
 class FakeChatCtx:
-    """Minimal stand-in for llm.ChatContext (copy + add_message)."""
+    """Minimal stand-in for llm.ChatContext (copy + add_message + insert)."""
 
-    def __init__(self, messages=None):
-        self.messages = list(messages or [])
+    def __init__(self, items=None):
+        self.items = list(items or [])
 
     def copy(self):
-        return FakeChatCtx(self.messages)
+        return FakeChatCtx(self.items)
 
     def add_message(self, *, role, content, **kwargs):
-        self.messages.append((role, content))
+        self.items.append((role, content))
+
+    def insert(self, items):
+        """Record inserted items (synthetic tool-turn reintegration, later task)."""
+        if isinstance(items, (list, tuple)):
+            self.items.extend(items)
+        else:
+            self.items.append(items)
 
 
 class FakeAgent:
@@ -80,492 +94,316 @@ class FakeSessionWithAgent(FakeSession):
         self.current_agent = FakeAgent()
 
 
-class FakeProc:
-    """Controllable stand-in for asyncio.subprocess.Process.
-
-    communicate() blocks until ``release`` is set (default: pre-set, returns at
-    once). kill() unblocks it so a cancelled/timed-out task can finish tearing down.
-    """
-
-    def __init__(self, *, stdout=b"", stderr=b"", returncode=0, blocking=False):
-        self._stdout = stdout
-        self._stderr = stderr
-        self.returncode = returncode
-        self.killed = False
-        self.release = asyncio.Event()
-        if not blocking:
-            self.release.set()
-
-    async def communicate(self):
-        await self.release.wait()
-        if self.killed:
-            self.returncode = -9
-        return self._stdout, self._stderr
-
-    def kill(self):
-        self.killed = True
-        self.release.set()
+# --------------------------------------------------------------------------- #
+# Harness: a manager wired to a real AcpClient over a scripted FakeAcpProc.
+# --------------------------------------------------------------------------- #
+def make_manager(monkeypatch, proc, fake_acp_exec, **kwargs):
+    """Build a HermesTaskManager over a real AcpClient backed by ``proc``."""
+    exec_fn, _created = fake_acp_exec(proc)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_fn)
+    client = AcpClient()
+    mgr = HermesTaskManager(client, **kwargs)
+    mgr.attach_session(FakeSession())
+    return mgr
 
 
-def fake_exec_factory(procs):
-    """Return a create_subprocess_exec replacement that hands out ``procs`` in order
-    and records the argv of each spawn in ``calls``."""
-    queue = list(procs)
-    calls: list[list[str]] = []
-
-    async def _fake(*args, **kwargs):
-        calls.append(list(args))
-        return queue.pop(0)
-
-    _fake.calls = calls
-    return _fake
+def only_task(mgr):
+    """The single task in a manager (convenience for one-task tests)."""
+    tasks = list(mgr._tasks.values())
+    assert len(tasks) == 1, f"expected exactly one task, got {tasks}"
+    return tasks[0]
 
 
+async def wait_for(predicate, timeout=2.0, interval=0.01):
+    """Poll ``predicate`` until true or the timeout elapses."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return predicate()
+
+
+# --------------------------------------------------------------------------- #
+# (1) delegate runs a task to completion; state → done with the result stored.
+# --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_delegate_returns_immediately_and_delivers_result(monkeypatch):
-    session = FakeSession()
-    proc = FakeProc(stdout=b"weather is sunny\n", stderr=b"session_id: s1\n", returncode=0, blocking=True)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
+async def test_delegate_runs_task_to_done_and_stores_result(
+    monkeypatch, fake_acp_exec
+):
+    from conftest import FakeAcpProc
 
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(session)
+    proc = FakeAcpProc()
+    proc.script_prompt(result={"text": "на улице солнечно, плюс восемнадцать"})
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)
 
-    directive = await mgr.delegate("посмотри погоду")
+    ack = await mgr.delegate("посмотри погоду")
+    assert "id:" in ack.lower() or "фон" in ack.lower()  # ack carries the task id
 
-    # Returned before the subprocess finished, and nothing spoken yet.
-    assert "background" in directive.lower() or "фон" in directive.lower()
-    assert session.replies == []
-
-    # Let Hermes finish; the result is delivered proactively via generate_reply.
-    proc.release.set()
     await mgr.join()
 
-    assert any("weather is sunny" in r for r in session.replies)
+    task = only_task(mgr)
+    assert task.state == "done"
+    assert "солнечно" in (task.result or "")
+    assert task.first_result.done()
+    assert "солнечно" in task.first_result.result()
 
 
+# --------------------------------------------------------------------------- #
+# (2) max_concurrent respected: 3 running + 1 queued; queued promotes on finish.
+# --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_delegate_builds_hermes_command(monkeypatch):
-    session = FakeSession()
-    proc = FakeProc(stdout=b"ok\n", returncode=0)
-    fake = fake_exec_factory([proc])
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+async def test_max_concurrent_queues_and_promotes_on_finish(
+    monkeypatch, fake_acp_exec
+):
+    from conftest import FakeAcpProc
 
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("найди погоду в Москве")
-    await mgr.join()
+    proc = FakeAcpProc()
+    # sess-1 finishes quickly (a short streamed step); sess-2/3 stay busy; the
+    # promoted task (sess-4) finishes on its own.
+    proc.script_prompt(session_id="sess-1", updates=[acp_tool_call("t", "step")], delay=0.15)
+    proc.script_prompt(session_id="sess-2", updates=[acp_tool_call("t", "busy")], delay=5)
+    proc.script_prompt(session_id="sess-3", updates=[acp_tool_call("t", "busy")], delay=5)
+    proc.script_prompt(session_id="sess-4", result={"text": "promoted done"})
 
-    argv = fake.calls[0]
-    assert argv[0] == "hermes"
-    assert "chat" in argv
-    assert "найди погоду в Москве" in argv  # passed as a single -q argument
-    assert "-Q" in argv and "--yolo" in argv
-
-
-@pytest.mark.asyncio
-async def test_exceeding_concurrency_queues_until_slot_frees(monkeypatch):
-    session = FakeSession()
-    procs = [FakeProc(stdout=f"r{i}\n".encode(), blocking=True) for i in range(3)]
-    fake = fake_exec_factory(procs)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
-
-    mgr = HermesTaskManager(max_concurrent=2, max_queued=5, task_timeout=10)
-    mgr.attach_session(session)
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, max_concurrent=3, max_queued=5)
 
     await mgr.delegate("a")
     await mgr.delegate("b")
-    d3 = await mgr.delegate("c")
-    await asyncio.sleep(0.02)  # let the admitted tasks reach create_subprocess_exec
+    await mgr.delegate("c")
+    d = await mgr.delegate("d")  # over capacity → queued
 
-    assert len(fake.calls) == 2  # third is queued, not spawned
-    assert "очеред" in d3.lower() or "queue" in d3.lower()
+    # State is set synchronously in _launch, so this holds regardless of timing.
+    assert mgr._running_count() == 3
+    assert len(mgr._queue) == 1
+    assert "очеред" in d.lower()
 
-    procs[0].release.set()  # free a slot
-    await asyncio.sleep(0.02)
-    assert len(fake.calls) == 3  # queued task now started
+    # sess-1 finishes → a slot frees → the queued task is promoted and runs.
+    queued_task = mgr._queue[0] if mgr._queue else None
+    assert queued_task is not None
+    assert await wait_for(lambda: queued_task.state != "queued")
+    assert queued_task.state in ("running", "done")
 
-    procs[1].release.set()
-    procs[2].release.set()
-    await mgr.join()
+    await mgr.shutdown()
 
 
+# --------------------------------------------------------------------------- #
+# (3) queue overflow → refusal string.
+# --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_queue_overflow_refuses(monkeypatch):
-    session = FakeSession()
-    procs = [FakeProc(stdout=b"x\n", blocking=True) for _ in range(10)]
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory(procs))
+async def test_queue_overflow_refuses(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
 
-    mgr = HermesTaskManager(max_concurrent=1, max_queued=1, task_timeout=10)
-    mgr.attach_session(session)
+    proc = FakeAcpProc()
+    for sid in ("sess-1", "sess-2"):
+        proc.script_prompt(session_id=sid, updates=[acp_tool_call("t", "busy")], delay=5)
+
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, max_concurrent=1, max_queued=1)
 
     await mgr.delegate("a")  # running
     await mgr.delegate("b")  # queued (fills the queue)
     refusal = await mgr.delegate("c")  # overflow
 
     assert "слишком много" in refusal.lower() or "подожд" in refusal.lower()
-
-    for p in procs:
-        p.release.set()
-    await mgr.join()
-
-
-@pytest.mark.asyncio
-async def test_no_voice_nudges_while_task_runs(monkeypatch):
-    """A long-running task must NOT emit any proactive speech until it finishes —
-    progress nudges flooded the speech queue, so they are gone."""
-    session = FakeSession()
-    proc = FakeProc(stdout=b"finally done\n", blocking=True)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
-
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("долгая задача")
-
-    await asyncio.sleep(0.2)
-    assert session.replies == []  # nothing spoken while it runs
-
-    proc.release.set()
-    await mgr.join()
-    assert any("finally done" in r for r in session.replies)  # result delivered at the end
-
-
-@pytest.mark.asyncio
-async def test_results_coalesced_into_one_reply_when_several_ready(monkeypatch):
-    """Several results ready at once are delivered as a SINGLE coalesced reply,
-    not one generate_reply per task."""
-    session = FakeSession()
-    # Hold the session busy so both tasks finish before any delivery happens.
-    session.agent_state = "speaking"
-    p1 = FakeProc(stdout=b"result one\n")
-    p2 = FakeProc(stdout=b"result two\n")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([p1, p2]))
-
-    mgr = HermesTaskManager(max_concurrent=2, task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("задача один")
-    await mgr.delegate("задача два")
-    await asyncio.sleep(0.05)  # both subprocesses finish, results buffered
-
-    assert session.replies == []  # nothing delivered while busy
-
-    session.agent_state = "listening"  # conversation goes idle
-    await mgr.join()
-
-    assert len(session.replies) == 1  # one coalesced reply, not two
-    assert "result one" in session.replies[0] and "result two" in session.replies[0]
-
-
-@pytest.mark.asyncio
-async def test_delivery_waits_until_session_idle(monkeypatch):
-    session = FakeSession()
-    session.user_state = "speaking"  # user is talking — do not interrupt
-    proc = FakeProc(stdout=b"ready now\n")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
-
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("задача")
-    await asyncio.sleep(0.05)
-    assert session.replies == []  # held back while the user speaks
-
-    session.user_state = "listening"
-    await mgr.join()
-    assert any("ready now" in r for r in session.replies)
-
-
-@pytest.mark.asyncio
-async def test_long_output_is_trimmed_before_delivery(monkeypatch):
-    session = FakeSession()
-    huge = ("a" * 5000).encode()
-    proc = FakeProc(stdout=huge)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
-
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("болтливая задача")
-    await mgr.join()
-
-    assert session.replies, "a result should be delivered"
-    # The delivered instruction must not carry the full 5000-char dump.
-    assert len(session.replies[0]) < 2000
-
-
-@pytest.mark.asyncio
-async def test_cancel_kills_running_task_and_delivers_no_result(monkeypatch):
-    session = FakeSession()
-    proc = FakeProc(stdout=b"should not be delivered\n", blocking=True)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
-
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("задача")
-    await asyncio.sleep(0.02)  # let it reach communicate()
-
-    msg = await mgr.cancel()
-    await mgr.join()
-
-    assert proc.killed is True
-    assert not any("should not be delivered" in r for r in session.replies)
-    assert "отмен" in msg.lower()
-    assert mgr._running == 0
-
-
-@pytest.mark.asyncio
-async def test_cancel_with_no_active_tasks_says_so(monkeypatch):
-    mgr = HermesTaskManager()
-    mgr.attach_session(FakeSession())
-    msg = await mgr.cancel()
-    assert "нет" in msg.lower()
-
-
-@pytest.mark.asyncio
-async def test_shutdown_cancels_all_running_and_queued(monkeypatch):
-    session = FakeSession()
-    procs = [FakeProc(stdout=b"x\n", blocking=True) for _ in range(5)]
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory(procs))
-
-    mgr = HermesTaskManager(max_concurrent=2, max_queued=5, task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("a")
-    await mgr.delegate("b")
-    await mgr.delegate("c")  # queued
-    await asyncio.sleep(0.02)
+    # The refused task was never registered.
+    assert len(mgr._tasks) == 2
 
     await mgr.shutdown()
 
-    assert mgr._running == 0
-    assert list(mgr._queue) == []
-    assert procs[0].killed and procs[1].killed  # the two running were killed
 
-
+# --------------------------------------------------------------------------- #
+# (4) list_tasks shows live last_tool/steps while running, then finished state.
+# --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_timeout_cancels_and_reports_failure(monkeypatch):
-    session = FakeSession()
-    proc = FakeProc(stdout=b"never\n", blocking=True)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
+async def test_list_tasks_live_then_finished(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
 
-    mgr = HermesTaskManager(task_timeout=0.05)
-    mgr.attach_session(session)
-    await mgr.delegate("медленная задача")
-    await mgr.join()
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("tc1", "terminal: ls"), acp_tool_call_update("tc1")],
+        result={"text": "готово"},
+        delay=0.25,
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)
 
-    assert proc.killed is True
-    assert any("время" in r.lower() or "не успел" in r.lower() for r in session.replies)
+    await mgr.delegate("проверь диск")
+    task = only_task(mgr)
 
-
-@pytest.mark.asyncio
-async def test_nonzero_exit_reports_error(monkeypatch):
-    session = FakeSession()
-    proc = FakeProc(stdout=b"", stderr=b"boom failure\n", returncode=2)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
-
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("сломается")
-    await mgr.join()
-
-    assert any("ошибк" in r.lower() for r in session.replies)
-
-
-@pytest.mark.asyncio
-async def test_list_tasks_summarizes_running_and_queued(monkeypatch):
-    session = FakeSession()
-    procs = [FakeProc(stdout=b"x\n", blocking=True) for _ in range(3)]
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory(procs))
-
-    mgr = HermesTaskManager(max_concurrent=1, max_queued=5, task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("поиск погоды")
-    await mgr.delegate("проверка почты")  # queued
-    await asyncio.sleep(0.02)
-
+    # After the first streamed tool event lands, the live status reflects it.
+    assert await wait_for(lambda: task.last_tool == "terminal: ls" and task.steps >= 1)
     summary = mgr.list_tasks()
-    assert "погод" in summary.lower()
-    assert "почт" in summary.lower()
+    assert "проверь диск" in summary
+    assert "terminal: ls" in summary  # live last_tool surfaced
+    assert task.state == "running"
 
-    for p in procs:
-        p.release.set()
     await mgr.join()
 
+    finished = mgr.list_tasks()
+    assert task.state == "done"
+    assert "готово" in finished  # finished state shown, not "still running"
+    assert "в работе" not in finished
 
+
+# --------------------------------------------------------------------------- #
+# (5) cancel by label and by task_id → cancelled + UI event.
+# --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_delegate_tool_uses_manager_from_session_userdata(monkeypatch):
-    """The @function_tool adapter pulls the manager from session.userdata, binds
-    the session, and delegates — returning the manager's directive."""
-    import worker_tools
-    from types import SimpleNamespace
+async def test_cancel_by_label_and_id(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
 
-    proc = FakeProc(stdout=b"sunny\n", returncode=0)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
-
-    mgr = HermesTaskManager(task_timeout=10)
-    session = FakeSession()
-    session.userdata = mgr
-    ctx = SimpleNamespace(session=session)
-
-    out = await worker_tools.delegate_to_hermes("посмотри погоду", context=ctx)
-    assert "background" in out.lower() or "фон" in out.lower()
-    await mgr.join()
-    assert any("sunny" in r for r in session.replies)
-
-
-@pytest.mark.asyncio
-async def test_publishes_ui_events_and_task_snapshot(monkeypatch):
-    """The manager publishes a 'delegated' event, a 'done' event carrying the full
-    output, and at least one task snapshot — for the web UI to render."""
     published = []
 
     async def publisher(data: bytes):
         published.append(json.loads(data))
 
-    proc = FakeProc(stdout=b"sunny, plus eighteen degrees\n")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
+    proc = FakeAcpProc()
+    for sid in ("sess-1", "sess-2"):
+        proc.script_prompt(session_id=sid, updates=[acp_tool_call("t", "busy")], delay=5)
 
-    mgr = HermesTaskManager(task_timeout=10, output_limit=10)  # tiny limit → summary != full
-    mgr.attach_session(FakeSession())
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, max_concurrent=3)
     mgr.set_publisher(publisher)
 
-    await mgr.delegate("посмотри погоду")
+    await mgr.delegate("проверь почту")
+    await mgr.delegate("посчитай бюджет")
+    mail, budget = list(mgr._tasks.values())
+
+    # Cancel one by label substring.
+    msg = await mgr.cancel("почту")
+    assert "отмен" in msg.lower()
+    assert mail.state == "cancelled"
+    assert budget.state == "running"
+
+    # Cancel the other by task_id.
+    await mgr.cancel(budget.task_id)
+    assert budget.state == "cancelled"
+
+    await asyncio.sleep(0.05)  # flush fire-and-forget UI publishes
+    assert any(e.get("kind") == "cancelled" for e in published)
+
+    await mgr.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# (6) shutdown cancels running tasks and drains the queue.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_shutdown_cancels_running_and_queue(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    for sid in ("sess-1", "sess-2"):
+        proc.script_prompt(session_id=sid, updates=[acp_tool_call("t", "busy")], delay=5)
+
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, max_concurrent=2, max_queued=5)
+
+    await mgr.delegate("a")
+    await mgr.delegate("b")
+    await mgr.delegate("c")  # queued
+    assert mgr._running_count() == 2
+    assert len(mgr._queue) == 1
+
+    await mgr.shutdown()
+
+    assert mgr._running_count() == 0
+    assert list(mgr._queue) == []
+    assert all(t.state == "cancelled" for t in mgr._tasks.values())
+    # Idempotent: a second shutdown must not raise.
+    await mgr.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# (7) UI snapshot shape (ops.js compat) + the four feed event kinds.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_ui_snapshot_shape_and_event_kinds(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    published = []
+
+    async def publisher(data: bytes):
+        published.append(json.loads(data))
+
+    proc = FakeAcpProc()
+    proc.script_prompt(result={"text": "готово"})
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)
+    mgr.set_publisher(publisher)
+
+    await mgr.delegate("задача")
     await mgr.join()
-    await asyncio.sleep(0.02)  # flush fire-and-forget publish tasks
+    await asyncio.sleep(0.05)  # flush fire-and-forget publishes
 
     kinds = [(e.get("type"), e.get("kind")) for e in published]
     assert ("event", "delegated") in kinds
     assert ("event", "done") in kinds
-    assert any(e.get("type") == "tasks" for e in published)
 
-    done = next(e for e in published if e.get("kind") == "done")
-    assert "sunny, plus eighteen degrees" in done["full"]  # full, untrimmed
-    assert len(done["summary"]) <= 11  # trimmed to output_limit (+ ellipsis)
+    # Task snapshots keep the ops.js contract: {type:"tasks", running:[{label,
+    # elapsed}], queued:[...]} .
+    snaps = [e for e in published if e.get("type") == "tasks"]
+    assert snaps
+    assert all("running" in s and "queued" in s for s in snaps)
+    assert any(
+        any("label" in r and "elapsed" in r for r in s["running"]) for s in snaps
+    )
 
 
 @pytest.mark.asyncio
-async def test_background_result_injected_into_chat_ctx(monkeypatch):
-    """A finished background result is written into the agent's chat context (not
-    just spoken via ephemeral generate_reply instructions) so it survives for
-    later turns — the 'agent forgets background results' fix."""
-    proc = FakeProc(stdout=b"the answer is 42\n")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
+async def test_failed_task_emits_error_event(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
 
-    mgr = HermesTaskManager(task_timeout=10)
-    session = FakeSessionWithAgent()
-    mgr.attach_session(session)
+    published = []
 
-    await mgr.delegate("посчитай ответ")
+    async def publisher(data: bytes):
+        published.append(json.loads(data))
+
+    proc = FakeAcpProc()
+    proc.script_prompt(error={"code": -32000, "message": "hermes boom"})
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)
+    mgr.set_publisher(publisher)
+
+    await mgr.delegate("сломается")
     await mgr.join()
-    await asyncio.sleep(0.02)  # let the delivery worker inject + reply
+    await asyncio.sleep(0.05)
 
-    msgs = session.current_agent.chat_ctx.messages
-    assert any("the answer is 42" in content for _role, content in msgs)
-    assert all(role == "system" for role, _content in msgs)
-    # and it is still spoken
-    assert any("the answer is 42" in r or "посчитай ответ" in r for r in session.replies)
+    task = only_task(mgr)
+    assert task.state == "failed"
+    assert "boom" in (task.result or "").lower()
+    kinds = [(e.get("type"), e.get("kind")) for e in published]
+    assert ("event", "error") in kinds
 
 
 @pytest.mark.asyncio
-async def test_no_publisher_is_safe(monkeypatch):
-    """With no publisher set, the manager runs normally (publishing is a no-op)."""
-    proc = FakeProc(stdout=b"ok\n")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(FakeSession())
+async def test_long_result_trimmed_to_output_limit(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(result={"text": "a" * 5000})
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, output_limit=50)
+
+    await mgr.delegate("болтливая задача")
+    await mgr.join()
+
+    task = only_task(mgr)
+    assert len(task.result) <= 51  # trimmed to output_limit (+ ellipsis)
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_no_active_tasks_says_so(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    mgr = make_manager(monkeypatch, FakeAcpProc(), fake_acp_exec)
+    msg = await mgr.cancel()
+    assert "нет" in msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_no_publisher_is_safe(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(result={"text": "ok"})
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)  # no publisher set
+
     await mgr.delegate("задача")
     await mgr.join()  # must not raise
-
-
-class IdlePrimitiveSession(FakeSession):
-    """FakeSession that exposes the framework's async ``wait_for_idle()`` primitive.
-
-    Records the relative order of idle-await vs reply so a test can assert the
-    worker awaits the primitive *before* speaking.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.idle_awaited = False
-        self.order: list[str] = []
-
-    async def wait_for_idle(self):
-        self.idle_awaited = True
-        self.order.append("idle")
-
-    def generate_reply(self, *, instructions=None, allow_interruptions=None, **kwargs):
-        self.order.append("reply")
-        return super().generate_reply(
-            instructions=instructions, allow_interruptions=allow_interruptions, **kwargs
-        )
-
-
-@pytest.mark.asyncio
-async def test_delivery_awaits_framework_idle_primitive_before_replying(monkeypatch):
-    """When the bound session exposes async wait_for_idle(), the delivery worker
-    awaits it before calling generate_reply (preferred over the state poll)."""
-    session = IdlePrimitiveSession()
-    proc = FakeProc(stdout=b"ready via primitive\n")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([proc]))
-
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(session)
-    await mgr.delegate("задача")
-    await mgr.join()
-
-    assert session.idle_awaited is True  # the framework primitive was awaited
-    assert any("ready via primitive" in r for r in session.replies)  # and a reply was made
-    assert session.order == ["idle", "reply"]  # await happened before the reply
-
-
-class RaisingHandle:
-    """Stand-in for a SpeechHandle whose await raises — mirrors FakeHandle's shape
-    so the raise happens at ``await handle`` inside the delivery worker."""
-
-    def __await__(self):
-        async def _boom():
-            raise RuntimeError("speech handle exploded")
-
-        return _boom().__await__()
-
-
-class FlakyHandleSession(FakeSession):
-    """First generate_reply yields a handle that raises on await; later ones are
-    normal — so a test can prove the worker survives a failed delivery and still
-    delivers the next result."""
-
-    def __init__(self):
-        super().__init__()
-        self._calls = 0
-
-    def generate_reply(self, *, instructions=None, allow_interruptions=None, **kwargs):
-        self.replies.append(instructions or "")
-        self._calls += 1
-        if self._calls == 1:
-            return RaisingHandle()
-        return FakeHandle()
-
-
-@pytest.mark.asyncio
-async def test_delivery_logs_and_continues_when_handle_await_raises(monkeypatch, caplog):
-    """A speech handle that raises on await must be logged as a warning (not
-    swallowed silently, not crashing the worker), and a subsequent result must
-    still be delivered (no strand)."""
-    session = FlakyHandleSession()
-    p1 = FakeProc(stdout=b"first result\n")
-    p2 = FakeProc(stdout=b"second result\n")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec_factory([p1, p2]))
-
-    mgr = HermesTaskManager(task_timeout=10)
-    mgr.attach_session(session)
-
-    with caplog.at_level(logging.WARNING, logger="agent"):
-        # First result: its delivery handle raises on await.
-        await mgr.delegate("первая задача")
-        await mgr.join()  # must NOT propagate the handle's exception
-
-        assert any(
-            "hermes proactive delivery failed" in rec.message for rec in caplog.records
-        ), "the failed delivery must be logged at WARNING, not swallowed"
-
-        # Second result: delivered by a healthy worker after the first one failed.
-        await mgr.delegate("вторая задача")
-        await mgr.join()
-
-    assert any("second result" in r for r in session.replies)  # next result still delivered
+    assert only_task(mgr).state == "done"
