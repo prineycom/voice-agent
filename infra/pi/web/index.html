@@ -17,6 +17,7 @@
     <small id="micLabel" style="color:#8b97a8">не активен</small>
   </div>
   <span class="grow"></span>
+  <button id="wakeBtn" disabled title="Разбудить агента (как wake-word)">👋 Разбудить</button>
   <button id="muteBtn" disabled>🔇 Mute</button>
   <button id="connectBtn" class="primary">Connect</button>
 </header>
@@ -50,7 +51,7 @@
       <small class="live2d-credit">This content uses sample data owned and copyrighted by Live2D Inc.</small>
     </div>
     <section id="transcript">
-      <div class="empty" id="emptyHint">Нажми <b>Connect</b> и разреши доступ к микрофону.<br>Скажи <b>«Хей джарвис»</b>, чтобы разбудить агента.</div>
+      <div class="empty" id="emptyHint">Нажми <b>Connect</b> и разреши доступ к микрофону.<br>Скажи <b>«Хей джарвис»</b> или нажми <b>👋 Разбудить</b>, чтобы разбудить агента.</div>
     </section>
     <form id="composer" autocomplete="off">
       <input id="composerInput" type="text" placeholder="Напиши сообщение агенту…" disabled aria-label="Текстовое сообщение агенту" />

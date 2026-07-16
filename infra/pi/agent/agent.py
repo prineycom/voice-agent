@@ -36,6 +36,7 @@ See the README (Task 8) for the on-Pi smoke test.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Callable
@@ -365,6 +366,24 @@ async def entrypoint(ctx: JobContext) -> None:
             if detector is not None:
                 asyncio.create_task(detector.aclose())
 
+        @ctx.room.on("data_received")
+        def _on_data_received(packet: rtc.DataPacket) -> None:  # noqa: ANN001
+            # Manual wake trigger from the web UI button: the spoken wake word can
+            # be hard to enunciate reliably, so the frontend offers a button that
+            # publishes {"type": "wake_request"} on the same UI_TOPIC. Treat it
+            # exactly like a classifier hit — on_wake_detected flips Dormant→Active
+            # and publishes the `active` event back, so the chime/badge/avatar
+            # feedback rides the SAME path as an audio wake word (no separate UI
+            # code). Ignored (harmless) if the message isn't ours.
+            if packet.topic != UI_TOPIC:
+                return
+            try:
+                msg = json.loads(bytes(packet.data).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return
+            if isinstance(msg, dict) and msg.get("type") == "wake_request":
+                wake_state.on_wake_detected("manual (UI button)", 1.0)
+
         # Catch tracks already subscribed before this handler was registered
         # (the participant may have joined before dispatch reached here).
         for participant in ctx.room.remote_participants.values():
@@ -461,6 +480,13 @@ async def entrypoint(ctx: JobContext) -> None:
         # timer so the agent's own speech keeps the conversation window open (#59).
         if wake_state is not None:
             wake_state.note_agent_activity()
+
+    # Keep the Active window open while the USER is still speaking: a long single
+    # utterance never hits a turn boundary, so without a live speech probe the
+    # silence timer could sleep the agent mid-sentence. session.user_state is the
+    # framework's VAD-driven "speaking"/"listening"/"away" (#59).
+    if wake_state is not None:
+        wake_state.set_user_speaking_source(lambda: session.user_state == "speaking")
 
     # --- Diagnostics for the "transcript stops on long output" bug (issue under
     # investigation). These are cheap, high-signal hooks: which conversation items

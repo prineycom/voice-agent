@@ -69,13 +69,26 @@ class WakeState:
         followup: bool = True,
         silence_timeout: float = DEFAULT_SILENCE_TIMEOUT,
         publish: Callable[[bytes], None] | None = None,
+        is_user_speaking: Callable[[], bool] | None = None,
     ) -> None:
         self.enabled = enabled
         self.followup = followup
         self.silence_timeout = silence_timeout
         self._publish = publish
+        # Live probe of whether the user is talking RIGHT NOW (session VAD state).
+        # The silence timer consults it so a long single utterance — which has no
+        # turn boundary to reset the timer — does not sleep the agent mid-speech.
+        self._is_user_speaking = is_user_speaking
         self._active = False
         self._timer: asyncio.TimerHandle | None = None
+
+    def set_user_speaking_source(self, fn: Callable[[], bool]) -> None:
+        """Wire the 'is the user speaking now?' probe after the session exists.
+
+        The AgentSession (whose ``user_state`` is the source) is built after this
+        WakeState, so the probe is injected here rather than at construction.
+        """
+        self._is_user_speaking = fn
 
     # -- queries ---------------------------------------------------------------
     @property
@@ -202,4 +215,11 @@ class WakeState:
 
     def _on_timeout(self) -> None:
         self._timer = None
+        # Never sleep on the user mid-sentence: a long single utterance produces no
+        # turn boundary to reset this timer, so if the user is still speaking when
+        # it fires, defer by re-arming. The countdown then only elapses once real
+        # silence follows the speech, and normal turn boundaries reset it precisely.
+        if self._is_user_speaking is not None and self._is_user_speaking():
+            self._arm_timer()
+            return
         self.sleep(f"silence timeout ({self.silence_timeout:.0f}s)")

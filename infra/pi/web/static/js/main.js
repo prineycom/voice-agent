@@ -20,6 +20,7 @@ import { createVoices } from './voices.js';
 
 const connectBtn = document.getElementById('connectBtn');
 const muteBtn = document.getElementById('muteBtn');
+const wakeBtn = document.getElementById('wakeBtn');
 const connStateEl = document.getElementById('connState');
 const agentStateEl = document.getElementById('agentState');
 const latencyEl = document.getElementById('latency');
@@ -130,7 +131,7 @@ const hooks = {
   attachAudio: (el) => document.body.appendChild(el),
   onMicActive() { micLabelEl.textContent = 'активен'; },
   onMicInactive() { micLabelEl.textContent = 'не активен'; vuBarEl.style.width = '0%'; },
-  setMuteEnabled(enabled) { muteBtn.disabled = !enabled; },
+  setMuteEnabled(enabled) { muteBtn.disabled = !enabled; wakeBtn.disabled = !enabled; },
   resetMuteUI() { muteBtn.textContent = '🔇 Mute'; micLabelEl.textContent = 'не активен'; },
   transcript,
   ops,
@@ -177,6 +178,14 @@ muteBtn.onclick = async () => {
   const muted = await room.toggleMute();
   muteBtn.textContent = muted ? '🎤 Unmute' : '🔇 Mute';
   micLabelEl.textContent = muted ? 'выключен' : 'активен';
+};
+
+// Manual wake button: request the Dormant→Active flip without a spoken wake word.
+// The chime/badge/avatar reaction comes back via the agent's `wake:active` event
+// (ops.js → wake.handle), so there's nothing to do here but fire the request.
+wakeBtn.onclick = async () => {
+  const ok = await room.wake();
+  if (ok) logger.log('запрос активации отправлен');
 };
 
 // Voice selector: lists the switchable CustomVoice presets from the backend and

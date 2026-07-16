@@ -121,6 +121,26 @@ export function createRoomController({ log, onConn, onError }) {
     }
   }
 
+  // Manual wake trigger (UI button): publish a wake request that the agent maps
+  // to the same Dormant→Active flip as a spoken wake word (agent.py data_received
+  // → wake_state.on_wake_detected). reliable=true — it's a tiny one-shot user
+  // intent that must not be dropped (unlike the lossy agent→UI broadcasts, whose
+  // size is the #23 head-of-line concern; a ~30-byte control message is not). The
+  // agent echoes {"type":"wake","state":"active"} back on `voiceagent`, so the
+  // chime/badge/avatar feedback runs through the existing wake-signal path — no
+  // optimistic UI here, the agent stays the single source of truth (ADR-0009).
+  async function wake() {
+    if (!room || !room.localParticipant) return false;
+    try {
+      const data = new TextEncoder().encode(JSON.stringify({ type: 'wake_request' }));
+      await room.localParticipant.publishData(data, { reliable: true, topic: 'voiceagent' });
+      return true;
+    } catch (e) {
+      log('сигнал активации не отправлен: ' + e.message);
+      return false;
+    }
+  }
+
   async function toggleMute() {
     if (!room) return muted;
     muted = !muted;
@@ -134,6 +154,7 @@ export function createRoomController({ log, onConn, onError }) {
     disconnect,
     toggleMute,
     sendText,
+    wake,
     isLocal,
     get room() { return room; },
   };
