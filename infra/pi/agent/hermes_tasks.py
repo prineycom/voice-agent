@@ -8,17 +8,14 @@ consume the streamed tool events → the final result. There is one live
 там?"), the UI feed, and (in later tasks) fast-window racing, milestone
 narration, synthetic-tool-turn reintegration, and bounded proactive delivery.
 
-This module is the SKELETON of that manager (first of a serial chain). It
-implements the state model, admission/queue, the lossy-channel UI feed,
-``list_tasks`` / ``cancel`` / ``shutdown``, and a working :meth:`_run_task` that
-drives an ACP session to completion and stores the result in live state. Two
-hooks mark where later tasks plug in without changing this file's shape:
+The manager implements the state model, admission/queue, the lossy-channel UI
+feed, ``list_tasks`` / ``cancel`` / ``shutdown``, the :meth:`_run_task` ACP
+driver, the fast-window race in :meth:`delegate`, milestone narration
+(:meth:`_maybe_narrate`), and synthetic-tool-turn reintegration
+(:meth:`_reintegrate`). One hook remains for the last task of the chain:
 
-- :meth:`_on_tool_event` — called per streamed tool event (extended by the
-  narration task to speak milestones).
-- :meth:`_on_task_complete` — called once a task settles (extended by the
-  reintegration + bounded-delivery tasks to speak the result and write a
-  synthetic tool turn into ``chat_ctx``).
+- :meth:`_deliver` — called after reintegration; the bounded-delivery task
+  extends it to speak the finished task's report proactively.
 
 The manager is plain (no livekit decorators) so it is fully unit-testable; the
 ``@function_tool`` adapters in worker_tools.py are thin wrappers that fetch the
@@ -33,6 +30,8 @@ import json
 import logging
 from collections import deque
 from dataclasses import dataclass, field
+
+from livekit.agents.llm import FunctionCall, FunctionCallOutput
 
 from acp_client import AcpCancelled
 
@@ -132,6 +131,10 @@ class HermesTask:
     finished_at: float | None = None
     result: str | None = None
     delivered_synchronously: bool = False
+    # True once the result has been written into chat_ctx as a synthetic tool
+    # turn (_reintegrate) — "the LLM can read this from context now"; delivery
+    # (next chain task) asserts this ordering before speaking.
+    reintegrated: bool = False
     # Fast-window handshake (see delegate): ``awaiting_sync`` is True only while a
     # delegate() call is racing this task's ``first_result`` against the fast
     # window; ``completion_pending`` is set by _on_task_complete when the task
@@ -228,8 +231,8 @@ class HermesTaskManager:
         records ``completion_pending`` instead of running its post-completion hooks.
         Both exits below (win or timeout) clear ``awaiting_sync`` and drain any
         deferred completion via ``_maybe_run_completion`` — the single settle point
-        later chain tasks extend for reintegration/delivery (skipped on a
-        synchronous win, since the answer already went back as the tool result).
+        where reintegration/delivery are decided (skipped on a synchronous win,
+        since the answer already went back as the real tool result).
         """
         if self._running_count() >= self.max_concurrent:
             if len(self._queue) >= self.max_queued:
@@ -306,6 +309,10 @@ class HermesTaskManager:
 
         for task in targets:
             await self._cancel_task(task)
+            # Cancellation settles here (never via _on_task_complete), so write
+            # its minimal context record now — a cancelled task with no record
+            # would look un-run to the LLM and invite a silent re-delegation.
+            self._spawn(self._finalize(task))
 
         self._emit({"type": "event", "kind": "cancelled", "count": len(targets)})
         self._promote_queued()
@@ -590,16 +597,100 @@ class HermesTaskManager:
     def _settle_completion(self, task: HermesTask) -> None:
         """Post-completion side-effects, run once the fast-window race is resolved.
 
-        HOOK + single decision point: the reintegration + bounded-delivery tasks
-        extend this to write a synthetic tool turn into ``chat_ctx`` and speak the
-        result — SKIPPED for ``delivered_synchronously`` tasks (the answer already
-        went back as the tool result). For now it promotes the next queued task,
-        prunes memory, refreshes the snapshot, and updates the idle gate.
+        Single decision point: a BACKGROUND result (not ``delivered_synchronously``)
+        is finalized — reintegrated into ``chat_ctx`` immediately and always, then
+        handed to the ``_deliver`` hook. A synchronous win is skipped entirely: the
+        fast window already returned the answer as the REAL tool result, so a
+        synthetic copy would duplicate it. Scheduling bookkeeping (promote / prune /
+        snapshot / idle gate) runs in both cases.
         """
+        if not task.delivered_synchronously and task.state in ("done", "failed"):
+            # async (update_chat_ctx awaits) → spawned; _finalize keeps the
+            # required order: reintegration BEFORE any delivery logic.
+            self._spawn(self._finalize(task))
         self._promote_queued()
         self._prune_finished()
         self._emit_tasks()
         self._update_idle()
+
+    async def _finalize(self, task: HermesTask) -> None:
+        """Reintegrate a background result into context, then hand off to delivery.
+
+        The order is a hard invariant (ADR-0022): the context record must exist
+        before any spoken report, so the LLM reads the authoritative tool result
+        instead of re-delegating.
+        """
+        await self._reintegrate(task)
+        await self._deliver(task)
+
+    async def _reintegrate(self, task: HermesTask) -> None:
+        """Write the result into ``chat_ctx`` as a synthetic ``task_result`` tool turn.
+
+        The ADR-0022 fix for the root-cause 0007 bug: a background answer glued in
+        as a ``role="system"`` note was never treated as *the* answer, so the model
+        re-delegated. Instead we append a paired ``FunctionCall`` +
+        ``FunctionCallOutput`` (same ``call_id``) — an authoritative, tool-linked
+        record. Runs immediately and always on background completion; failures
+        reuse the same shape with ``is_error=True`` (honest report, ADR-0022).
+        Best-effort: a reintegration failure must never crash the manager, but it
+        is logged loudly — it means the result exists only as live task state.
+        """
+        agent = getattr(self._session, "current_agent", None)
+        if agent is None:
+            log.warning(
+                "hermes task %s (%s): no agent attached — result NOT written to "
+                "chat_ctx (kept in live task state only)",
+                task.task_id,
+                task.label,
+            )
+            return
+        call_id = f"hermes_task_{task.task_id}"
+        if task.state == "cancelled":
+            # User-initiated cancel: a minimal context record is still useful (the
+            # LLM should know the task ended without a result and not re-delegate
+            # it silently), marked is_error so it is never read as an answer.
+            output = "задача отменена, результата нет"
+        else:
+            output = task.result or ""
+        try:
+            chat_ctx = agent.chat_ctx.copy()
+            chat_ctx.insert(
+                [
+                    FunctionCall(
+                        call_id=call_id,
+                        name="task_result",
+                        arguments=json.dumps(
+                            {"task_id": task.task_id, "request": task.label},
+                            ensure_ascii=False,
+                        ),
+                    ),
+                    FunctionCallOutput(
+                        call_id=call_id,
+                        name="task_result",
+                        output=output,
+                        is_error=task.state != "done",
+                    ),
+                ]
+            )
+            await agent.update_chat_ctx(chat_ctx)
+        except Exception:  # noqa: BLE001 — must not crash the manager
+            log.exception(
+                "hermes task %s (%s): reintegration failed — result NOT recorded "
+                "in chat_ctx",
+                task.task_id,
+                task.label,
+            )
+            return
+        task.reintegrated = True
+
+    async def _deliver(self, task: HermesTask) -> None:
+        """HOOK (next chain task): speak the finished task's report proactively.
+
+        Bounded delivery per ADR-0022 — wait for a natural pause up to
+        ``delivery_fallback_s``, then a soft barge-in. By the time this runs the
+        result is already reintegrated into ``chat_ctx`` (see :meth:`_finalize`),
+        so a delivery miss can never lose the answer. Stub for now.
+        """
 
     def _maybe_run_completion(self, task: HermesTask) -> None:
         """Drain a completion deferred while this task's fast window was open.
@@ -685,7 +776,8 @@ class HermesTaskManager:
         )
 
     def _spawn(self, coro) -> None:
-        """Run a fire-and-forget UI publish task, tracked so shutdown can cancel it."""
+        """Run a fire-and-forget background task (UI publishes, finalize), tracked
+        so shutdown can cancel and drain it."""
         task = asyncio.create_task(coro)
         self._ui_tasks.add(task)
         task.add_done_callback(self._ui_tasks.discard)

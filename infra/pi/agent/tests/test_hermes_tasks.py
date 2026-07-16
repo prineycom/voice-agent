@@ -810,3 +810,166 @@ async def test_completion_edge_does_not_narrate(monkeypatch, fake_acp_exec):
 
     assert mgr._session.said == []  # finish edges are progress data, not milestones
     assert task.steps == 1
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic tool-turn reintegration (ADR-0022): background results become a
+# paired FunctionCall + FunctionCallOutput ("task_result") in chat_ctx — never
+# a role="system" note (the 0007 re-delegation bug).
+# --------------------------------------------------------------------------- #
+def tool_turn_pair(session):
+    """The (calls, outputs) inserted into the session agent's chat context."""
+    from livekit.agents.llm import FunctionCall, FunctionCallOutput
+
+    items = session.current_agent.chat_ctx.items
+    calls = [i for i in items if isinstance(i, FunctionCall)]
+    outs = [i for i in items if isinstance(i, FunctionCallOutput)]
+    return calls, outs
+
+
+@pytest.mark.asyncio
+async def test_background_result_reintegrated_as_tool_turn(
+    monkeypatch, fake_acp_exec
+):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "ответ из фона"}, delay=0.3
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    directive = await mgr.delegate("долгая задача")
+    task = only_task(mgr)
+    assert task.task_id in directive  # backgrounded
+
+    await mgr.join()
+    assert await wait_for(lambda: task.reintegrated)
+
+    calls, outs = tool_turn_pair(session)
+    assert len(calls) == 1 and len(outs) == 1  # exactly one pair
+    call, out = calls[0], outs[0]
+    assert call.call_id == out.call_id == f"hermes_task_{task.task_id}"
+    assert call.name == "task_result" and out.name == "task_result"
+    assert out.is_error is False
+    assert out.output == task.result  # the stored (trimmed) answer, verbatim
+    args = json.loads(call.arguments)
+    assert args["task_id"] == task.task_id
+    assert "долгая" in args["request"]
+    # The 0007 anti-pattern must be gone: nothing glued in as a system message.
+    assert not any(
+        getattr(i, "role", None) == "system"
+        for i in session.current_agent.chat_ctx.items
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_failure_reintegrated_as_error(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")],
+        error={"code": -32000, "message": "hermes boom"},
+        delay=0.3,
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    await mgr.delegate("сломается в фоне")
+    task = only_task(mgr)
+    await mgr.join()
+    assert task.state == "failed"
+    assert await wait_for(lambda: task.reintegrated)
+
+    calls, outs = tool_turn_pair(session)
+    assert len(calls) == 1 and len(outs) == 1
+    assert outs[0].is_error is True
+    assert "boom" in outs[0].output.lower()  # honest error text, same tool shape
+
+
+@pytest.mark.asyncio
+async def test_synchronous_result_is_not_reintegrated(monkeypatch, fake_acp_exec):
+    """A fast-window win already returned the answer as the REAL tool result —
+    a synthetic copy would duplicate it in context."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(result={"text": "мгновенный ответ"})
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)  # default 8s window
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    answer = await mgr.delegate("быстрый вопрос")
+    task = only_task(mgr)
+    assert "мгновенный" in answer
+    assert task.delivered_synchronously is True
+
+    await mgr.join()
+    await asyncio.sleep(0.05)  # give any (wrong) spawned finalize a chance to run
+
+    assert task.reintegrated is False
+    assert session.current_agent.chat_ctx.items == []  # chat_ctx untouched
+
+
+@pytest.mark.asyncio
+async def test_cancelled_task_reintegrated_minimally(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(updates=[acp_tool_call("t", "busy")], delay=5)
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    await mgr.delegate("долгая задача")  # backgrounds after the tiny window
+    task = only_task(mgr)
+    await mgr.cancel(task.task_id)
+    assert task.state == "cancelled"
+    assert await wait_for(lambda: task.reintegrated)
+
+    calls, outs = tool_turn_pair(session)
+    assert len(calls) == 1 and len(outs) == 1
+    assert outs[0].call_id == f"hermes_task_{task.task_id}"
+    assert outs[0].is_error is True  # never readable as an answer
+    assert "отмен" in outs[0].output.lower()  # minimal "task cancelled" record
+
+
+@pytest.mark.asyncio
+async def test_reintegration_failure_survives_and_logs(
+    monkeypatch, fake_acp_exec, caplog
+):
+    import logging
+
+    from conftest import FakeAcpProc
+
+    class ExplodingAgent(FakeAgent):
+        async def update_chat_ctx(self, chat_ctx, **kwargs):
+            raise RuntimeError("ctx boom")
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "готово"}, delay=0.3
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    session.current_agent = ExplodingAgent()
+    mgr.attach_session(session)
+
+    with caplog.at_level(logging.ERROR, logger="agent"):
+        await mgr.delegate("долгая задача")
+        task = only_task(mgr)
+        await mgr.join()
+        assert await wait_for(
+            lambda: any(
+                "reintegration failed" in r.getMessage() for r in caplog.records
+            )
+        )
+
+    # The manager survives: task state intact, no crash, still serviceable.
+    assert task.state == "done"
+    assert task.reintegrated is False
+    assert mgr.list_tasks()  # still answers status queries
