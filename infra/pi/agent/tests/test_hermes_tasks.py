@@ -558,3 +558,84 @@ async def test_slow_path_runs_completion_hooks_exactly_once(monkeypatch, fake_ac
     assert len({e.get("id") for e in done}) == 1
     assert task.state == "done"
     assert task.completion_pending is False
+
+
+@pytest.mark.asyncio
+async def test_delegate_cancelled_mid_window_cleans_up_and_promotes(
+    monkeypatch, fake_acp_exec
+):
+    """Cancelling delegate() itself mid-window (framework barge-in cancels the
+    in-flight tool call) must clear the handshake state — the task keeps running
+    and, when it settles, its completion hooks fire normally (queued promotes)."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    # sess-1 settles on its own at ~0.3s (past the delegate cancellation below);
+    # sess-2 is the queued task that must still get promoted afterwards.
+    proc.script_prompt(
+        session_id="sess-1", updates=[acp_tool_call("t", "step")],
+        result={"text": "поздний ответ"}, delay=0.3,
+    )
+    proc.script_prompt(session_id="sess-2", result={"text": "promoted"})
+
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, max_concurrent=1, max_queued=5, fast_window_s=5
+    )
+
+    racer = asyncio.create_task(mgr.delegate("долгая"))
+    await asyncio.sleep(0.05)  # window open, task admitted and running
+    first = only_task(mgr)
+    assert first.awaiting_sync is True
+
+    q = await mgr.delegate("вторая")  # slot full → queued immediately
+    assert "очеред" in q.lower()
+
+    racer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await racer
+
+    # The handshake state is cleaned even though neither win nor timeout fired.
+    assert first.awaiting_sync is False
+    assert first.state == "running"  # the underlying task was NOT cancelled
+
+    # When the task settles, _on_task_complete runs the hooks (not a permanent
+    # deferral) → the queued task is promoted and completes.
+    second = [t for t in mgr._tasks.values() if t is not first][0]
+    assert await wait_for(lambda: second.state == "done")
+    assert first.state == "done"
+    assert first.completion_pending is False
+    assert first.delivered_synchronously is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_open_window_returns_cancelled_ack(
+    monkeypatch, fake_acp_exec
+):
+    """cancel() on a task whose fast window is still open → delegate wakes at once
+    with a cancelled ack, NOT the background directive (no result is coming)."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(updates=[acp_tool_call("t", "busy")], delay=5)
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=5)
+
+    racer = asyncio.create_task(mgr.delegate("долгая"))
+    await wait_for(lambda: len(mgr._tasks) == 1)
+    task = only_task(mgr)
+    assert await wait_for(lambda: task.state == "running" and task.awaiting_sync)
+
+    msg = await mgr.cancel()
+    assert "отмен" in msg.lower()
+
+    # The racer wakes immediately (first_result released), well before the 5s
+    # window, and answers honestly — no background-result promise.
+    reply = await asyncio.wait_for(racer, timeout=1.0)
+    assert task.state == "cancelled"
+    assert "отмен" in reply.lower()
+    assert task.task_id in reply
+    assert "фон" not in reply.lower()  # not DIRECTIVE_BACKGROUND
+    assert "придёт" not in reply.lower()
+    assert task.delivered_synchronously is False
+    assert task.awaiting_sync is False
+    # No dangling pending future (its resolution was consumed by the racer).
+    assert task.first_result.done()

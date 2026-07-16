@@ -82,6 +82,13 @@ DIRECTIVE_SYNC_FAILED = (
     "Задача не удалась: {error}. Скажи пользователю честно, что не получилось — "
     "не выдумывай успех. Если стоит попробовать снова, спроси его."
 )
+# Returned when the task was cancelled while its own fast window was still open
+# (e.g. the user asked to stop it mid-race): no result is coming, so promising a
+# later automatic delivery would be a lie.
+DIRECTIVE_SYNC_CANCELLED = (
+    "Задачу (id: {task_id}) отменили — результата не будет. Подтверди пользователю "
+    "отмену и продолжай разговор."
+)
 
 
 @dataclass
@@ -216,25 +223,38 @@ class HermesTaskManager:
 
         task.awaiting_sync = True
         try:
-            # SHIELD is required: a fast-window timeout must not cancel the
-            # underlying future/task — the task keeps running in the background.
-            text = await asyncio.wait_for(
-                asyncio.shield(task.first_result), self.fast_window_s
-            )
-        except asyncio.TimeoutError:
-            task.awaiting_sync = False
-            # If the task settled right at the window boundary, drain its deferred
-            # completion now; otherwise its own _on_task_complete runs the hooks.
-            self._maybe_run_completion(task)
-            return DIRECTIVE_BACKGROUND.format(task_id=task.task_id)
+            try:
+                # SHIELD is required: a fast-window timeout must not cancel the
+                # underlying future/task — the task keeps running in the background.
+                text = await asyncio.wait_for(
+                    asyncio.shield(task.first_result), self.fast_window_s
+                )
+            except asyncio.TimeoutError:
+                if task.state == "cancelled":
+                    # Cancelled while the window was open: no result is coming, so
+                    # the background promise would be a lie.
+                    return DIRECTIVE_SYNC_CANCELLED.format(task_id=task.task_id)
+                return DIRECTIVE_BACKGROUND.format(task_id=task.task_id)
 
-        # Result landed within the window → deliver synchronously as the tool result.
-        task.delivered_synchronously = True
-        task.awaiting_sync = False
-        self._maybe_run_completion(task)
-        if task.state == "failed":
-            return DIRECTIVE_SYNC_FAILED.format(error=text)
-        return text
+            if task.state == "cancelled":
+                # _cancel_task released first_result to wake this racer early;
+                # that empty resolution is a wake-up, not an answer.
+                return DIRECTIVE_SYNC_CANCELLED.format(task_id=task.task_id)
+
+            # Result landed within the window → deliver it as the tool result.
+            task.delivered_synchronously = True
+            if task.state == "failed":
+                return DIRECTIVE_SYNC_FAILED.format(error=text)
+            return text
+        finally:
+            # ALWAYS close the window — win, timeout, delegate() itself being
+            # cancelled (the framework cancels in-flight tool calls on barge-in),
+            # or any other exception. Otherwise ``awaiting_sync`` stays True
+            # forever and _on_task_complete defers into ``completion_pending``
+            # that nothing ever drains (queued tasks would starve). A pending
+            # CancelledError re-raises after this cleanup.
+            task.awaiting_sync = False
+            self._maybe_run_completion(task)
 
     async def cancel(self, hint: str = "") -> str:
         """Cancel active Hermes tasks (running + queued); return a directive.
@@ -301,6 +321,7 @@ class HermesTaskManager:
             if task.state == "running":
                 task.state = "cancelled"
                 task.finished_at = self._now()
+            self._release_first_result(task)
 
         with contextlib.suppress(Exception):
             await self._acp.aclose()
@@ -418,6 +439,14 @@ class HermesTaskManager:
             session_id = await self._acp.new_session()
             task.session_id = session_id
             handle = await self._acp.prompt(session_id, task.request)
+            # If this runner is torn down mid-stream (cancel/shutdown), the
+            # handle's result future can settle with AcpCancelled after we have
+            # stopped awaiting it; consume the exception so asyncio never logs
+            # "Future exception was never retrieved". Awaiting it below still
+            # works — retrieval is idempotent.
+            handle.result.add_done_callback(
+                lambda f: None if f.cancelled() else f.exception()
+            )
             async for ev in handle.events:
                 self._on_tool_event(task, ev)
             answer = await handle.result
@@ -527,6 +556,20 @@ class HermesTaskManager:
         if task.state == "running":
             task.state = "cancelled"
             task.finished_at = self._now()
+        self._release_first_result(task)
+
+    @staticmethod
+    def _release_first_result(task: HermesTask) -> None:
+        """Wake any fast-window racer on a task that will never produce a result.
+
+        Cancellation/shutdown leaves ``first_result`` pending; a delegate() still
+        racing it would sit out the full window and then promise a background
+        result that never comes. Resolve it with an empty string — the racer reads
+        ``task.state`` ("cancelled") and answers with the cancelled ack instead of
+        treating the empty wake-up as an answer. No-op once resolved.
+        """
+        if task.first_result is not None and not task.first_result.done():
+            task.first_result.set_result("")
 
     def _update_idle(self) -> None:
         """Set the idle event iff nothing is running or queued."""
