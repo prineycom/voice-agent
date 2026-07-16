@@ -14,6 +14,13 @@ driver, the fast-window race in :meth:`delegate`, milestone narration
 (:meth:`_maybe_narrate`), synthetic-tool-turn reintegration
 (:meth:`_reintegrate`), and bounded proactive delivery (:meth:`_deliver`).
 
+Failure doctrine (ADR-0022): EVERY failure mode — ACP error, process crash,
+the hard ``task_timeout_s`` cap — settles the task ``failed`` with an honest
+result (error + last streamed step) and flows through the same reintegration
+(``is_error=True``) + delivery path as success. NO AUTO-RETRY, ever: a failed
+task is reported and left settled; retrying is the user's call. Hermes being
+down is never a crash — the agent keeps talking.
+
 The manager is plain (no livekit decorators) so it is fully unit-testable; the
 ``@function_tool`` adapters in worker_tools.py are thin wrappers that fetch the
 manager from ``context.session.userdata`` and call into it.
@@ -537,24 +544,62 @@ class HermesTaskManager:
             handle.result.add_done_callback(
                 lambda f: None if f.cancelled() else f.exception()
             )
-            async for ev in handle.events:
-                self._on_tool_event(task, ev)
-            answer = await handle.result
+            # Hard per-task cap (ADR-0022, 300s default): ONE deadline bounds the
+            # whole prompt consumption — the event stream AND the final result.
+            answer = await asyncio.wait_for(
+                self._consume_prompt(task, handle), self.task_timeout_s
+            )
             task.result = self._trim(answer)
             task.state = "done"
         except AcpCancelled:
             return  # cancellation is settled by _cancel_task
         except asyncio.CancelledError:
             raise  # cancellation is settled by _cancel_task
+        except asyncio.TimeoutError:
+            # Must precede `except Exception` (TimeoutError is an Exception).
+            # Don't leak the ACP-side work: best-effort cancel of the prompt.
+            if task.session_id is not None:
+                with contextlib.suppress(Exception):
+                    await self._acp.cancel_prompt(task.session_id)
+            task.result = self._trim(
+                f"превышен лимит времени ({int(self.task_timeout_s)} с); "
+                f"последний шаг: {task.last_tool or '—'}"
+            )
+            task.state = "failed"
+            log.warning(
+                "hermes task %s (%s) timed out after %.0fs (last step: %s)",
+                task.task_id,
+                task.label,
+                self.task_timeout_s,
+                task.last_tool,
+            )
         except Exception as exc:  # noqa: BLE001 — surface any failure honestly
-            task.result = self._trim(str(exc))
+            detail = str(exc) or exc.__class__.__name__
+            if task.last_tool:
+                # The last streamed step gives the LLM/user something concrete
+                # ("failed while doing X"), per ADR-0022 failure reporting.
+                detail += f"; последний шаг: {task.last_tool}"
+            task.result = self._trim(detail)
             task.state = "failed"
             log.warning("hermes task %s (%s) failed: %r", task.task_id, task.label, exc)
 
+        # Every failure mode above (ACP error, crash, timeout) converges here —
+        # the same completion path as success: release the fast-window future,
+        # then reintegrate (is_error) + deliver via _on_task_complete.
         task.finished_at = self._now()
         if task.first_result is not None and not task.first_result.done():
             task.first_result.set_result(task.result or "")
         self._on_task_complete(task)
+
+    async def _consume_prompt(self, task: HermesTask, handle) -> str:
+        """Consume one prompt end-to-end: stream tool events, return the answer.
+
+        Split out so a single ``wait_for`` deadline (``task_timeout_s``) bounds
+        BOTH awaits — the event iterator and the final result future.
+        """
+        async for ev in handle.events:
+            self._on_tool_event(task, ev)
+        return await handle.result
 
     def _on_tool_event(self, task: HermesTask, ev) -> None:
         """Update live per-task state from one streamed ACP tool event.

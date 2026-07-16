@@ -1222,3 +1222,145 @@ async def test_delivery_failure_survives_and_logs(monkeypatch, fake_acp_exec, ca
     assert task.state == "done"
     calls, outs = tool_turn_pair(session)
     assert len(calls) == 1 and len(outs) == 1  # answer safe in chat_ctx
+
+
+# --------------------------------------------------------------------------- #
+# Failure / timeout honest reporting (ADR-0022): the hard task_timeout_s cap,
+# process crashes, and Hermes-down all settle `failed` with error + last step,
+# flow through the same reintegration + delivery shape, and NEVER auto-retry.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_task_timeout_fails_honestly_with_last_step(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    # One tool event lands immediately (sets last_tool), then the scripted peer
+    # sleeps 5s before answering — far past the 0.2s cap: never completes in time.
+    proc.script_prompt(updates=[acp_tool_call("t", "terminal: sleep 99")], delay=5)
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, fast_window_s=0.05, task_timeout_s=0.2
+    )
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    await mgr.delegate("зависшая задача")
+    task = only_task(mgr)
+
+    # The cap fires at ~0.2s — well inside this 0.5s bound.
+    assert await wait_for(lambda: task.state == "failed", timeout=0.5)
+    assert "превышен лимит времени" in task.result
+    assert "последний шаг: terminal: sleep 99" in task.result
+
+    # The ACP-side work is cancelled, not leaked.
+    assert await wait_for(
+        lambda: any(m.get("method") == "session/cancel" for m in proc.requests)
+    )
+    # Honest-reporting shape: is_error tool turn + spoken delivery, like any failure.
+    assert await wait_for(lambda: task.reintegrated and task.delivered)
+    calls, outs = tool_turn_pair(session)
+    assert len(calls) == 1 and len(outs) == 1
+    assert outs[0].is_error is True
+    assert "превышен лимит времени" in outs[0].output
+    assert session.replies  # delivery attempted
+    assert "не удалась" in session.replies[0].lower()
+
+    await mgr.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_acp_crash_mid_task_fails_honestly_and_manager_survives(
+    monkeypatch, fake_acp_exec
+):
+    """The hermes acp process dying mid-prompt is an honest failure, and the
+    manager keeps working: the next delegation respawns and succeeds."""
+    from conftest import FakeAcpProc
+
+    proc1 = FakeAcpProc()
+    # Tool event at t≈0 (sets last_tool), crash at ~0.3s — after the 0.25s
+    # window, so this is a BACKGROUND failure (pair + delivery must fire).
+    proc1.script_prompt(
+        updates=[acp_tool_call("t", "terminal: ls")], die=True, delay=0.3
+    )
+    proc2 = FakeAcpProc()
+    proc2.script_prompt(result={"text": "после рестарта всё работает"})
+
+    exec_fn, _created = fake_acp_exec(proc1, proc2)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_fn)
+    mgr = HermesTaskManager(AcpClient(), fast_window_s=0.25)
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    directive = await mgr.delegate("умрёт в процессе")
+    t1 = only_task(mgr)
+    assert t1.task_id in directive  # backgrounded before the crash
+
+    assert await wait_for(lambda: t1.state == "failed")
+    assert t1.result  # honest error text, not empty
+    assert "последний шаг: terminal: ls" in t1.result
+    assert await wait_for(lambda: t1.reintegrated and t1.delivered)
+    calls, outs = tool_turn_pair(session)
+    assert outs and outs[0].is_error is True
+
+    # Manager alive: a new delegation respawns hermes and answers in-window.
+    answer = await mgr.delegate("а теперь?")
+    assert "после рестарта" in answer
+
+    await mgr.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_hermes_down_at_delegate_fails_synchronously(
+    monkeypatch, fake_acp_exec
+):
+    """Hermes unspawnable/dead at delegate time → the failure surfaces INSIDE the
+    fast window as the honest sync-failure directive — never a hang, never a
+    background promise for a task that failed instantly."""
+    from acp_client import AcpError
+    from conftest import FakeAcpProc
+
+    mgr = make_manager(monkeypatch, FakeAcpProc(), fake_acp_exec)  # default 8s window
+
+    async def dead_hermes(*args, **kwargs):
+        raise AcpError("hermes недоступен: spawn failed")
+
+    monkeypatch.setattr(mgr._acp, "new_session", dead_hermes)
+
+    # Bounded await: a hang here would trip the 2s timeout, failing the test.
+    reply = await asyncio.wait_for(mgr.delegate("проверь почту"), timeout=2.0)
+    task = only_task(mgr)
+
+    assert task.state == "failed"
+    assert task.delivered_synchronously is True
+    assert "не удалась" in reply.lower()  # DIRECTIVE_SYNC_FAILED shape
+    assert "hermes недоступен" in reply
+    assert "фоне" not in reply.lower()  # no background promise
+    assert "id:" not in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_failed_task_is_never_retried(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")],
+        error={"code": -32000, "message": "hermes boom"},
+        delay=0.2,
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    await mgr.delegate("сломается в фоне")
+    task = only_task(mgr)
+    await mgr.join()
+    assert task.state == "failed"
+    assert await wait_for(lambda: task.reintegrated)
+    await asyncio.sleep(0.2)  # give any (wrong) auto-retry a chance to fire
+
+    # Exactly one task, exactly one session and one prompt — nothing re-ran it.
+    assert len(mgr._tasks) == 1
+    news = [m for m in proc.requests if m.get("method") == "session/new"]
+    prompts = [m for m in proc.requests if m.get("method") == "session/prompt"]
+    assert len(news) == 1
+    assert len(prompts) == 1
