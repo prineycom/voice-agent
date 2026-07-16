@@ -10,12 +10,12 @@ worker_tools:
     # - git      # add later if needed
     # - docker   # add later
 
-  # ACP hybrid Hermes delegation (delegate_to_hermes). Hermes runs as a long-lived
+  # ACP hybrid Hermes delegation (the `delegate` tool). Hermes runs as a long-lived
   # `hermes acp` process; delegation returns synchronously if it finishes within
   # the fast window, else it backgrounds and the result is delivered proactively
   # (soft barge-in on a conversation pause) when ready. See
   # docs/adr/0022-hermes-acp-hybrid-delegation.md.
-  fast_window_s: 8            # delegate_to_hermes blocks up to this long before backgrounding
+  fast_window_s: 8            # delegate blocks up to this long before backgrounding
   max_concurrent: 3           # max concurrent ACP sessions (fast + background combined)
   max_queued: 5                # FIFO overflow queue cap (beyond it: refuse + ask user to wait)
   task_timeout_s: 300          # hard ceiling per delegated task; over it → cancel + report failure
