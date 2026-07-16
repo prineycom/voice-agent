@@ -12,7 +12,8 @@ import json
 
 import pytest
 
-from acp_client import AcpConnection, AcpError
+from acp_client import AcpClient, AcpConnection, AcpError
+from conftest import FakeAcpProc
 
 
 class FakeWriter:
@@ -201,3 +202,135 @@ async def test_garbage_line_does_not_kill_reader_loop():
     assert result == {"ok": 1}
 
     await conn.aclose()
+
+
+# ---------------------------------------------------------------------------
+# AcpClient supervisor: spawn + initialize + crash detection + respawn.
+#
+# These drive the REAL supervisor against the scripted FakeAcpProc peer from
+# conftest, monkeypatching `asyncio.create_subprocess_exec` so no real `hermes`
+# process is spawned. See docs/adr/0022-hermes-acp-hybrid-delegation.md.
+# ---------------------------------------------------------------------------
+
+
+class _HangingInitProc(FakeAcpProc):
+    """A FakeAcpProc that NEVER answers ``initialize`` — models a cold-start hang.
+
+    Everything else behaves like the base fake; only ``initialize`` is swallowed so
+    the client's handshake ``wait_for`` must time out.
+    """
+
+    async def _handle(self, msg: dict) -> None:
+        if msg.get("method") == "initialize":
+            return  # never respond — the client's initialize wait_for must fire
+        await super()._handle(msg)
+
+
+async def _wait_until(predicate, timeout: float = 1.0) -> None:
+    """Poll ``predicate`` until it is truthy or ``timeout`` elapses."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    assert predicate(), "condition not met within timeout"
+
+
+@pytest.mark.asyncio
+async def test_start_sends_initialize_and_is_available(fake_acp_exec, monkeypatch):
+    proc = FakeAcpProc()
+    exec_fn, created = fake_acp_exec(proc)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_fn)
+
+    client = AcpClient()
+    assert await client.start() is True
+    assert client.available is True
+
+    # Spawned exactly `hermes acp --accept-hooks`, and initialize was the first
+    # request with protocolVersion 1.
+    assert proc.argv == ["hermes", "acp", "--accept-hooks"]
+    assert proc.requests[0]["method"] == "initialize"
+    assert proc.requests[0]["params"] == {"protocolVersion": 1}
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_start_missing_binary_returns_false_without_raising(monkeypatch):
+    async def _raise(*_args, **_kwargs):
+        raise FileNotFoundError("hermes: not found")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _raise)
+
+    client = AcpClient()
+    # Must not raise — Hermes-down is never startup-fatal.
+    assert await client.start() is False
+    assert client.available is False
+
+    await client.aclose()  # idempotent no-op when nothing spawned
+
+
+@pytest.mark.asyncio
+async def test_start_initialize_timeout_returns_false(fake_acp_exec, monkeypatch):
+    proc = _HangingInitProc()
+    exec_fn, _created = fake_acp_exec(proc)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_fn)
+
+    # Tiny timeout: initialize is never answered, so the handshake must give up.
+    client = AcpClient(init_timeout_s=0.05)
+    assert await client.start() is False
+    assert client.available is False
+    # The dead process was torn down.
+    assert proc.returncode is not None
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_crash_flips_available_fails_pending_then_ensure_respawns(
+    fake_acp_exec, monkeypatch
+):
+    proc1 = FakeAcpProc(pid=111)
+    proc2 = FakeAcpProc(pid=222)
+    exec_fn, created = fake_acp_exec(proc1, proc2)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_fn)
+
+    client = AcpClient()
+    assert await client.start() is True
+
+    # An in-flight request over the live connection...
+    conn = await client._ensure()
+    assert conn is client._conn
+    pending = asyncio.ensure_future(conn.request("session/new", {"cwd": "/x"}))
+    await asyncio.sleep(0)  # let it register before the crash
+
+    # ...must fail honestly when the process dies, and `available` flips False.
+    proc1.kill()
+    with pytest.raises(AcpError):
+        await asyncio.wait_for(pending, 1.0)
+    await _wait_until(lambda: client.available is False)
+
+    # Next _ensure() respawns a fresh process and re-runs initialize.
+    conn2 = await client._ensure()
+    assert client.available is True
+    assert created[-1] is proc2  # the second FakeAcpProc from the factory
+    assert conn2 is not conn
+    assert proc2.requests[0]["method"] == "initialize"
+    assert proc2.requests[0]["params"] == {"protocolVersion": 1}
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_aclose_terminates_the_process(fake_acp_exec, monkeypatch):
+    proc = FakeAcpProc()
+    exec_fn, _created = fake_acp_exec(proc)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_fn)
+
+    client = AcpClient()
+    assert await client.start() is True
+
+    await client.aclose()
+    assert proc.terminated is True
+    assert client.available is False
