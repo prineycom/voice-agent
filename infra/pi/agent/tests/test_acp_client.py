@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from acp_client import AcpClient, AcpConnection, AcpError, AcpToolEvent
+from acp_client import AcpCancelled, AcpClient, AcpConnection, AcpError, AcpToolEvent
 from conftest import (
     FakeAcpProc,
     acp_agent_message,
@@ -570,5 +570,90 @@ async def test_proc_death_mid_prompt_fails_result_and_ends_stream(
     # ...and the result future fails honestly instead of hanging forever.
     with pytest.raises(AcpError):
         await asyncio.wait_for(handle.result, 1.0)
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_prompt_fails_result_with_cancelled_and_ends_stream(
+    fake_acp_exec, monkeypatch
+):
+    proc = FakeAcpProc()
+    client, _ = await _started_client(fake_acp_exec, monkeypatch, proc)
+
+    sid = await client.new_session()
+    # Slow script: the delay after each update keeps the prompt in flight long
+    # enough to cancel it mid-stream.
+    proc.script_prompt(
+        session_id=sid,
+        updates=[
+            acp_tool_call("tc-1", "terminal: slow"),
+            acp_tool_call_update("tc-1"),
+        ],
+        result={"stopReason": "end_turn"},
+        delay=0.5,
+    )
+
+    handle = await client.prompt(sid, "long task")
+
+    # Wait for the first tool event so the cancel lands mid-prompt, not before it.
+    first = await asyncio.wait_for(handle.events.__anext__(), 1.0)
+    assert first.tool_call_id == "tc-1"
+
+    await client.cancel_prompt(sid)
+
+    # The result future fails with the dedicated cancellation error...
+    with pytest.raises(AcpCancelled):
+        await asyncio.wait_for(handle.result, 1.0)
+    # ...and the events stream terminates instead of hanging its consumer.
+    rest = await asyncio.wait_for(_collect(handle), 1.0)
+    assert all(isinstance(e, AcpToolEvent) for e in rest)
+
+    # The best-effort session/cancel notification went out on the wire.
+    cancels = [r for r in proc.requests if r["method"] == "session/cancel"]
+    assert cancels and cancels[0]["params"]["sessionId"] == sid
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reprompt_same_session_in_flight_raises_and_original_completes(
+    fake_acp_exec, monkeypatch
+):
+    proc = FakeAcpProc()
+    client, _ = await _started_client(fake_acp_exec, monkeypatch, proc)
+
+    sid = await client.new_session()
+    proc.script_prompt(
+        session_id=sid,
+        updates=[
+            acp_tool_call("tc-1", "terminal: slow"),
+            acp_tool_call_update("tc-1"),
+            acp_agent_message("original answer"),
+        ],
+        result={"stopReason": "end_turn"},
+        delay=0.05,
+    )
+
+    handle = await client.prompt(sid, "task one")
+
+    # A second prompt on the SAME session while the first is in flight is
+    # rejected loudly — updates route by sessionId alone, so allowing it would
+    # cross-contaminate the new handle's stream with the old RPC's updates.
+    with pytest.raises(AcpError, match="already in flight"):
+        await client.prompt(sid, "task two")
+
+    # The original prompt is unaffected: its events and result complete normally.
+    events = await asyncio.wait_for(_collect(handle), 2.0)
+    assert [e.tool_call_id for e in events] == ["tc-1", "tc-1"]
+    assert await asyncio.wait_for(handle.result, 1.0) == "original answer"
+
+    # Only ONE session/prompt ever reached the wire (the rejected one sent nothing).
+    assert len(_requests(proc, "session/prompt")) == 1
+
+    # After completion the session is free again: a new prompt is accepted.
+    proc.script_prompt(session_id=sid, result={"stopReason": "end_turn", "answer": "ok"})
+    handle2 = await client.prompt(sid, "task three")
+    assert await asyncio.wait_for(handle2.result, 1.0) == "ok"
 
     await client.aclose()

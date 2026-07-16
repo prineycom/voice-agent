@@ -519,16 +519,31 @@ class AcpClient:
         task. Tool events stream on ``handle.events``; the final answer resolves
         ``handle.result`` (or fails it on crash/cancel). Routing is per-``sessionId``
         so concurrent prompts never cross-contaminate.
+
+        One prompt per session at a time: a second :meth:`prompt` on a session whose
+        prior prompt is still in flight raises :class:`AcpError`. Updates are routed
+        by ``sessionId`` alone, so two in-flight prompts on one session would
+        cross-contaminate the new handle's stream with the old RPC's late updates.
+        The task manager opens one session per task (ADR-0022), so this never fires
+        in normal use — start a new session (or :meth:`cancel_prompt` first) instead.
         """
-        conn = await self._ensure()
+        if session_id in self._prompt_sessions:
+            raise AcpError(f"prompt already in flight for session {session_id}")
+        # Register BEFORE any await: the in-flight check above must be atomic with
+        # the registration (no yield between them, or two racing prompt() calls on
+        # one session could both pass), and an early update must be routed, not
+        # dropped, once the RPC fires.
         session = _PromptSession()
-        # Register BEFORE the RPC so an early update is routed, not dropped. A stale
-        # entry for the same id (shouldn't happen — one prompt per session) is
-        # terminated first so its consumer can't hang.
-        stale = self._prompt_sessions.get(session_id)
-        if stale is not None:
-            stale.close()
         self._prompt_sessions[session_id] = session
+        try:
+            conn = await self._ensure()
+        except BaseException:
+            # Hermes could not be brought up: undo the registration so the session
+            # is not permanently blocked, and settle the (unreturned) stream.
+            session.close()
+            if self._prompt_sessions.get(session_id) is session:
+                self._prompt_sessions.pop(session_id, None)
+            raise
         result: "asyncio.Future[str]" = asyncio.get_event_loop().create_future()
         session.task = asyncio.ensure_future(
             self._run_prompt(conn, session_id, text, session, result)
