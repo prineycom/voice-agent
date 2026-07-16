@@ -185,19 +185,9 @@ async def run_command(args: str) -> str:
         log.warning("run_command %r exited %s; stderr: %s", command, proc.returncode, tail)
         return f"run_command: '{command}' exited {proc.returncode}: {tail}"
 
-    # Hermes emits the `session_id:` line on STDERR in -Q mode (not stdout).
-    # The LLM needs it to resume the same Hermes session via --resume, so fold
-    # any `session_id:` line from stderr into the returned output. Other stderr
-    # noise (spinner remnants, warnings) is ignored.
-    sid_lines = [ln for ln in stderr.splitlines() if ln.strip().startswith("session_id:")]
-    if not stdout and not sid_lines:
+    if not stdout:
         return "(no output)"
-    parts = []
-    if sid_lines:
-        parts.append(sid_lines[-1].strip())
-    if stdout:
-        parts.append(stdout)
-    return "\n".join(parts)
+    return stdout
 
 
 # --------------------------------------------------------------------------- #

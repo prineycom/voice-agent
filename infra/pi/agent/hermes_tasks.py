@@ -225,6 +225,11 @@ class HermesTaskManager:
         self._session = None  # bound AgentSession (proactive delivery, later tasks)
         self._publish = None  # async (data: bytes) -> None, or None
         self._event_seq = 0  # monotonic id for feed events (client dedups repeats)
+        # Signature of the last-published task snapshot (running task_ids + their
+        # last_tool, plus queued task_ids). A tool-heavy task streams ~90 ACP
+        # events, each calling _emit_tasks; most don't change what the UI renders,
+        # so we skip republishing (and its two lossy re-sends) when unchanged.
+        self._last_tasks_sig: tuple | None = None
         self._ui_tasks: set[asyncio.Task] = set()  # in-flight UI (re)publish tasks
         # In-flight _finalize (reintegrate → deliver) tasks, tracked SEPARATELY
         # from UI publishes: shutdown cancels UI tasks outright but must NOT
@@ -756,30 +761,43 @@ class HermesTaskManager:
             output = "задача отменена, результата нет"
         else:
             output = task.result or ""
+        # Build the synthetic tool turn OUTSIDE the lock so the serialized
+        # critical section below is as tight as possible (one fresh read + one
+        # replace, no other work between them).
+        turn = [
+            FunctionCall(
+                call_id=call_id,
+                name="task_result",
+                arguments=json.dumps(
+                    {"task_id": task.task_id, "request": task.label},
+                    ensure_ascii=False,
+                ),
+            ),
+            FunctionCallOutput(
+                call_id=call_id,
+                name="task_result",
+                output=output,
+                is_error=task.state != "done",
+            ),
+        ]
         try:
-            # The whole read-modify-write is serialized: update_chat_ctx REPLACES
-            # the context, so the fresh copy() MUST be taken inside the lock or a
-            # concurrent finalizer's stale copy would overwrite this pair.
+            # The read-modify-write is serialized against other finalizers:
+            # update_chat_ctx REPLACES the context (no merge), so the copy() MUST
+            # be taken inside the lock or a concurrent finalizer's stale copy would
+            # overwrite this pair. We read the FRESHEST agent.chat_ctx here, right
+            # before the replace, to keep the copy→update gap to that single await.
+            #
+            # Residual race (needs live-Pi confirmation of livekit-agents
+            # semantics): this lock serializes finalizers against each OTHER, not
+            # against the framework's own chat_ctx writes. A user/assistant item
+            # committed by the framework during the update_chat_ctx await could
+            # still be clobbered by this stale-plus-turn copy. Shrinking the window
+            # is the conservative mitigation; the real fix is an in-place
+            # insert/append that persists without a full replace — switch to it
+            # once a livekit-agents version is confirmed to expose one.
             async with self._chat_ctx_lock:
                 chat_ctx = agent.chat_ctx.copy()
-                chat_ctx.insert(
-                    [
-                        FunctionCall(
-                            call_id=call_id,
-                            name="task_result",
-                            arguments=json.dumps(
-                                {"task_id": task.task_id, "request": task.label},
-                                ensure_ascii=False,
-                            ),
-                        ),
-                        FunctionCallOutput(
-                            call_id=call_id,
-                            name="task_result",
-                            output=output,
-                            is_error=task.state != "done",
-                        ),
-                    ]
-                )
+                chat_ctx.insert(turn)
                 await agent.update_chat_ctx(chat_ctx)
         except Exception:  # noqa: BLE001 — must not crash the manager
             log.exception(
@@ -816,6 +834,15 @@ class HermesTaskManager:
                 task.task_id,
                 task.label,
             )
+            return
+        if self._closing:
+            # Shutdown in progress: the room is gone, so a spoken report is
+            # pointless — and _wait_for_pause would otherwise block up to
+            # delivery_fallback_s (~15s) waiting for an idle that never comes,
+            # tripping shutdown's short finalizer-drain timeout and logging a
+            # misleading "context record(s) may be lost" warning. Reintegration
+            # already ran (the answer is safe in chat_ctx); skip the now-useless
+            # report so the finalizer completes fast.
             return
 
         # Serialize deliveries so two near-simultaneous reports don't fight over
@@ -1011,13 +1038,39 @@ class HermesTaskManager:
             except Exception as e:
                 log.debug("UI publish dropped (%d bytes): %r", len(data), e)
 
+    def _tasks_signature(self) -> tuple:
+        """Identity of the currently *renderable* snapshot: which tasks are
+        running (and their ``last_tool``, the only per-event field the UI shows)
+        plus which are queued. Deliberately excludes ``elapsed`` (it ticks every
+        call) and ``steps`` (not published) so a stream of same-state tool events
+        collapses to a single publish. Any real change — a new tool, a task
+        settling, a promotion — shifts this tuple and re-emits immediately."""
+        running = tuple(
+            (t.task_id, t.last_tool)
+            for t in self._tasks.values()
+            if t.state == "running"
+        )
+        queued = tuple(
+            t.task_id for t in self._tasks.values() if t.state == "queued"
+        )
+        return (running, queued)
+
     def _emit_tasks(self) -> None:
         """Publish the running + queued task snapshot now, then re-publish a couple
         of *fresh* snapshots after a short delay. The snapshot is idempotent and
         re-read each time, so a dropped lossy snapshot self-heals and a late
-        re-send can never resurrect an already-finished task."""
+        re-send can never resurrect an already-finished task.
+
+        Coalesced: identical back-to-back snapshots are suppressed (see
+        _tasks_signature) so a tool-heavy task doesn't flood the lossy Pi/Tailscale
+        path with hundreds of redundant datagrams. The lossy-datagram redundancy
+        (immediate + two delayed re-sends) is preserved for every *real* change."""
         if self._publish is None:
             return
+        sig = self._tasks_signature()
+        if sig == self._last_tasks_sig:
+            return  # unchanged since the last publish — suppress the duplicate emit
+        self._last_tasks_sig = sig
         self._publish_tasks_once()
         self._spawn(self._resend_tasks())
 
