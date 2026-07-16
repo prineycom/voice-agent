@@ -48,3 +48,4 @@ Desktop (RTX 4070)
 - Frontend is vanilla JS as ES modules, no build step (no React/Vue overhead for Pi 5); served as static files by the stdlib http.server
 - Sound goes through LiveKit WebRTC in browser, not system speakers
 - Kiosk and web access share the same responsive frontend (kiosk-specific concerns are Epic 6)
+- Hermes delegation runs over a long-lived `hermes acp` streaming process (ACP, ndjson JSON-RPC over stdio) with a hybrid 8s fast window — `delegate` returns synchronously when fast, otherwise backgrounds and the result re-enters chat_ctx as a synthetic `task_result` tool turn; `run_command` is literal-shell-only — see ADR 0022
