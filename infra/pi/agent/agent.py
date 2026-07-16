@@ -55,6 +55,7 @@ from livekit.agents import metrics as agent_metrics
 from livekit.agents.voice.events import MetricsCollectedEvent
 from livekit.plugins import openai, silero
 
+from acp_client import AcpClient
 from config import _env_bool, load_config
 from health import (
     STTHealthError,
@@ -62,7 +63,7 @@ from health import (
     check_stt_health,
     check_tts_health,
 )
-from hermes_tasks import UI_TOPIC
+from hermes_tasks import UI_TOPIC, HermesTaskManager
 from motion_events import DEFAULT_EMOTION, EmotionTagStripper, motion_event_json
 from stt_plugin import DesktopSTT
 from tts_plugin import DesktopTTS
@@ -228,6 +229,32 @@ def _load_soul(path: Path) -> str:
     return _load_text_file(path, what="SOUL", required=True) or ""
 
 
+async def _start_hermes() -> HermesTaskManager:
+    """Spawn the long-lived ``hermes acp`` ACP client eagerly and wire the manager.
+
+    Eager spawn (ADR-0022): the cold ``initialize`` handshake is ~8.5s, so it runs
+    once here at worker startup rather than being paid on the first delegation. This
+    is NEVER a startup gate (unlike STT/TTS): ``AcpClient.start()`` is documented to
+    never raise and returns False on any failure (missing binary, initialize
+    timeout, immediate crash). A False result just means delegation degrades
+    gracefully — the client respawns lazily on first use (``_ensure``). The manager
+    owns the client and ``aclose``s it on shutdown, so the caller only needs to
+    register ``manager.shutdown`` as a shutdown callback.
+    """
+    acp_client = AcpClient()
+    try:
+        hermes_ok = await acp_client.start()
+    except Exception:  # noqa: BLE001 — start() never raises, but Hermes must NEVER block startup
+        hermes_ok = False
+        log.exception("hermes acp startup failed unexpectedly")
+    if not hermes_ok:
+        log.warning(
+            "hermes acp unavailable at startup — delegation degrades gracefully "
+            "(lazy respawn on first use)"
+        )
+    return make_hermes_manager(acp_client)
+
+
 async def entrypoint(ctx: JobContext) -> None:
     """Health-gate, join the room, and run the STT → LLM → TTS pipeline."""
     cfg = load_config()
@@ -258,10 +285,14 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await ctx.connect()  # type: ignore[call-arg]
 
-    # Background Hermes delegation manager (async tool calls). Stored in the
-    # session userdata so the function_tool adapters reach it; cancelled on
-    # shutdown so a user disconnect never leaves orphan Hermes subprocesses.
-    hermes_manager = make_hermes_manager()
+    # Background Hermes delegation manager (async tool calls). The long-lived
+    # `hermes acp` ACP client is spawned + initialized EAGERLY here (~8.5s cold,
+    # ADR-0022) so the first delegation doesn't pay that cost; it is never a startup
+    # gate (unlike STT/TTS) — an unavailable Hermes just degrades delegation. Stored
+    # in the session userdata so the function_tool adapters reach it; its shutdown
+    # (which acloses the ACP client) is registered so a user disconnect never leaves
+    # an orphan `hermes acp` subprocess.
+    hermes_manager = await _start_hermes()
     ctx.add_shutdown_callback(hermes_manager.shutdown)
     # Stream tool/background-task events to the web UI as LiveKit data messages
     # (topic UI_TOPIC); the frontend renders the live operations panel + tool feed.
