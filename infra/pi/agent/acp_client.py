@@ -28,7 +28,9 @@ import asyncio
 import contextlib
 import json
 import logging
-from typing import Any, Awaitable, Callable, Optional
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 log = logging.getLogger("agent.acp")
 
@@ -67,6 +69,94 @@ class AcpError(Exception):
     def __init__(self, message: str, *, error: Optional[dict] = None) -> None:
         super().__init__(message)
         self.error = error
+
+
+class AcpCancelled(AcpError):
+    """A prompt was cancelled locally (via :meth:`AcpClient.cancel_prompt`).
+
+    Distinct from a transport :class:`AcpError` so a caller can tell an
+    operator-requested cancellation apart from an honest crash/timeout failure.
+    """
+
+
+@dataclass(frozen=True)
+class AcpToolEvent:
+    """One tool-boundary event parsed from a ``session/update`` notification.
+
+    Emitted for ``update.sessionUpdate`` of ``tool_call`` (the START edge) and
+    ``tool_call_update`` (the FINISH edge) — the two edges the manager narrates
+    on (ADR-0022). ``title`` carries the humanisable tool label (e.g.
+    ``"terminal: uname -a"``), ``kind`` the ACP tool category (``execute`` …),
+    ``status`` its lifecycle state (``pending`` / ``completed`` …). ``raw`` is the
+    full ``session/update`` params for callers that need more than these fields.
+    """
+
+    kind_of_update: str
+    tool_call_id: Optional[str]
+    title: Optional[str]
+    kind: Optional[str]
+    status: Optional[str]
+    raw: dict
+
+
+# Queue sentinel: pushed onto a prompt's event queue to terminate its stream.
+_STREAM_END = object()
+
+
+@dataclass
+class _PromptSession:
+    """Per-session routing state for one in-flight ``session/prompt``.
+
+    ``queue`` carries :class:`AcpToolEvent`s (terminated by ``_STREAM_END``);
+    ``text_parts`` accumulates ``agent_message_chunk`` text as the streaming
+    fallback for the final answer (see :meth:`AcpClient._extract_answer`). ``task``
+    is the fire-and-forget RPC task so :meth:`AcpClient.cancel_prompt` can cancel
+    it locally.
+    """
+
+    queue: "asyncio.Queue[Any]" = field(default_factory=asyncio.Queue)
+    text_parts: list[str] = field(default_factory=list)
+    task: Optional[asyncio.Task] = None
+    _closed: bool = False
+
+    def close(self) -> None:
+        """Terminate the event stream exactly once (idempotent)."""
+        if not self._closed:
+            self._closed = True
+            self.queue.put_nowait(_STREAM_END)
+
+
+class AcpPromptHandle:
+    """Handle over one in-flight ``session/prompt``: a tool-event stream + result.
+
+    Two independently awaitable surfaces that compose with ``asyncio.wait_for``:
+
+    - :attr:`events` — an async iterator of :class:`AcpToolEvent`s that terminates
+      when the prompt completes (or crashes/cancels). Consume it to narrate.
+    - :attr:`result` — an :class:`asyncio.Future` resolved with the final answer
+      text on success, or failed with :class:`AcpError` / :class:`AcpCancelled` on
+      crash / cancellation. This is the fast-window racer's target.
+
+    Both are driven off the same per-session routing state, so tool events for one
+    session never leak into another's stream (ADR-0022 concurrent-session
+    interleaving).
+    """
+
+    def __init__(
+        self, session_id: str, session: _PromptSession, result: "asyncio.Future[str]"
+    ) -> None:
+        self.session_id = session_id
+        self._session = session
+        self.result = result
+        self.events: AsyncIterator[AcpToolEvent] = self._event_stream()
+
+    async def _event_stream(self) -> AsyncIterator[AcpToolEvent]:
+        queue = self._session.queue
+        while True:
+            item = await queue.get()
+            if item is _STREAM_END:
+                return
+            yield item
 
 
 class AcpConnection:
@@ -290,12 +380,14 @@ class AcpClient:
       loop, so repeated failures cannot tight-loop: each caller pays exactly one
       spawn+initialize attempt and gets an honest :class:`AcpError` if it fails.
 
-    Per-session methods (``session/new`` / ``session/prompt``) are added on this
-    class in a later task; they obtain a live codec from :meth:`_ensure`, which is
-    the single seam that transparently spans respawns. The ``on_notification`` /
-    ``on_server_request`` hooks are stored and handed to *every* new connection so
-    ``session/update`` narration and permission requests keep routing across a
-    respawn.
+    Per-session methods (:meth:`new_session` / :meth:`prompt` / :meth:`cancel_prompt`)
+    obtain a live codec from :meth:`_ensure`, the single seam that transparently
+    spans respawns. The client interposes its own dispatchers on every new
+    connection: :meth:`prompt` routes ``session/update`` events per ``sessionId``
+    into a streaming :class:`AcpPromptHandle`, and ``session/request_permission`` is
+    auto-answered positively; user-supplied ``on_notification`` /
+    ``on_server_request`` hooks are delegated to (the latter only for non-permission
+    methods) so narration keeps routing across a respawn.
     """
 
     def __init__(
@@ -310,10 +402,15 @@ class AcpClient:
         self._command = tuple(command)
         self._init_timeout_s = init_timeout_s
         self._cwd = cwd
-        # Stored once and re-applied to each spawned connection so dispatch keeps
-        # working across respawns; the next task wires session routing through them.
-        self._on_notification = on_notification
-        self._on_server_request = on_server_request
+        # User-supplied hooks, re-applied to each spawned connection so dispatch
+        # keeps working across respawns. The client interposes its OWN dispatchers
+        # (session routing + permission auto-answer) and delegates to these: every
+        # notification is forwarded; a server→client request goes to the user hook
+        # only for NON-permission methods (permission is always auto-answered).
+        self._user_on_notification = on_notification
+        self._user_on_server_request = on_server_request
+        # Per-session routing for streaming prompts, keyed by ACP sessionId.
+        self._prompt_sessions: dict[str, _PromptSession] = {}
 
         # Lifecycle state, all mutated under `_lock` (mirrors DesktopTTS._ensure_ws
         # / _drop_ws in tts_plugin.py: one lock serialises spawn/drop/respawn).
@@ -395,6 +492,225 @@ class AcpClient:
                     with contextlib.suppress(ProcessLookupError):
                         proc.kill()
 
+    # -- Sessions & streaming prompts --------------------------------------
+
+    async def new_session(
+        self, cwd: Optional[str] = None, mcp_servers: Optional[list] = None
+    ) -> str:
+        """Open a fresh ACP session (one per delegated task) and return its id.
+
+        Sends ``session/new {cwd, mcpServers}`` over a live (respawned-on-demand)
+        connection; ``cwd`` defaults to the client's configured cwd or the process
+        cwd. Raises :class:`AcpError` if Hermes cannot be brought up.
+        """
+        conn = await self._ensure()
+        effective_cwd = cwd if cwd is not None else (self._cwd or str(Path.cwd()))
+        result = await conn.request(
+            "session/new", {"cwd": effective_cwd, "mcpServers": mcp_servers or []}
+        )
+        return result["sessionId"]
+
+    async def prompt(self, session_id: str, text: str) -> AcpPromptHandle:
+        """Start a streaming ``session/prompt`` and return its :class:`AcpPromptHandle`.
+
+        Registers the session's routing state BEFORE firing the RPC (so no
+        ``session/update`` can race ahead of the queue), then fires
+        ``session/prompt {sessionId, prompt:[{type:text,text}]}`` as a background
+        task. Tool events stream on ``handle.events``; the final answer resolves
+        ``handle.result`` (or fails it on crash/cancel). Routing is per-``sessionId``
+        so concurrent prompts never cross-contaminate.
+        """
+        conn = await self._ensure()
+        session = _PromptSession()
+        # Register BEFORE the RPC so an early update is routed, not dropped. A stale
+        # entry for the same id (shouldn't happen — one prompt per session) is
+        # terminated first so its consumer can't hang.
+        stale = self._prompt_sessions.get(session_id)
+        if stale is not None:
+            stale.close()
+        self._prompt_sessions[session_id] = session
+        result: "asyncio.Future[str]" = asyncio.get_event_loop().create_future()
+        session.task = asyncio.ensure_future(
+            self._run_prompt(conn, session_id, text, session, result)
+        )
+        return AcpPromptHandle(session_id, session, result)
+
+    async def cancel_prompt(self, session_id: str) -> None:
+        """Cancel an in-flight prompt: best-effort ``session/cancel`` + local abort.
+
+        ADR-0022 does not mandate a cancel RPC, so this is defensive: it fires a
+        best-effort ``session/cancel`` notification (the standard ACP method) and
+        then cancels the local RPC task, which fails ``handle.result`` with
+        :class:`AcpCancelled` and terminates the event stream. A no-op if the
+        session is unknown.
+        """
+        session = self._prompt_sessions.get(session_id)
+        conn = self._conn
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.notify("session/cancel", {"sessionId": session_id})
+        if session is not None and session.task is not None:
+            session.task.cancel()
+
+    async def _run_prompt(
+        self,
+        conn: AcpConnection,
+        session_id: str,
+        text: str,
+        session: _PromptSession,
+        result: "asyncio.Future[str]",
+    ) -> None:
+        """Drive one ``session/prompt`` RPC and settle its handle.
+
+        On success resolves ``result`` with the final answer; on crash (the pending
+        future fails with :class:`AcpError`) or local cancellation fails it. Always
+        terminates the event stream and drops the session's routing state so no
+        consumer hangs and no state leaks.
+        """
+        try:
+            rpc_result = await conn.request(
+                "session/prompt",
+                {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]},
+            )
+            if not result.done():
+                result.set_result(self._extract_answer(rpc_result, session))
+        except asyncio.CancelledError:
+            if not result.done():
+                result.set_exception(AcpCancelled("prompt cancelled"))
+            raise
+        except AcpError as exc:
+            if not result.done():
+                result.set_exception(exc)
+        except Exception as exc:  # noqa: BLE001 — surface anything as an honest error
+            if not result.done():
+                result.set_exception(AcpError(f"prompt failed: {exc}"))
+        finally:
+            session.close()
+            # Only drop our own entry (a racing re-prompt may have replaced it).
+            if self._prompt_sessions.get(session_id) is session:
+                self._prompt_sessions.pop(session_id, None)
+
+    def _extract_answer(self, rpc_result: Any, session: _PromptSession) -> str:
+        """Resolve the final answer text for a completed prompt.
+
+        Prefer explicit text in the ``session/prompt`` result if present; otherwise
+        fall back to the ``agent_message_chunk`` text accumulated during the stream.
+        ADR-0022 OPEN POINT: the exact result shape for Hermes 0.18.2 is unconfirmed
+        (the PoC only observed a ``stopReason``), so the accumulated-chunk fallback
+        is always maintained and used when the result carries no obvious text.
+        """
+        text = self._explicit_result_text(rpc_result)
+        if text is not None:
+            return text
+        return "".join(session.text_parts)
+
+    @staticmethod
+    def _explicit_result_text(rpc_result: Any) -> Optional[str]:
+        """Best-effort extraction of a text answer from the RPC result object."""
+        if not isinstance(rpc_result, dict):
+            return None
+        for key in ("text", "answer", "response", "content", "message"):
+            val = rpc_result.get(key)
+            if isinstance(val, str) and val:
+                return val
+            if isinstance(val, dict):
+                inner = val.get("text")
+                if isinstance(inner, str) and inner:
+                    return inner
+        return None
+
+    # -- Dispatch (session routing + permission auto-answer) ---------------
+
+    def _dispatch_notification(self, method: str, params: dict) -> Any:
+        """Route ``session/update`` to per-session state, then delegate to the hook."""
+        if method == "session/update" and isinstance(params, dict):
+            self._route_session_update(params)
+        if self._user_on_notification is not None:
+            return self._user_on_notification(method, params)
+        return None
+
+    def _route_session_update(self, params: dict) -> None:
+        """Fan a ``session/update`` to its session: tool events queued, text kept."""
+        session = self._prompt_sessions.get(params.get("sessionId"))
+        if session is None:
+            return  # unknown / already-finished session — drop
+        update = params.get("update")
+        if not isinstance(update, dict):
+            return
+        kind_of_update = update.get("sessionUpdate")
+        if kind_of_update in ("tool_call", "tool_call_update"):
+            session.queue.put_nowait(
+                AcpToolEvent(
+                    kind_of_update=kind_of_update,
+                    tool_call_id=update.get("toolCallId"),
+                    title=update.get("title"),
+                    kind=update.get("kind"),
+                    status=update.get("status"),
+                    raw=params,
+                )
+            )
+        elif kind_of_update == "agent_message_chunk":
+            content = update.get("content")
+            if isinstance(content, dict):
+                chunk = content.get("text")
+                if isinstance(chunk, str) and chunk:
+                    session.text_parts.append(chunk)
+        # Other update kinds are ignored (the final answer arrives via the RPC).
+
+    def _dispatch_server_request(
+        self, conn: AcpConnection, method: str, params: dict, request_id: int
+    ) -> Any:
+        """Auto-answer ``session/request_permission``; else defer to the user hook."""
+        if method == "session/request_permission":
+            return self._auto_answer_permission(conn, params or {}, request_id)
+        if self._user_on_server_request is not None:
+            return self._user_on_server_request(method, params, request_id)
+        log.warning(
+            "ACP: no handler for server→client request %r (id=%s)", method, request_id
+        )
+        return None
+
+    async def _auto_answer_permission(
+        self, conn: AcpConnection, params: dict, request_id: int
+    ) -> None:
+        """Positively answer a permission request; never raise into the reader loop.
+
+        Picks the first ``allow``-kind option (else the first option with an id) and
+        replies ``{"outcome": {"outcome": "selected", "optionId": …}}``; if no
+        options parse, replies with a generic ``selected`` outcome so the prompt is
+        not blocked. With ``--accept-hooks`` these should be rare (ADR-0022 PoC).
+        """
+        try:
+            option_id = self._pick_allow_option(params)
+            if option_id is not None:
+                outcome = {"outcome": "selected", "optionId": option_id}
+            else:
+                outcome = {"outcome": "selected"}
+            await conn.respond(request_id, {"outcome": outcome})
+            log.info(
+                "ACP: auto-approved session/request_permission "
+                "(session=%s, optionId=%s)",
+                params.get("sessionId"),
+                option_id,
+            )
+        except Exception:  # noqa: BLE001 — a permission reply must never crash the loop
+            log.exception("ACP: failed to auto-answer permission request")
+
+    @staticmethod
+    def _pick_allow_option(params: dict) -> Optional[str]:
+        """Choose an ``optionId`` to grant: first ``allow*`` kind, else first with id."""
+        options = params.get("options")
+        if not isinstance(options, list) or not options:
+            return None
+        for opt in options:
+            if isinstance(opt, dict) and str(opt.get("kind", "")).startswith("allow"):
+                if opt.get("optionId") is not None:
+                    return opt["optionId"]
+        for opt in options:
+            if isinstance(opt, dict) and opt.get("optionId") is not None:
+                return opt["optionId"]
+        return None
+
     # -- Lifecycle seam ----------------------------------------------------
 
     async def _ensure(self) -> AcpConnection:
@@ -442,11 +758,14 @@ class AcpClient:
             cwd=self._cwd,
         )
         self._proc = proc
-        conn = AcpConnection(
-            proc.stdout,
-            proc.stdin,
-            on_notification=self._on_notification,
-            on_server_request=self._on_server_request,
+        conn = AcpConnection(proc.stdout, proc.stdin)
+        # Interpose the client's own dispatchers (they close over `conn` so the
+        # permission auto-answer replies on the right connection across respawns).
+        conn.on_notification = self._dispatch_notification
+        conn.on_server_request = (
+            lambda method, params, request_id: self._dispatch_server_request(
+                conn, method, params, request_id
+            )
         )
         self._conn = conn
         self._monitor = asyncio.ensure_future(self._monitor_proc(proc, conn))

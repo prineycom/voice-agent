@@ -12,8 +12,13 @@ import json
 
 import pytest
 
-from acp_client import AcpClient, AcpConnection, AcpError
-from conftest import FakeAcpProc
+from acp_client import AcpClient, AcpConnection, AcpError, AcpToolEvent
+from conftest import (
+    FakeAcpProc,
+    acp_agent_message,
+    acp_tool_call,
+    acp_tool_call_update,
+)
 
 
 class FakeWriter:
@@ -334,3 +339,236 @@ async def test_aclose_terminates_the_process(fake_acp_exec, monkeypatch):
     await client.aclose()
     assert proc.terminated is True
     assert client.available is False
+
+
+# ---------------------------------------------------------------------------
+# AcpClient sessions: new_session / streaming prompt / permission auto-answer.
+#
+# These drive the REAL client (routing + auto-answer) against the scripted
+# FakeAcpProc peer, monkeypatching `create_subprocess_exec`. The prompt handle's
+# `events` stream and `result` future are the surfaces the task manager consumes.
+# ---------------------------------------------------------------------------
+
+
+async def _started_client(fake_acp_exec, monkeypatch, proc, **client_kwargs):
+    """Spawn a started AcpClient wired to ``proc`` (initialize handshake done)."""
+    exec_fn, created = fake_acp_exec(proc)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_fn)
+    client = AcpClient(**client_kwargs)
+    assert await client.start() is True
+    return client, created
+
+
+async def _collect(handle) -> list[AcpToolEvent]:
+    """Drain a prompt handle's tool-event stream to a list (terminates on close)."""
+    return [event async for event in handle.events]
+
+
+def _requests(proc: FakeAcpProc, method: str) -> list[dict]:
+    return [r for r in proc.requests if r["method"] == method]
+
+
+@pytest.mark.asyncio
+async def test_new_session_returns_id_and_sends_cwd_and_mcp(fake_acp_exec, monkeypatch):
+    proc = FakeAcpProc()
+    client, _ = await _started_client(fake_acp_exec, monkeypatch, proc, cwd="/work")
+
+    sid = await client.new_session(mcp_servers=[{"name": "hermes"}])
+    assert sid == "sess-1"
+
+    new_req = _requests(proc, "session/new")[0]
+    assert new_req["params"]["cwd"] == "/work"  # falls back to the client's cwd
+    assert new_req["params"]["mcpServers"] == [{"name": "hermes"}]
+
+    # An explicit cwd overrides the client default.
+    await client.new_session(cwd="/elsewhere")
+    assert _requests(proc, "session/new")[1]["params"]["cwd"] == "/elsewhere"
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_prompt_streams_tool_events_in_order_then_result(fake_acp_exec, monkeypatch):
+    proc = FakeAcpProc()
+    client, _ = await _started_client(fake_acp_exec, monkeypatch, proc)
+
+    sid = await client.new_session()
+    proc.script_prompt(
+        session_id=sid,
+        updates=[
+            acp_tool_call("tc-1", "terminal: uname -a", kind="execute"),
+            acp_agent_message("смотрю систему…"),
+            acp_tool_call_update("tc-1", status="completed"),
+        ],
+        result={"stopReason": "end_turn"},  # no text → chunk fallback
+    )
+
+    handle = await client.prompt(sid, "what os")
+    events = await asyncio.wait_for(_collect(handle), 1.0)
+    answer = await asyncio.wait_for(handle.result, 1.0)
+
+    # Only the two tool edges are yielded, in order; the message chunk is not.
+    assert [e.kind_of_update for e in events] == ["tool_call", "tool_call_update"]
+    assert events[0].tool_call_id == "tc-1"
+    assert events[0].title == "terminal: uname -a"
+    assert events[0].kind == "execute"
+    assert events[0].status == "pending"
+    assert events[1].status == "completed"
+    # Result carried no text → accumulated agent_message_chunk is the answer.
+    assert answer == "смотрю систему…"
+
+    prompt_req = _requests(proc, "session/prompt")[0]
+    assert prompt_req["params"]["sessionId"] == sid
+    assert prompt_req["params"]["prompt"] == [{"type": "text", "text": "what os"}]
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_result_text_is_preferred_over_chunks(fake_acp_exec, monkeypatch):
+    proc = FakeAcpProc()
+    client, _ = await _started_client(fake_acp_exec, monkeypatch, proc)
+
+    sid = await client.new_session()
+    proc.script_prompt(
+        session_id=sid,
+        updates=[acp_agent_message("partial chunk that must be ignored")],
+        result={"stopReason": "end_turn", "answer": "authoritative result"},
+    )
+
+    handle = await client.prompt(sid, "q")
+    answer = await asyncio.wait_for(handle.result, 1.0)
+    assert answer == "authoritative result"
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_message_chunk_fallback_when_result_has_no_text(
+    fake_acp_exec, monkeypatch
+):
+    proc = FakeAcpProc()
+    client, _ = await _started_client(fake_acp_exec, monkeypatch, proc)
+
+    sid = await client.new_session()
+    proc.script_prompt(
+        session_id=sid,
+        updates=[acp_agent_message("Привет, "), acp_agent_message("это ответ.")],
+        result={"stopReason": "end_turn"},  # no text field at all
+    )
+
+    handle = await client.prompt(sid, "q")
+    answer = await asyncio.wait_for(handle.result, 1.0)
+    assert answer == "Привет, это ответ."
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_prompts_do_not_cross_contaminate(fake_acp_exec, monkeypatch):
+    proc = FakeAcpProc()
+    client, _ = await _started_client(fake_acp_exec, monkeypatch, proc)
+
+    sid_a = await client.new_session()  # sess-1
+    sid_b = await client.new_session()  # sess-2
+    assert sid_a != sid_b
+
+    # Delays force the two sessions' updates to interleave in wall-clock time.
+    proc.script_prompt(
+        session_id=sid_a,
+        updates=[
+            acp_tool_call("a-1", "terminal: A"),
+            acp_tool_call_update("a-1"),
+            acp_agent_message("answer A"),
+        ],
+        result={"stopReason": "end_turn"},
+        delay=0.02,
+    )
+    proc.script_prompt(
+        session_id=sid_b,
+        updates=[
+            acp_tool_call("b-1", "terminal: B"),
+            acp_tool_call_update("b-1"),
+            acp_agent_message("answer B"),
+        ],
+        result={"stopReason": "end_turn"},
+        delay=0.02,
+    )
+
+    handle_a = await client.prompt(sid_a, "task A")
+    handle_b = await client.prompt(sid_b, "task B")
+    events_a, events_b = await asyncio.wait_for(
+        asyncio.gather(_collect(handle_a), _collect(handle_b)), 2.0
+    )
+
+    # Session A's stream carries ONLY A's tool ids, and B's only B's — no leakage.
+    assert {e.tool_call_id for e in events_a} == {"a-1"}
+    assert {e.tool_call_id for e in events_b} == {"b-1"}
+    assert await asyncio.wait_for(handle_a.result, 1.0) == "answer A"
+    assert await asyncio.wait_for(handle_b.result, 1.0) == "answer B"
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_permission_request_is_auto_answered_and_prompt_completes(
+    fake_acp_exec, monkeypatch
+):
+    proc = FakeAcpProc()
+    client, _ = await _started_client(fake_acp_exec, monkeypatch, proc)
+
+    sid = await client.new_session()
+    proc.script_prompt(
+        session_id=sid,
+        server_request={
+            "method": "session/request_permission",
+            "params": {
+                "options": [
+                    {"optionId": "reject", "kind": "reject_once", "name": "No"},
+                    {"optionId": "allow-1", "kind": "allow_once", "name": "Yes"},
+                ]
+            },
+        },
+        updates=[acp_agent_message("done after approval")],
+        result={"stopReason": "end_turn"},
+    )
+
+    handle = await client.prompt(sid, "do risky thing")
+    answer = await asyncio.wait_for(handle.result, 1.0)
+    assert answer == "done after approval"  # the prompt still completed
+
+    # Exactly one client response, granting the first allow-kind option.
+    assert len(proc.client_responses) == 1
+    assert proc.client_responses[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "allow-1"}
+    }
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_proc_death_mid_prompt_fails_result_and_ends_stream(
+    fake_acp_exec, monkeypatch
+):
+    proc = FakeAcpProc()
+    client, _ = await _started_client(fake_acp_exec, monkeypatch, proc)
+
+    sid = await client.new_session()
+    proc.script_prompt(
+        session_id=sid,
+        updates=[acp_tool_call("tc-1", "terminal: slow")],
+        delay=0.01,
+        die=True,  # crash mid-prompt: no final answer, stdout EOFs
+    )
+
+    handle = await client.prompt(sid, "long task")
+
+    # The event stream terminates (the one streamed edge, then close — no hang)...
+    events = await asyncio.wait_for(_collect(handle), 1.0)
+    assert [e.tool_call_id for e in events] == ["tc-1"]
+
+    # ...and the result future fails honestly instead of hanging forever.
+    with pytest.raises(AcpError):
+        await asyncio.wait_for(handle.result, 1.0)
+
+    await client.aclose()
