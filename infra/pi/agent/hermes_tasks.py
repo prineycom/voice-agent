@@ -75,6 +75,13 @@ DIRECTIVE_BACKGROUND = (
     "фразу-подтверждение и продолжай разговор — результат придёт позже сам. "
     "НЕ перезапускай эту задачу, чтобы узнать статус — результат озвучится автоматически."
 )
+# Honest failure returned synchronously when a task fails WITHIN the fast window
+# (the answer is delivered this turn, so there is no background hand-off). {error}
+# carries Hermes's trimmed error text.
+DIRECTIVE_SYNC_FAILED = (
+    "Задача не удалась: {error}. Скажи пользователю честно, что не получилось — "
+    "не выдумывай успех. Если стоит попробовать снова, спроси его."
+)
 
 
 @dataclass
@@ -98,6 +105,13 @@ class HermesTask:
     finished_at: float | None = None
     result: str | None = None
     delivered_synchronously: bool = False
+    # Fast-window handshake (see delegate): ``awaiting_sync`` is True only while a
+    # delegate() call is racing this task's ``first_result`` against the fast
+    # window; ``completion_pending`` is set by _on_task_complete when the task
+    # settles *during* that race, so the deferred side-effects run exactly once at
+    # the single settle point (_maybe_run_completion) rather than twice.
+    awaiting_sync: bool = False
+    completion_pending: bool = False
     session_id: str | None = None
     first_result: "asyncio.Future[str] | None" = field(default=None, repr=False)
     runner: "asyncio.Task | None" = field(default=None, repr=False)
@@ -165,10 +179,26 @@ class HermesTaskManager:
     async def delegate(self, request: str) -> str:
         """Admit, queue, or refuse a Hermes task; return a directive for the LLM.
 
-        SEAM: the immediate-run path returns a plain ack here. The next task in
-        the chain replaces this return with a race of ``task.first_result``
-        against the ``fast_window_s`` timer (synchronous reply when Hermes is
-        quick, background hand-off otherwise).
+        Hybrid fast window (ADR-0022): an admitted task is started immediately and
+        its final result raced against ``fast_window_s``. If Hermes answers within
+        the window the reply is returned synchronously as the tool result (the LLM
+        speaks it this turn); otherwise the task drops to the background and its
+        ``task_id`` + a "continues in the background" directive is returned.
+
+        A task that must be QUEUED (over capacity) does NOT consume a fast window —
+        it returns the queued directive at once and, when later promoted, runs
+        purely in the background.
+
+        Fast-window ⇄ completion handshake (keeps the completion side-effects
+        single-fire despite the race): the result may land — and ``_run_task`` may
+        already have called ``_on_task_complete`` — *before* this coroutine wakes
+        from ``wait_for``. So we mark ``task.awaiting_sync`` before awaiting; while
+        it is set ``_on_task_complete`` only emits the UI "done"/"error" event and
+        records ``completion_pending`` instead of running its post-completion hooks.
+        Both exits below (win or timeout) clear ``awaiting_sync`` and drain any
+        deferred completion via ``_maybe_run_completion`` — the single settle point
+        later chain tasks extend for reintegration/delivery (skipped on a
+        synchronous win, since the answer already went back as the tool result).
         """
         if self._running_count() >= self.max_concurrent:
             if len(self._queue) >= self.max_queued:
@@ -183,7 +213,28 @@ class HermesTaskManager:
         task = self._start_task(request)
         self._emit_delegated(task)
         self._emit_tasks()
-        return DIRECTIVE_BACKGROUND.format(task_id=task.task_id)
+
+        task.awaiting_sync = True
+        try:
+            # SHIELD is required: a fast-window timeout must not cancel the
+            # underlying future/task — the task keeps running in the background.
+            text = await asyncio.wait_for(
+                asyncio.shield(task.first_result), self.fast_window_s
+            )
+        except asyncio.TimeoutError:
+            task.awaiting_sync = False
+            # If the task settled right at the window boundary, drain its deferred
+            # completion now; otherwise its own _on_task_complete runs the hooks.
+            self._maybe_run_completion(task)
+            return DIRECTIVE_BACKGROUND.format(task_id=task.task_id)
+
+        # Result landed within the window → deliver synchronously as the tool result.
+        task.delivered_synchronously = True
+        task.awaiting_sync = False
+        self._maybe_run_completion(task)
+        if task.state == "failed":
+            return DIRECTIVE_SYNC_FAILED.format(error=text)
+        return text
 
     async def cancel(self, hint: str = "") -> str:
         """Cancel active Hermes tasks (running + queued); return a directive.
@@ -401,10 +452,22 @@ class HermesTaskManager:
     def _on_task_complete(self, task: HermesTask) -> None:
         """Settle bookkeeping for a task that just reached a terminal state.
 
-        HOOK: the reintegration + bounded-delivery tasks extend this to write a
-        synthetic tool turn into ``chat_ctx`` and speak the result. For now it
-        emits the UI feed event, promotes the next queued task, and prunes memory.
+        The UI feed event is emitted immediately in BOTH paths (synchronous win
+        and background) so the browser always sees the result once. The remaining
+        post-completion side-effects are deferred while a fast-window race is still
+        open (``awaiting_sync``): they run at the single settle point once
+        ``delegate`` resolves the race (see the handshake note on :meth:`delegate`).
         """
+        self._emit_completion_event(task)
+        if task.awaiting_sync:
+            # Fast window still open: defer the hooks to _maybe_run_completion so
+            # they (and, later, reintegration/delivery) fire exactly once.
+            task.completion_pending = True
+            return
+        self._settle_completion(task)
+
+    def _emit_completion_event(self, task: HermesTask) -> None:
+        """Publish the one-shot "done"/"error" UI feed entry for a settled task."""
         kind = "done" if task.state == "done" else "error"
         body = task.result or ""
         self._emit(
@@ -417,10 +480,33 @@ class HermesTaskManager:
                 "full": body[:UI_FULL_OUTPUT_CAP],
             }
         )
+
+    def _settle_completion(self, task: HermesTask) -> None:
+        """Post-completion side-effects, run once the fast-window race is resolved.
+
+        HOOK + single decision point: the reintegration + bounded-delivery tasks
+        extend this to write a synthetic tool turn into ``chat_ctx`` and speak the
+        result — SKIPPED for ``delivered_synchronously`` tasks (the answer already
+        went back as the tool result). For now it promotes the next queued task,
+        prunes memory, refreshes the snapshot, and updates the idle gate.
+        """
         self._promote_queued()
         self._prune_finished()
         self._emit_tasks()
         self._update_idle()
+
+    def _maybe_run_completion(self, task: HermesTask) -> None:
+        """Drain a completion deferred while this task's fast window was open.
+
+        A no-op unless ``_on_task_complete`` ran during the race (``completion_
+        pending``): the timeout path's task may still be running (its own
+        ``_on_task_complete`` runs the hooks later), and the win path already
+        emitted the UI event — this just runs the deferred settle exactly once.
+        """
+        if not task.completion_pending:
+            return
+        task.completion_pending = False
+        self._settle_completion(task)
 
     async def _cancel_task(self, task: HermesTask) -> None:
         """Cancel one task (queued or running); leave it in state ``cancelled``."""

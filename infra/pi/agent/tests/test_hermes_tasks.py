@@ -126,28 +126,43 @@ async def wait_for(predicate, timeout=2.0, interval=0.01):
 
 
 # --------------------------------------------------------------------------- #
-# (1) delegate runs a task to completion; state → done with the result stored.
+# (1) fast result within the window → delegate returns the ANSWER synchronously
+#     (not an ack), delivered_synchronously, state done, one "done" UI event.
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_delegate_runs_task_to_done_and_stores_result(
+async def test_delegate_fast_result_returns_answer_synchronously(
     monkeypatch, fake_acp_exec
 ):
     from conftest import FakeAcpProc
 
+    published = []
+
+    async def publisher(data: bytes):
+        published.append(json.loads(data))
+
     proc = FakeAcpProc()
     proc.script_prompt(result={"text": "на улице солнечно, плюс восемнадцать"})
-    mgr = make_manager(monkeypatch, proc, fake_acp_exec)
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)  # default 8s window
+    mgr.set_publisher(publisher)
 
-    ack = await mgr.delegate("посмотри погоду")
-    assert "id:" in ack.lower() or "фон" in ack.lower()  # ack carries the task id
+    answer = await mgr.delegate("посмотри погоду")
 
-    await mgr.join()
+    # The tool returns the reply itself, not a background ack.
+    assert "солнечно" in answer
+    assert "id:" not in answer.lower() and "фон" not in answer.lower()
 
     task = only_task(mgr)
     assert task.state == "done"
-    assert "солнечно" in (task.result or "")
+    assert task.delivered_synchronously is True
     assert task.first_result.done()
     assert "солнечно" in task.first_result.result()
+
+    await mgr.join()
+    await asyncio.sleep(0.05)  # flush fire-and-forget UI publishes
+
+    # The "done" UI event still fires — exactly once (re-sends share one id).
+    done_ids = {e.get("id") for e in published if e.get("kind") == "done"}
+    assert len(done_ids) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -160,14 +175,20 @@ async def test_max_concurrent_queues_and_promotes_on_finish(
     from conftest import FakeAcpProc
 
     proc = FakeAcpProc()
-    # sess-1 finishes quickly (a short streamed step); sess-2/3 stay busy; the
-    # promoted task (sess-4) finishes on its own.
-    proc.script_prompt(session_id="sess-1", updates=[acp_tool_call("t", "step")], delay=0.15)
+    # sess-1 finishes on its own after ~0.5s (comfortably past the four delegates'
+    # cumulative tiny-window blocking, so all three occupy slots when d is
+    # delegated); sess-2/3 stay busy; the promoted task (sess-4) finishes at once.
+    proc.script_prompt(session_id="sess-1", updates=[acp_tool_call("t", "step")], delay=0.5)
     proc.script_prompt(session_id="sess-2", updates=[acp_tool_call("t", "busy")], delay=5)
     proc.script_prompt(session_id="sess-3", updates=[acp_tool_call("t", "busy")], delay=5)
     proc.script_prompt(session_id="sess-4", result={"text": "promoted done"})
 
-    mgr = make_manager(monkeypatch, proc, fake_acp_exec, max_concurrent=3, max_queued=5)
+    # Tiny fast window so each admitted task backgrounds at once (its result is
+    # slower than the window) instead of blocking delegate — the concurrency /
+    # queue accounting is what this test exercises, not the fast-window race.
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, max_concurrent=3, max_queued=5, fast_window_s=0.02
+    )
 
     await mgr.delegate("a")
     await mgr.delegate("b")
@@ -199,9 +220,11 @@ async def test_queue_overflow_refuses(monkeypatch, fake_acp_exec):
     for sid in ("sess-1", "sess-2"):
         proc.script_prompt(session_id=sid, updates=[acp_tool_call("t", "busy")], delay=5)
 
-    mgr = make_manager(monkeypatch, proc, fake_acp_exec, max_concurrent=1, max_queued=1)
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, max_concurrent=1, max_queued=1, fast_window_s=0.05
+    )
 
-    await mgr.delegate("a")  # running
+    await mgr.delegate("a")  # running (backgrounds after the tiny window)
     await mgr.delegate("b")  # queued (fills the queue)
     refusal = await mgr.delegate("c")  # overflow
 
@@ -225,7 +248,9 @@ async def test_list_tasks_live_then_finished(monkeypatch, fake_acp_exec):
         result={"text": "готово"},
         delay=0.25,
     )
-    mgr = make_manager(monkeypatch, proc, fake_acp_exec)
+    # Tiny window so delegate backgrounds and we can observe the live running
+    # state before the (slower) result lands.
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
 
     await mgr.delegate("проверь диск")
     task = only_task(mgr)
@@ -261,7 +286,9 @@ async def test_cancel_by_label_and_id(monkeypatch, fake_acp_exec):
     for sid in ("sess-1", "sess-2"):
         proc.script_prompt(session_id=sid, updates=[acp_tool_call("t", "busy")], delay=5)
 
-    mgr = make_manager(monkeypatch, proc, fake_acp_exec, max_concurrent=3)
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, max_concurrent=3, fast_window_s=0.05
+    )
     mgr.set_publisher(publisher)
 
     await mgr.delegate("проверь почту")
@@ -295,7 +322,9 @@ async def test_shutdown_cancels_running_and_queue(monkeypatch, fake_acp_exec):
     for sid in ("sess-1", "sess-2"):
         proc.script_prompt(session_id=sid, updates=[acp_tool_call("t", "busy")], delay=5)
 
-    mgr = make_manager(monkeypatch, proc, fake_acp_exec, max_concurrent=2, max_queued=5)
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, max_concurrent=2, max_queued=5, fast_window_s=0.05
+    )
 
     await mgr.delegate("a")
     await mgr.delegate("b")
@@ -407,3 +436,125 @@ async def test_no_publisher_is_safe(monkeypatch, fake_acp_exec):
     await mgr.delegate("задача")
     await mgr.join()  # must not raise
     assert only_task(mgr).state == "done"
+
+
+# --------------------------------------------------------------------------- #
+# Fast-window race (ADR-0022): background / failure / queued / handshake.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_delegate_slow_result_backgrounds_then_completes(
+    monkeypatch, fake_acp_exec
+):
+    """Result slower than the window → directive with task_id now, result later."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    # One streamed step, then the result arrives ~0.3s later — past the 0.1s window.
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "готово позже"}, delay=0.3
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.1)
+
+    directive = await mgr.delegate("долгая задача")
+    task = only_task(mgr)
+
+    # Backgrounded: a directive carrying the task id, not the answer.
+    assert task.task_id in directive
+    assert "готово позже" not in directive
+    assert task.delivered_synchronously is False
+    assert task.state == "running"
+
+    await mgr.join()
+
+    assert task.state == "done"
+    assert "готово позже" in (task.result or "")
+    assert task.delivered_synchronously is False
+
+
+@pytest.mark.asyncio
+async def test_delegate_fast_failure_returns_honest_error(monkeypatch, fake_acp_exec):
+    """A failure WITHIN the window → an honest failure string (with the error)."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(error={"code": -32000, "message": "hermes boom"})
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)  # default 8s window
+
+    reply = await mgr.delegate("сломается быстро")
+    task = only_task(mgr)
+
+    assert task.state == "failed"
+    assert task.delivered_synchronously is True
+    assert "boom" in reply.lower()  # the error text is surfaced honestly
+    assert "не удалась" in reply.lower() or "не получилось" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_queued_task_returns_immediately_without_window(
+    monkeypatch, fake_acp_exec
+):
+    """A queued task returns the queued directive at once — it never waits a window."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    # sess-1 occupies the only slot for a long time; sess-2 is the queued task.
+    proc.script_prompt(session_id="sess-1", updates=[acp_tool_call("t", "busy")], delay=5)
+    proc.script_prompt(session_id="sess-2", result={"text": "не должно ждать"})
+
+    # A generous 5s window: if the queued path wrongly awaited it, this test would
+    # hang for ~5s. Fill the running slot directly (bypassing delegate's window) so
+    # the next delegate deterministically hits the QUEUE branch.
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, max_concurrent=1, max_queued=5, fast_window_s=5
+    )
+    mgr._start_task("занят")  # running, slot full
+    assert mgr._running_count() == 1
+
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    directive = await mgr.delegate("в очередь")
+    elapsed = loop.time() - t0
+
+    assert "очеред" in directive.lower()
+    assert elapsed < 1.0  # returned immediately, did not consume the 5s window
+    assert len(mgr._queue) == 1
+    assert mgr._queue[0].delivered_synchronously is False
+
+    await mgr.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_slow_path_runs_completion_hooks_exactly_once(monkeypatch, fake_acp_exec):
+    """The deferred-completion handshake fires the completion side-effects once.
+
+    A task that settles just after the window (so _on_task_complete runs with the
+    race already resolved) must emit exactly one "done" UI event and promote/prune
+    exactly once — no double-fire from the delegate side of the handshake.
+    """
+    from conftest import FakeAcpProc
+
+    published = []
+
+    async def publisher(data: bytes):
+        published.append(json.loads(data))
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "готово"}, delay=0.3
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.1)
+    mgr.set_publisher(publisher)
+
+    directive = await mgr.delegate("долгая")
+    task = only_task(mgr)
+    assert task.task_id in directive  # backgrounded
+
+    await mgr.join()
+    await asyncio.sleep(0.05)  # flush fire-and-forget publishes
+
+    # Exactly one distinct "done" event (its re-sends share a single id).
+    done = [e for e in published if e.get("kind") == "done"]
+    assert done
+    assert len({e.get("id") for e in done}) == 1
+    assert task.state == "done"
+    assert task.completion_pending is False
