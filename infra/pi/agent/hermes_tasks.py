@@ -11,11 +11,8 @@ narration, synthetic-tool-turn reintegration, and bounded proactive delivery.
 The manager implements the state model, admission/queue, the lossy-channel UI
 feed, ``list_tasks`` / ``cancel`` / ``shutdown``, the :meth:`_run_task` ACP
 driver, the fast-window race in :meth:`delegate`, milestone narration
-(:meth:`_maybe_narrate`), and synthetic-tool-turn reintegration
-(:meth:`_reintegrate`). One hook remains for the last task of the chain:
-
-- :meth:`_deliver` — called after reintegration; the bounded-delivery task
-  extends it to speak the finished task's report proactively.
+(:meth:`_maybe_narrate`), synthetic-tool-turn reintegration
+(:meth:`_reintegrate`), and bounded proactive delivery (:meth:`_deliver`).
 
 The manager is plain (no livekit decorators) so it is fully unit-testable; the
 ``@function_tool`` adapters in worker_tools.py are thin wrappers that fetch the
@@ -113,6 +110,27 @@ DIRECTIVE_SYNC_CANCELLED = (
     "отмену и продолжай разговор."
 )
 
+# -- Bounded delivery (ADR-0022 "Delivery of the spoken report") --------------
+# generate_reply instructions for the proactive background report. The result /
+# error is ALREADY in chat_ctx as the task_result tool turn (reintegration runs
+# first), so the instructions only tell the model to voice it — tone per
+# skills/hermes.md: short, conversational, no markdown, honest about failures.
+DELIVERY_INSTRUCTIONS_DONE = (
+    "Фоновая задача «{label}» (id: {task_id}) завершилась — её результат уже в "
+    "контексте как результат инструмента task_result. Озвучь его пользователю "
+    "сейчас: коротко, разговорно, без markdown."
+)
+DELIVERY_INSTRUCTIONS_FAILED = (
+    "Фоновая задача «{label}» (id: {task_id}) НЕ удалась — ошибка уже в контексте "
+    "как результат инструмента task_result (is_error). Честно скажи пользователю, "
+    "что не получилось и почему. Не выдумывай успех и не повторяй запрос молча."
+)
+# Prepended when the fallback timer won the idle race (soft barge-in, ADR-0022).
+DELIVERY_BARGE_IN_PREFIX = (
+    "Разговор сейчас занят, поэтому вклинься мягко — начни со слов "
+    "«кстати, по той задаче…». "
+)
+
 
 @dataclass
 class HermesTask:
@@ -137,8 +155,11 @@ class HermesTask:
     delivered_synchronously: bool = False
     # True once the result has been written into chat_ctx as a synthetic tool
     # turn (_reintegrate) — "the LLM can read this from context now"; delivery
-    # (next chain task) asserts this ordering before speaking.
+    # runs strictly after this, so a delivery miss can never lose the answer.
     reintegrated: bool = False
+    # True once the spoken background report was fired (_deliver's
+    # generate_reply call succeeded) — "отчитался".
+    delivered: bool = False
     # Fast-window handshake (see delegate): ``awaiting_sync`` is True only while a
     # delegate() call is racing this task's ``first_result`` against the fast
     # window; ``completion_pending`` is set by _on_task_complete when the task
@@ -207,8 +228,12 @@ class HermesTaskManager:
         # AgentActivity.update_chat_ctx REPLACES the context (no merge), so two
         # finalizers interleaving around the await would have the second's stale
         # copy() overwrite — and silently drop — the first's tool-turn pair.
-        # The delivery task (next in the chain) reuses this lock discipline.
+        # Any future chat_ctx read-modify-write must reuse this lock discipline.
         self._chat_ctx_lock = asyncio.Lock()
+        # Serializes spoken deliveries so two near-simultaneous background
+        # reports don't fight over the channel: the second delivery (including
+        # its own idle race) starts only after the first's generate_reply CALL.
+        self._delivery_lock = asyncio.Lock()
         self._closing = False
         # Set whenever nothing is running or queued (test/shutdown join point).
         self._idle = asyncio.Event()
@@ -216,7 +241,7 @@ class HermesTaskManager:
 
     # -- wiring -------------------------------------------------------------
     def attach_session(self, session) -> None:
-        """Bind the live AgentSession used for proactive replies (later tasks)."""
+        """Bind the live AgentSession used for narration and proactive delivery."""
         self._session = session
 
     def set_publisher(self, publish) -> None:
@@ -722,13 +747,93 @@ class HermesTaskManager:
         task.reintegrated = True
 
     async def _deliver(self, task: HermesTask) -> None:
-        """HOOK (next chain task): speak the finished task's report proactively.
+        """Speak the finished background task's report (ADR-0022 bounded delivery).
 
-        Bounded delivery per ADR-0022 — wait for a natural pause up to
-        ``delivery_fallback_s``, then a soft barge-in. By the time this runs the
-        result is already reintegrated into ``chat_ctx`` (see :meth:`_finalize`),
-        so a delivery miss can never lose the answer. Stub for now.
+        Window + fallback: wait for a natural pause (``session.wait_for_idle``)
+        up to ``delivery_fallback_s``, then deliver anyway with a soft barge-in
+        ("кстати, по той задаче…"). This replaces the old unbounded idle gate
+        that could sit on a finished result forever. Runs strictly AFTER
+        :meth:`_reintegrate` (see :meth:`_finalize`), so the result is already
+        safe in chat_ctx — a delivery failure loses only the spoken report,
+        never the answer. No ``_chat_ctx_lock`` here: nothing below touches
+        chat_ctx; generate_reply reads the (already updated) context itself.
         """
+        if task.delivered_synchronously:
+            return  # guarded upstream (_settle_completion); belt-and-braces
+        if task.state == "cancelled":
+            # cancel() already returned a spoken confirmation as its tool result;
+            # a proactive "report" about a task the user just killed is noise.
+            return
+        if self._session is None:
+            log.info(
+                "hermes task %s (%s): no session attached — report not spoken "
+                "(result is in chat_ctx/live state)",
+                task.task_id,
+                task.label,
+            )
+            return
+
+        # Serialize deliveries so two near-simultaneous reports don't fight over
+        # the channel: the second waits, then runs its OWN idle race. The lock
+        # covers only the idle race + the generate_reply CALL (not the playout);
+        # the framework queues the actual speech, which is acceptable ordering.
+        async with self._delivery_lock:
+            barged_in = await self._wait_for_pause()
+            template = (
+                DELIVERY_INSTRUCTIONS_DONE
+                if task.state == "done"
+                else DELIVERY_INSTRUCTIONS_FAILED
+            )
+            instructions = (
+                DELIVERY_BARGE_IN_PREFIX if barged_in else ""
+            ) + template.format(label=task.label, task_id=task.task_id)
+            try:
+                # Synchronous call returning a SpeechHandle; fire the reply, do
+                # not await playout.
+                self._session.generate_reply(
+                    instructions=instructions, allow_interruptions=True
+                )
+            except Exception:  # noqa: BLE001 — must not crash the manager
+                log.exception(
+                    "hermes task %s (%s): delivery failed — report not spoken "
+                    "(result is already safe in chat_ctx)",
+                    task.task_id,
+                    task.label,
+                )
+                return
+            task.delivered = True
+
+    async def _wait_for_pause(self) -> bool:
+        """Race a natural conversation pause against ``delivery_fallback_s``.
+
+        Returns True when the fallback timer won (the report will soft barge-in).
+        Prefers the framework's ``session.wait_for_idle`` coroutine; falls back
+        to polling :meth:`_session_is_idle` when the session doesn't expose it.
+        If the idle wait *raises* (e.g. ActivityClosedError while the session is
+        closing) we proceed as a barge-in — generate_reply will then fail loudly
+        in the caller if the session is truly gone.
+        """
+        wait_idle = getattr(self._session, "wait_for_idle", None)
+        if wait_idle is not None:
+            idle_task = asyncio.create_task(wait_idle())
+        else:
+            idle_task = asyncio.create_task(self._poll_session_idle())
+        timer_task = asyncio.create_task(asyncio.sleep(self.delivery_fallback_s))
+        done, pending = await asyncio.wait(
+            {idle_task, timer_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for p in pending:
+            p.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if idle_task in done and idle_task.exception() is not None:
+            log.debug("wait_for_idle failed: %r", idle_task.exception())
+            return True
+        return timer_task in done
+
+    async def _poll_session_idle(self) -> None:
+        """Fallback pause probe for sessions without ``wait_for_idle``."""
+        while not self._session_is_idle():
+            await asyncio.sleep(0.1)
 
     def _maybe_run_completion(self, task: HermesTask) -> None:
         """Drain a completion deferred while this task's fast window was open.
@@ -790,8 +895,9 @@ class HermesTaskManager:
     def _session_is_idle(self) -> bool:
         """Whether the conversation is quiet enough to speak a result into.
 
-        Used by the proactive-delivery worker (later tasks) as the fallback idle
-        probe when the framework's own ``wait_for_idle`` primitive is unavailable.
+        Used by milestone narration and, via :meth:`_poll_session_idle`, as the
+        delivery pause probe when the framework's own ``wait_for_idle`` primitive
+        is unavailable on the bound session.
         """
         s = self._session
         if s is None:

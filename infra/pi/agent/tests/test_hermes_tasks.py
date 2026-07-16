@@ -43,14 +43,28 @@ class FakeSession:
 
     def __init__(self):
         self.replies: list[str] = []
+        self.reply_calls: list[dict] = []  # full kwargs per generate_reply call
         self.said: list[dict] = []  # recorded say() calls (milestone narration)
         self.agent_state = "listening"
         self.user_state = "listening"
         self.current_speech = None
+        # Backs wait_for_idle: set = conversation idle (the default). Tests
+        # clear it to model a permanently busy conversation.
+        self.idle_event = asyncio.Event()
+        self.idle_event.set()
 
     def generate_reply(self, *, instructions=None, allow_interruptions=None, **kwargs):
         self.replies.append(instructions or "")
+        self.reply_calls.append(
+            {"instructions": instructions, "allow_interruptions": allow_interruptions}
+        )
         return FakeHandle()
+
+    async def wait_for_idle(self):
+        """Mirrors AgentSession.wait_for_idle: a coroutine that resolves once the
+        session is idle (blocks while busy). Divergence from the real API: returns
+        None instead of the AgentActivity — the manager ignores the value."""
+        await self.idle_event.wait()
 
     def say(self, text, *, allow_interruptions=None, add_to_chat_ctx=True, **kwargs):
         """Mirrors AgentSession.say (synchronous, returns a SpeechHandle)."""
@@ -1051,3 +1065,160 @@ async def test_shutdown_drains_inflight_finalizer(monkeypatch, fake_acp_exec):
     calls, outs = tool_turn_pair(session)
     assert len(calls) == 1 and len(outs) == 1
     assert outs[0].output == "успел до выключения"
+
+
+# --------------------------------------------------------------------------- #
+# Bounded delivery (ADR-0022): after reintegration, speak the report via
+# generate_reply — natural pause up to delivery_fallback_s, else soft barge-in.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_delivery_speaks_promptly_when_idle(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "готово"}, delay=0.3
+    )
+    # Generous fallback (5s): if delivery wrongly sat out the window while idle,
+    # the wait_for (2s) below would time out.
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, fast_window_s=0.05, delivery_fallback_s=5
+    )
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    await mgr.delegate("проверь погоду")
+    task = only_task(mgr)
+    await mgr.join()
+    assert await wait_for(lambda: task.delivered)
+
+    assert task.reintegrated is True  # hard ordering: record first, speech after
+    assert len(session.replies) == 1
+    instr = session.replies[0]
+    assert task.label in instr and task.task_id in instr  # tied to the context record
+    assert "кстати" not in instr.lower()  # idle path → no barge-in phrasing
+    assert session.reply_calls[0]["allow_interruptions"] is True
+
+
+@pytest.mark.asyncio
+async def test_delivery_barges_in_after_fallback_when_busy(
+    monkeypatch, fake_acp_exec
+):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "готово"}, delay=0.3
+    )
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, fast_window_s=0.05, delivery_fallback_s=0.1
+    )
+    session = FakeSessionWithAgent()
+    session.idle_event.clear()  # permanently busy: wait_for_idle never resolves
+    mgr.attach_session(session)
+
+    await mgr.delegate("долгая задача")
+    task = only_task(mgr)
+    await mgr.join()
+    # The report still lands ~delivery_fallback_s later — never lost to a busy
+    # conversation (the old unbounded idle-gate bug).
+    assert await wait_for(lambda: task.delivered)
+
+    assert len(session.replies) == 1
+    assert "кстати, по той задаче" in session.replies[0].lower()  # soft barge-in
+
+
+@pytest.mark.asyncio
+async def test_delivery_reports_failure_honestly(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")],
+        error={"code": -32000, "message": "hermes boom"},
+        delay=0.3,
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    await mgr.delegate("сломается в фоне")
+    task = only_task(mgr)
+    await mgr.join()
+    assert await wait_for(lambda: task.delivered)
+
+    assert task.state == "failed"
+    instr = session.replies[0].lower()
+    assert "не удалась" in instr  # honest failure report
+    assert "честно" in instr
+    assert "не выдумывай успех" in instr
+
+
+@pytest.mark.asyncio
+async def test_cancelled_task_is_not_delivered(monkeypatch, fake_acp_exec):
+    """cancel() already speaks its own confirmation via the tool result — the
+    finalizer writes the context record but must not also report proactively."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(updates=[acp_tool_call("t", "busy")], delay=5)
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    mgr.attach_session(session)
+
+    await mgr.delegate("долгая задача")
+    task = only_task(mgr)
+    await mgr.cancel(task.task_id)
+    assert await wait_for(lambda: task.reintegrated)  # record still written
+
+    assert session.replies == []  # no proactive report
+    assert task.delivered is False
+
+
+@pytest.mark.asyncio
+async def test_deliver_without_session_is_safe(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    mgr = make_manager(monkeypatch, FakeAcpProc(), fake_acp_exec)
+    task = mgr._make_task("тест")
+    task.state = "done"
+    task.result = "результат"
+    mgr._session = None
+
+    await mgr._deliver(task)  # must not raise
+
+    assert task.delivered is False  # nothing spoken; result stays in live state
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_survives_and_logs(monkeypatch, fake_acp_exec, caplog):
+    import logging
+
+    from conftest import FakeAcpProc
+
+    class ExplodingReplySession(FakeSessionWithAgent):
+        def generate_reply(self, **kwargs):
+            raise RuntimeError("reply boom")
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "готово"}, delay=0.3
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = ExplodingReplySession()
+    mgr.attach_session(session)
+
+    with caplog.at_level(logging.ERROR, logger="agent"):
+        await mgr.delegate("долгая задача")
+        task = only_task(mgr)
+        await mgr.join()
+        assert await wait_for(
+            lambda: any("delivery failed" in r.getMessage() for r in caplog.records)
+        )
+
+    # Reintegration ran FIRST, so the failed delivery lost only the speech.
+    assert task.reintegrated is True
+    assert task.delivered is False
+    assert task.state == "done"
+    calls, outs = tool_turn_pair(session)
+    assert len(calls) == 1 and len(outs) == 1  # answer safe in chat_ctx
