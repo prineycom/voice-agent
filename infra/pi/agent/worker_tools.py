@@ -1,9 +1,19 @@
-"""Worker tool — generic whitelisted CLI command runner.
+"""Worker tools — literal-shell escape hatch + async Hermes delegation.
 
-Exposes ONE `livekit.agents.function_tool`, `run_command(args)`, that lets the
-agent's LLM run any CLI command whose first token is on the whitelist defined in
+Hermes delegation runs over a long-lived `hermes acp` (Agent Client Protocol)
+streaming client — one persistent process spawned at worker startup, one ACP
+session per delegated task (see docs/adr/0022-hermes-acp-hybrid-delegation.md,
+which supersedes docs/adr/0007-hermes-cli-delegation.md). Free-form intent
+("найди мои задачи", "сделай X") goes through the `delegate` tool, which races
+the task against an 8s fast window and backgrounds it past that, later
+reintegrating the result as a synthetic tool turn.
+
+This module also exposes `run_command(args)`, a narrow, separate escape hatch:
+a `livekit.agents.function_tool` that lets the agent's LLM run a LITERAL shell
+command line whose first token is on the whitelist defined in
 `infra/pi/agent/config.yaml` (`worker_tools.allowed_commands`, default
-`["hermes"]`).
+`["hermes"]`). It is not a natural-language interface — free-form asks are
+explicitly out of scope for `run_command` and must go to `delegate` instead.
 
 Design (see CONTEXT.md → Hermes Tools / run_command):
 - The LLM composes the full CLI args string (taught by skills/hermes.md).
@@ -20,8 +30,9 @@ Design (see CONTEXT.md → Hermes Tools / run_command):
 - Graceful degradation: a non-whitelisted command, a missing binary, or a
   non-zero exit returns a clear error STRING (never raises) so the agent keeps
   talking instead of crashing the turn. Hermes being down is a recoverable
-  condition, not a startup-fatal one (unlike STT/TTS, which gate startup).
-- No MCP, no messaging bridge, no `hermes mcp serve`. Direct CLI subprocess only.
+  condition, not a startup-fatal one (unlike STT/TTS, which gate startup). The
+  long-lived ACP client backing `delegate` follows the same doctrine: a crash
+  is a respawn-and-report-honestly event, never a startup gate.
 
 Config (`infra/pi/agent/config.yaml`):
     worker_tools:
@@ -108,17 +119,21 @@ def _invalidate_config_cache() -> None:
 
 @function_tool
 async def run_command(args: str) -> str:
-    """Run a whitelisted CLI command on the Pi and return its stdout.
+    """Run a LITERAL shell command line on the Pi and return its output.
 
-    Pass the full command line as a single string, e.g.
-    `run_command("hermes chat -q 'what is 2+2' -Q --yolo --source tool")`.
-    The first token must be a whitelisted command (default: `hermes`); anything
-    else is rejected. Quote arguments that contain spaces with single quotes.
+    This tool accepts ONLY a literal command line, e.g. `run_command("uname -a")`
+    or `run_command("hermes memory list")`. The first token must be a
+    whitelisted command (default: `hermes`); anything else is rejected. Quote
+    arguments that contain spaces with single quotes.
 
-    Returns the command's stdout (the final response, plus for Hermes a trailing
-    `session_id:` line you should reuse via `--resume <session_id>`). On
-    rejection, missing binary, timeout, or non-zero exit, returns a short error
-    string describing the failure — never raises.
+    FORBIDDEN: free-form natural-language intent or requests, e.g.
+    `run_command("найди мои задачи")` or `run_command("сделай X")`. Those must
+    go to the `delegate` tool, not here — `run_command` does not interpret
+    intent, it only execs the literal command line you give it.
+
+    Returns the command's stdout/stderr tail. On rejection, missing binary,
+    timeout, or non-zero exit, returns a short error string describing the
+    failure — never raises.
     """
     try:
         tokens = shlex.split(args)
