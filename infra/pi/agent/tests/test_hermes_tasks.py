@@ -973,3 +973,81 @@ async def test_reintegration_failure_survives_and_logs(
     assert task.state == "done"
     assert task.reintegrated is False
     assert mgr.list_tasks()  # still answers status queries
+
+
+class SlowUpdateAgent(FakeAgent):
+    """FakeAgent whose update_chat_ctx really suspends — mirrors the realtime-LLM
+    path where the replace-style update awaits, opening a lost-update window for
+    an unsynchronized copy()→insert()→update sequence."""
+
+    def __init__(self, delay=0.15):
+        super().__init__()
+        self._delay = delay
+
+    async def update_chat_ctx(self, chat_ctx, **kwargs):
+        await asyncio.sleep(self._delay)
+        self._ctx = chat_ctx
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reintegrations_keep_both_pairs(monkeypatch, fake_acp_exec):
+    """Two background tasks finishing near-simultaneously must BOTH land their
+    tool-turn pair: update_chat_ctx REPLACES the context, so without the
+    chat_ctx lock the second finalizer's stale copy() overwrites the first's."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "ответ один"}, delay=0.3
+    )
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "ответ два"}, delay=0.3
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    session.current_agent = SlowUpdateAgent(delay=0.15)
+    mgr.attach_session(session)
+
+    await mgr.delegate("задача один")
+    await mgr.delegate("задача два")
+    t1, t2 = list(mgr._tasks.values())
+
+    await mgr.join()
+    assert await wait_for(lambda: t1.reintegrated and t2.reintegrated)
+
+    calls, outs = tool_turn_pair(session)
+    assert len(calls) == 2 and len(outs) == 2  # neither pair overwritten
+    assert {c.call_id for c in calls} == {
+        f"hermes_task_{t1.task_id}",
+        f"hermes_task_{t2.task_id}",
+    }
+    assert {o.output for o in outs} == {"ответ один", "ответ два"}
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_inflight_finalizer(monkeypatch, fake_acp_exec):
+    """A task that genuinely finishes right before shutdown must still land its
+    chat_ctx record: shutdown drains finalizers instead of cancelling them."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")],
+        result={"text": "успел до выключения"},
+        delay=0.3,
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    session.current_agent = SlowUpdateAgent(delay=0.1)  # finalizer mid-update
+    mgr.attach_session(session)
+
+    await mgr.delegate("долгая задача")
+    task = only_task(mgr)
+    await mgr.join()  # task done; its finalizer just spawned / mid-await
+    await mgr.shutdown()  # must drain the finalizer, not cancel it
+
+    assert task.state == "done"
+    assert task.reintegrated is True  # the record landed despite the shutdown
+    calls, outs = tool_turn_pair(session)
+    assert len(calls) == 1 and len(outs) == 1
+    assert outs[0].output == "успел до выключения"

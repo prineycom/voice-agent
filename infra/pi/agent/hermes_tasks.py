@@ -57,6 +57,10 @@ DEFAULT_OUTPUT_LIMIT = 600  # chars of Hermes output handed to the LLM per resul
 # long session can still answer "как там та задача?" without unbounded growth.
 _FINISHED_KEEP = 20
 
+# How long shutdown waits for in-flight finalizers (reintegration/delivery) to
+# land their chat_ctx records before giving up on them (with a loud warning).
+_FINALIZE_DRAIN_TIMEOUT_S = 2.0
+
 # -- Milestone narration (ADR-0022 "Progress") -------------------------------
 # Short template phrases spoken via ``session.say`` on a tool-call START edge —
 # no LLM call, never written to chat_ctx, skipped (not queued) when the channel
@@ -194,6 +198,17 @@ class HermesTaskManager:
         self._publish = None  # async (data: bytes) -> None, or None
         self._event_seq = 0  # monotonic id for feed events (client dedups repeats)
         self._ui_tasks: set[asyncio.Task] = set()  # in-flight UI (re)publish tasks
+        # In-flight _finalize (reintegrate → deliver) tasks, tracked SEPARATELY
+        # from UI publishes: shutdown cancels UI tasks outright but must NOT
+        # cancel these — a cancelled finalizer silently loses a finished task's
+        # context record. Shutdown drains them with a short timeout instead.
+        self._finalize_tasks: set[asyncio.Task] = set()
+        # Serializes every read-modify-write of the agent's chat_ctx. The real
+        # AgentActivity.update_chat_ctx REPLACES the context (no merge), so two
+        # finalizers interleaving around the await would have the second's stale
+        # copy() overwrite — and silently drop — the first's tool-turn pair.
+        # The delivery task (next in the chain) reuses this lock discipline.
+        self._chat_ctx_lock = asyncio.Lock()
         self._closing = False
         # Set whenever nothing is running or queued (test/shutdown join point).
         self._idle = asyncio.Event()
@@ -312,7 +327,7 @@ class HermesTaskManager:
             # Cancellation settles here (never via _on_task_complete), so write
             # its minimal context record now — a cancelled task with no record
             # would look un-run to the LLM and invite a silent re-delegation.
-            self._spawn(self._finalize(task))
+            self._spawn_finalize(self._finalize(task))
 
         self._emit({"type": "event", "kind": "cancelled", "count": len(targets)})
         self._promote_queued()
@@ -347,6 +362,25 @@ class HermesTaskManager:
         for ui_task in list(self._ui_tasks):
             ui_task.cancel()
         await asyncio.gather(*runners, *self._ui_tasks, return_exceptions=True)
+
+        # Finalizers are NOT cancelled: a task that genuinely finished right
+        # before shutdown deserves its chat_ctx record, and cancelling would
+        # drop it with no log (CancelledError bypasses _reintegrate's except).
+        # Drain them briefly; anything still unfinished is logged loudly.
+        if self._finalize_tasks:
+            _done, pending = await asyncio.wait(
+                list(self._finalize_tasks), timeout=_FINALIZE_DRAIN_TIMEOUT_S
+            )
+            if pending:
+                log.warning(
+                    "shutdown: %d finalizer(s) did not finish within %.1fs — "
+                    "context record(s) may be lost",
+                    len(pending),
+                    _FINALIZE_DRAIN_TIMEOUT_S,
+                )
+                for p in pending:
+                    p.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
 
         for task in self._tasks.values():
             if task.state == "running":
@@ -607,7 +641,7 @@ class HermesTaskManager:
         if not task.delivered_synchronously and task.state in ("done", "failed"):
             # async (update_chat_ctx awaits) → spawned; _finalize keeps the
             # required order: reintegration BEFORE any delivery logic.
-            self._spawn(self._finalize(task))
+            self._spawn_finalize(self._finalize(task))
         self._promote_queued()
         self._prune_finished()
         self._emit_tasks()
@@ -653,26 +687,30 @@ class HermesTaskManager:
         else:
             output = task.result or ""
         try:
-            chat_ctx = agent.chat_ctx.copy()
-            chat_ctx.insert(
-                [
-                    FunctionCall(
-                        call_id=call_id,
-                        name="task_result",
-                        arguments=json.dumps(
-                            {"task_id": task.task_id, "request": task.label},
-                            ensure_ascii=False,
+            # The whole read-modify-write is serialized: update_chat_ctx REPLACES
+            # the context, so the fresh copy() MUST be taken inside the lock or a
+            # concurrent finalizer's stale copy would overwrite this pair.
+            async with self._chat_ctx_lock:
+                chat_ctx = agent.chat_ctx.copy()
+                chat_ctx.insert(
+                    [
+                        FunctionCall(
+                            call_id=call_id,
+                            name="task_result",
+                            arguments=json.dumps(
+                                {"task_id": task.task_id, "request": task.label},
+                                ensure_ascii=False,
+                            ),
                         ),
-                    ),
-                    FunctionCallOutput(
-                        call_id=call_id,
-                        name="task_result",
-                        output=output,
-                        is_error=task.state != "done",
-                    ),
-                ]
-            )
-            await agent.update_chat_ctx(chat_ctx)
+                        FunctionCallOutput(
+                            call_id=call_id,
+                            name="task_result",
+                            output=output,
+                            is_error=task.state != "done",
+                        ),
+                    ]
+                )
+                await agent.update_chat_ctx(chat_ctx)
         except Exception:  # noqa: BLE001 — must not crash the manager
             log.exception(
                 "hermes task %s (%s): reintegration failed — result NOT recorded "
@@ -776,11 +814,22 @@ class HermesTaskManager:
         )
 
     def _spawn(self, coro) -> None:
-        """Run a fire-and-forget background task (UI publishes, finalize), tracked
-        so shutdown can cancel and drain it."""
+        """Run a fire-and-forget UI publish task, tracked so shutdown can cancel it."""
         task = asyncio.create_task(coro)
         self._ui_tasks.add(task)
         task.add_done_callback(self._ui_tasks.discard)
+
+    def _spawn_finalize(self, coro) -> None:
+        """Run a _finalize (reintegrate → deliver) task, tracked in its own set.
+
+        Deliberately NOT in ``_ui_tasks``: shutdown cancels UI publishes outright,
+        but cancelling a just-spawned finalizer would drop a genuinely finished
+        task's chat_ctx record with no log (CancelledError bypasses the finalizer's
+        own error handling). Shutdown drains this set with a timeout instead.
+        """
+        task = asyncio.create_task(coro)
+        self._finalize_tasks.add(task)
+        task.add_done_callback(self._finalize_tasks.discard)
 
     def _emit(self, payload: dict) -> None:
         """Fire-and-forget publish a UI event (safe from sync or async context)."""
