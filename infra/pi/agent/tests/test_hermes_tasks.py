@@ -1364,3 +1364,78 @@ async def test_failed_task_is_never_retried(monkeypatch, fake_acp_exec):
     prompts = [m for m in proc.requests if m.get("method") == "session/prompt"]
     assert len(news) == 1
     assert len(prompts) == 1
+
+
+# --------------------------------------------------------------------------- #
+# function_tool adapters (worker_tools.delegate / list_tasks / cancel): thin
+# wrappers that fetch the manager from context.session.userdata, bind the live
+# session, and call into it. Exercised end-to-end over a real AcpClient so the
+# adapter → manager → ACP path is covered, not just a stubbed manager.
+# --------------------------------------------------------------------------- #
+class FakeContext:
+    """Stand-in for livekit RunContext: exposes ``.session`` with ``.userdata``.
+
+    The manager lives in ``session.userdata`` (as in production) and the adapter's
+    ``_manager`` binds ``session`` to the manager via ``attach_session``.
+    """
+
+    def __init__(self, manager, session):
+        session.userdata = manager
+        self.session = session
+
+
+@pytest.mark.asyncio
+async def test_delegate_adapter_returns_manager_output(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    import worker_tools
+
+    proc = FakeAcpProc()
+    proc.script_prompt(result={"text": "на улице солнечно"})
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)  # default fast window
+    ctx = FakeContext(mgr, FakeSessionWithAgent())
+
+    # Fast task: the adapter returns the manager's synchronous answer verbatim.
+    out = await worker_tools.delegate.__wrapped__(ctx, "посмотри погоду")
+    assert out == "на улице солнечно"
+    # The adapter bound the live session onto the manager (attach_session).
+    assert mgr._session is ctx.session
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_adapter_returns_manager_status(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    import worker_tools
+
+    proc = FakeAcpProc()
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)
+    ctx = FakeContext(mgr, FakeSessionWithAgent())
+
+    # list_tasks is synchronous on the manager; the adapter returns it as-is.
+    out = await worker_tools.list_tasks.__wrapped__(ctx)
+    assert out == mgr.list_tasks()
+    assert "нет" in out.lower()  # no background tasks yet
+
+
+@pytest.mark.asyncio
+async def test_cancel_adapter_returns_manager_output(monkeypatch, fake_acp_exec):
+    from conftest import FakeAcpProc
+
+    import worker_tools
+
+    proc = FakeAcpProc()
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec)
+    ctx = FakeContext(mgr, FakeSessionWithAgent())
+
+    # Nothing active → the adapter surfaces the manager's "no active tasks" reply.
+    out = await worker_tools.cancel.__wrapped__(ctx)
+    assert "нет активных задач" in out.lower()
+
+
+def test_old_hermes_tool_names_are_gone():
+    import worker_tools
+
+    assert not hasattr(worker_tools, "delegate_to_hermes")
+    assert not hasattr(worker_tools, "list_hermes_tasks")
+    assert not hasattr(worker_tools, "cancel_hermes_tasks")

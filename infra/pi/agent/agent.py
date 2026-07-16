@@ -70,9 +70,9 @@ import voice_state
 from wake_detector import WakeWordDetector
 from wake_state import WakeState
 from worker_tools import (
-    cancel_hermes_tasks,
-    delegate_to_hermes,
-    list_hermes_tasks,
+    cancel,
+    delegate,
+    list_tasks,
     make_hermes_manager,
     run_command,
 )
@@ -514,7 +514,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # session; RoomIO routes the audio to the connected participant.
     agent = GreetingAgent(
         instructions=instructions,
-        tools=[delegate_to_hermes, cancel_hermes_tasks, list_hermes_tasks, run_command],
+        tools=[delegate, cancel, list_tasks, run_command],
         greeting=cfg.agent_greeting,
         publish_motion=publish_motion,
         wake_state=wake_state,
