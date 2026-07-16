@@ -73,6 +73,10 @@ class AcpConnection:
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._closed = False
+        # Tracked separately from `_closed`: the reader loop sets `_closed` when
+        # it exits on its own (EOF/error), but only `aclose()` releases the
+        # writer — so EOF-then-aclose must still close the writer exactly once.
+        self._writer_closed = False
         self._reader_task = asyncio.ensure_future(self._reader_loop())
 
     # -- Outbound ----------------------------------------------------------
@@ -217,16 +221,22 @@ class AcpConnection:
                 fut.set_exception(exc)
 
     async def aclose(self) -> None:
-        """Cancel the reader loop, fail pending requests, and close the writer."""
-        if self._closed and self._reader_task.done():
-            return
+        """Cancel the reader loop, fail pending requests, and close the writer.
+
+        Idempotent, and safe to call after the reader loop already exited on its
+        own (peer EOF / loop error): the writer is still released in that case —
+        `_closed` alone must not short-circuit the writer close.
+        """
         self._closed = True
-        self._reader_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._reader_task
+        if not self._reader_task.done():
+            self._reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reader_task
         # The reader loop's `finally` fails pending futures; do it again here
         # (idempotent — `_pending` is already drained) to cover the case where
         # the loop had already exited before cancellation landed.
         self._fail_pending(AcpError("ACP connection closed"))
-        with contextlib.suppress(Exception):
-            self._writer.close()
+        if not self._writer_closed:
+            self._writer_closed = True
+            with contextlib.suppress(Exception):
+                self._writer.close()

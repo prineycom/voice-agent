@@ -160,6 +160,29 @@ async def test_aclose_fails_pending_requests():
 
 
 @pytest.mark.asyncio
+async def test_eof_then_aclose_still_closes_writer_and_fails_pending():
+    reader = asyncio.StreamReader()
+    writer = FakeWriter()
+    conn = AcpConnection(reader, writer)
+
+    task = asyncio.ensure_future(conn.request("session/prompt", {}))
+    await asyncio.sleep(0)  # let the request register its pending future
+
+    # Peer closes the stream (EOF): the reader loop exits on its own and fails
+    # the pending future before anyone calls aclose.
+    reader.feed_eof()
+    with pytest.raises(AcpError):
+        await asyncio.wait_for(task, 1.0)
+
+    # aclose AFTER the loop already exited must still release the writer.
+    await conn.aclose()
+    assert writer.closed is True
+
+    # And stay idempotent on a second call.
+    await conn.aclose()
+
+
+@pytest.mark.asyncio
 async def test_garbage_line_does_not_kill_reader_loop():
     reader = asyncio.StreamReader()
     writer = FakeWriter()
