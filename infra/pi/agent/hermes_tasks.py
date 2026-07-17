@@ -167,6 +167,12 @@ class HermesTask:
     # True once the spoken background report was fired (_deliver's
     # generate_reply call succeeded) — "отчитался".
     delivered: bool = False
+    # True once this finished task's result was surfaced to the user through a
+    # list_tasks() status read ("как там?"). The proactive _deliver report is then
+    # redundant — the LLM already had the result in hand and voiced it — so it is
+    # suppressed to avoid speaking the same outcome twice (status answer, then a
+    # duplicate "кстати, по той задаче…").
+    surfaced_in_status: bool = False
     # Fast-window handshake (see delegate): ``awaiting_sync`` is True only while a
     # delegate() call is racing this task's ``first_result`` against the fast
     # window; ``completion_pending`` is set by _on_task_complete when the task
@@ -477,6 +483,10 @@ class HermesTaskManager:
                 preview = self._trim(t.result, 80) if t.result else ""
                 tail = f": {preview}" if preview else ""
                 items.append(f"«{t.label}» [{state_ru[t.state]}]{tail}")
+                # The LLM now has this finished task's result to voice in its status
+                # answer, so a later proactive _deliver would just repeat it. Mark it
+                # surfaced so any still-pending delivery skips (dedup, see _deliver).
+                t.surfaced_in_status = True
             parts.append("завершено: " + "; ".join(items))
         return ". ".join(parts) + "."
 
@@ -870,6 +880,18 @@ class HermesTaskManager:
             # cancel() already returned a spoken confirmation as its tool result;
             # a proactive "report" about a task the user just killed is noise.
             return
+        if task.surfaced_in_status:
+            # The user already asked "как там?" and the LLM voiced this result from
+            # the list_tasks() status read — a proactive report now would duplicate
+            # it. (Also re-checked after the pause wait, since the status query can
+            # land during that window.)
+            log.info(
+                "hermes task %s (%s): already surfaced via list_tasks — "
+                "skipping proactive report (avoids duplicate)",
+                task.task_id,
+                task.label,
+            )
+            return
         if self._session is None:
             log.info(
                 "hermes task %s (%s): no session attached — report not spoken "
@@ -894,6 +916,16 @@ class HermesTaskManager:
         # the framework queues the actual speech, which is acceptable ordering.
         async with self._delivery_lock:
             barged_in = await self._wait_for_pause()
+            if task.surfaced_in_status:
+                # Status query ("как там?") landed during the pause wait and the
+                # LLM already voiced this result — drop the now-duplicate report.
+                log.info(
+                    "hermes task %s (%s): surfaced via list_tasks during the "
+                    "delivery wait — skipping duplicate report",
+                    task.task_id,
+                    task.label,
+                )
+                return
             # The pause wait can block up to delivery_fallback_s (~15s); the user
             # may disconnect in that window, stopping the session. generate_reply
             # then raises RuntimeError("AgentSession isn't running") — expected on

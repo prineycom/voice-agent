@@ -1201,6 +1201,41 @@ async def test_delivery_barges_in_after_fallback_when_busy(
 
 
 @pytest.mark.asyncio
+async def test_status_read_suppresses_duplicate_delivery(monkeypatch, fake_acp_exec):
+    """No duplicate report: if the user asks status (list_tasks) while a finished
+    task's proactive delivery is still parked, the LLM voices the result from the
+    status read, so _deliver must skip instead of speaking the same outcome again.
+    """
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")], result={"text": "итог задачи"}, delay=0.3
+    )
+    mgr = make_manager(
+        monkeypatch, proc, fake_acp_exec, fast_window_s=0.05, delivery_fallback_s=0.5
+    )
+    session = FakeSessionWithAgent()
+    session.idle_event.clear()  # busy: delivery parks in _wait_for_pause
+    mgr.attach_session(session)
+
+    await mgr.delegate("долгая задача")
+    task = only_task(mgr)
+    await mgr.join()  # task finished; delivery worker now waiting for a pause
+
+    # User asks "как там?" while delivery is still parked → the finished result is
+    # surfaced (and the LLM would voice it from this status answer).
+    status = mgr.list_tasks()
+    assert "итог" in status.lower()
+    assert task.surfaced_in_status
+
+    # Let the delivery fallback elapse; the proactive report must be suppressed.
+    await asyncio.sleep(0.7)
+    assert session.replies == []  # no duplicate proactive report
+    assert not task.delivered
+
+
+@pytest.mark.asyncio
 async def test_delivery_reports_failure_honestly(monkeypatch, fake_acp_exec):
     from conftest import FakeAcpProc
 
