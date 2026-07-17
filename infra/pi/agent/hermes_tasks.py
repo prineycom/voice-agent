@@ -297,6 +297,9 @@ class HermesTaskManager:
             return DIRECTIVE_QUEUED.format(task_id=task.task_id)
 
         task = self._start_task(request)
+        log.info(
+            "delegate: task %s admitted (%s)", task.task_id, self._trim(request, 80)
+        )
         self._emit_delegated(task)
         self._emit_tasks()
 
@@ -313,6 +316,11 @@ class HermesTaskManager:
                     # Cancelled while the window was open: no result is coming, so
                     # the background promise would be a lie.
                     return DIRECTIVE_SYNC_CANCELLED.format(task_id=task.task_id)
+                log.info(
+                    "delegate: task %s (%s) → BACKGROUND (fast window elapsed)",
+                    task.task_id,
+                    task.label,
+                )
                 return DIRECTIVE_BACKGROUND.format(task_id=task.task_id)
 
             if task.state == "cancelled":
@@ -323,7 +331,14 @@ class HermesTaskManager:
             # Result landed within the window → deliver it as the tool result.
             task.delivered_synchronously = True
             if task.state == "failed":
+                log.info("delegate: task %s (%s) → SYNC FAILED", task.task_id, task.label)
                 return DIRECTIVE_SYNC_FAILED.format(error=text)
+            log.info(
+                "delegate: task %s (%s) → SYNC WIN (%d chars to LLM)",
+                task.task_id,
+                task.label,
+                len(text or ""),
+            )
             return text
         finally:
             # ALWAYS close the window — win, timeout, delegate() itself being
@@ -729,6 +744,13 @@ class HermesTaskManager:
         before any spoken report, so the LLM reads the authoritative tool result
         instead of re-delegating.
         """
+        log.info(
+            "finalize: task %s (%s) state=%s result=%d chars → reintegrate+deliver",
+            task.task_id,
+            task.label,
+            task.state,
+            len(task.result or ""),
+        )
         await self._reintegrate(task)
         await self._deliver(task)
 
@@ -787,6 +809,13 @@ class HermesTaskManager:
             # overwrite this pair. We read the FRESHEST agent.chat_ctx here, right
             # before the replace, to keep the copy→update gap to that single await.
             #
+            # exclude_invalid_function_calls MUST be False: it defaults to True,
+            # which makes update_chat_ctx DROP any FunctionCall/FunctionCallOutput
+            # whose name is not a registered agent tool. `task_result` is a
+            # synthetic tool name (never registered), so the default silently
+            # strips this whole pair — the result then never reaches chat_ctx and
+            # the LLM re-delegates. Keeping it False persists the synthetic turn.
+            #
             # Residual race (needs live-Pi confirmation of livekit-agents
             # semantics): this lock serializes finalizers against each OTHER, not
             # against the framework's own chat_ctx writes. A user/assistant item
@@ -797,8 +826,12 @@ class HermesTaskManager:
             # once a livekit-agents version is confirmed to expose one.
             async with self._chat_ctx_lock:
                 chat_ctx = agent.chat_ctx.copy()
+                before = len(chat_ctx.items)
                 chat_ctx.insert(turn)
-                await agent.update_chat_ctx(chat_ctx)
+                await agent.update_chat_ctx(
+                    chat_ctx, exclude_invalid_function_calls=False
+                )
+                after = len(agent.chat_ctx.items)
         except Exception:  # noqa: BLE001 — must not crash the manager
             log.exception(
                 "hermes task %s (%s): reintegration failed — result NOT recorded "
@@ -808,6 +841,16 @@ class HermesTaskManager:
             )
             return
         task.reintegrated = True
+        log.info(
+            "reintegrate: task %s (%s) task_result written to chat_ctx "
+            "(items %d→%d, output=%d chars, is_error=%s)",
+            task.task_id,
+            task.label,
+            before,
+            after,
+            len(output),
+            task.state != "done",
+        )
 
     async def _deliver(self, task: HermesTask) -> None:
         """Speak the finished background task's report (ADR-0022 bounded delivery).
@@ -851,6 +894,22 @@ class HermesTaskManager:
         # the framework queues the actual speech, which is acceptable ordering.
         async with self._delivery_lock:
             barged_in = await self._wait_for_pause()
+            # The pause wait can block up to delivery_fallback_s (~15s); the user
+            # may disconnect in that window, stopping the session. generate_reply
+            # then raises RuntimeError("AgentSession isn't running") — expected on
+            # teardown, not an error (the answer is already safe in chat_ctx).
+            # Re-check the session's activity (the same gate generate_reply uses)
+            # and skip quietly instead of logging a scary traceback. Guard on
+            # hasattr so a stand-in session without the attribute (tests) is
+            # treated as running — only a REAL session that went None is skipped.
+            if hasattr(self._session, "_activity") and self._session._activity is None:
+                log.info(
+                    "hermes task %s (%s): session stopped before delivery — "
+                    "report not spoken (result is safe in chat_ctx)",
+                    task.task_id,
+                    task.label,
+                )
+                return
             template = (
                 DELIVERY_INSTRUCTIONS_DONE
                 if task.state == "done"
@@ -874,6 +933,14 @@ class HermesTaskManager:
                 )
                 return
             task.delivered = True
+            log.info(
+                "deliver: task %s (%s) spoken report fired (barge_in=%s, "
+                "reintegrated=%s)",
+                task.task_id,
+                task.label,
+                barged_in,
+                task.reintegrated,
+            )
 
     async def _wait_for_pause(self) -> bool:
         """Race a natural conversation pause against ``delivery_fallback_s``.

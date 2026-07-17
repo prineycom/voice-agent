@@ -112,6 +112,42 @@ class FakeAgent:
         self._ctx = chat_ctx
 
 
+class FilteringAgent:
+    """Mirrors the REAL livekit Agent.update_chat_ctx: with its default
+    ``exclude_invalid_function_calls=True`` it DROPS any FunctionCall /
+    FunctionCallOutput whose ``name`` is not a registered tool. Guards the live
+    reintegration bug where the synthetic ``task_result`` pair (never a real
+    tool) was silently stripped, so the result never reached chat_ctx and the
+    LLM re-delegated. Reintegration must pass ``exclude_invalid_function_calls=False``.
+    """
+
+    #: actually-registered tools — ``task_result`` is deliberately NOT among them
+    REGISTERED_TOOLS = {"delegate", "cancel", "list_tasks", "run_command"}
+
+    def __init__(self):
+        self._ctx = FakeChatCtx()
+
+    @property
+    def chat_ctx(self):
+        return self._ctx
+
+    async def update_chat_ctx(self, chat_ctx, *, exclude_invalid_function_calls=True):
+        from livekit.agents.llm import FunctionCall, FunctionCallOutput
+
+        if exclude_invalid_function_calls:
+            chat_ctx = FakeChatCtx(
+                [
+                    i
+                    for i in chat_ctx.items
+                    if not (
+                        isinstance(i, (FunctionCall, FunctionCallOutput))
+                        and getattr(i, "name", None) not in self.REGISTERED_TOOLS
+                    )
+                ]
+            )
+        self._ctx = chat_ctx
+
+
 class FakeSessionWithAgent(FakeSession):
     """FakeSession that also exposes current_agent, for chat-context injection."""
 
@@ -877,6 +913,42 @@ async def test_background_result_reintegrated_as_tool_turn(
         getattr(i, "role", None) == "system"
         for i in session.current_agent.chat_ctx.items
     )
+
+
+@pytest.mark.asyncio
+async def test_reintegration_survives_invalid_function_call_filter(
+    monkeypatch, fake_acp_exec
+):
+    """Regression (live bug): update_chat_ctx defaults to
+    exclude_invalid_function_calls=True, which strips FunctionCall/Output whose
+    name isn't a registered tool. The synthetic ``task_result`` pair MUST survive
+    — reintegration passes exclude_invalid_function_calls=False. Without it the
+    result never reaches chat_ctx and the agent re-delegates endlessly."""
+    from conftest import FakeAcpProc
+
+    proc = FakeAcpProc()
+    proc.script_prompt(
+        updates=[acp_tool_call("t", "step")],
+        result={"text": "ответ из фона"},
+        delay=0.3,
+    )
+    mgr = make_manager(monkeypatch, proc, fake_acp_exec, fast_window_s=0.05)
+    session = FakeSessionWithAgent()
+    session.current_agent = FilteringAgent()  # filters like the real Agent
+    mgr.attach_session(session)
+
+    directive = await mgr.delegate("долгая задача")
+    task = only_task(mgr)
+    assert task.task_id in directive  # backgrounded
+
+    await mgr.join()
+    assert await wait_for(lambda: task.reintegrated)
+
+    # The pair survived the framework's invalid-function-call filter.
+    calls, outs = tool_turn_pair(session)
+    assert len(calls) == 1 and len(outs) == 1
+    assert calls[0].name == "task_result"
+    assert outs[0].output == task.result
 
 
 @pytest.mark.asyncio
