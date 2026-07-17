@@ -482,6 +482,12 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=vad,
         turn_detection="vad",
         userdata=hermes_manager,
+        # Default is 3: after 3 tool calls in a turn the framework forces
+        # tool_choice="none" and DROPS any further tool call. A stray/failed
+        # tool call (e.g. the LLM reaching for a wrong command) would then wall
+        # off the real `delegate`/`list_tasks` call. Give delegation headroom so
+        # one bad step never swallows the correct one.
+        max_tool_steps=8,
     )
 
     # First-audio latency (req #6): log LLM time-to-first-token and TTS
