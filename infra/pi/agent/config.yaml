@@ -20,4 +20,4 @@ worker_tools:
   max_queued: 5                # FIFO overflow queue cap (beyond it: refuse + ask user to wait)
   task_timeout_s: 300          # hard ceiling per delegated task; over it → cancel + report failure
   delivery_fallback_s: 15      # max wait for a conversation pause before soft barge-in delivery
-  output_limit_chars: 600      # trim each Hermes result to this before it reaches the LLM/TTS
+  output_limit_chars: 4000     # cap on the Hermes result handed to the LLM (it summarizes for voice itself); aligned with the UI full-output cap so the agent never sees less than the browser
