@@ -2,10 +2,18 @@
 tags:
   - voice-agent
   - adr
-status: accepted
+status: superseded
+superseded-by: 0022-hermes-acp-hybrid-delegation
 ---
 
 # Hermes Integration: Direct CLI Subprocess via Whitelisted run_command Tool
+
+> **Superseded by [ADR-0022](0022-hermes-acp-hybrid-delegation.md) (2026-07-16).**
+> The per-call `hermes chat -q … -Q` subprocess and the fire-and-forget
+> `HermesTaskManager` async update below are replaced by a long-lived `hermes acp`
+> streaming client with hybrid fast-window delegation and tool-linked result
+> reintegration. `run_command` survives only as a literal-shell-command escape
+> hatch. Retained here for history.
 
 The Agent Worker reaches Hermes by shelling out to the `hermes` CLI as an async
 subprocess, exposed to the LLM as ONE generic `livekit.agents.function_tool`,

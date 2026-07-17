@@ -168,6 +168,40 @@ async def test_activity_resets_timer():
 
 
 @pytest.mark.asyncio
+async def test_does_not_sleep_while_user_speaking():
+    # A long single utterance has no turn boundary to reset the timer; the live
+    # speech probe must keep the agent Active until the user actually goes quiet.
+    speaking = {"v": True}
+    ws = WakeState(
+        enabled=True,
+        followup=True,
+        silence_timeout=0.05,
+        is_user_speaking=lambda: speaking["v"],
+    )
+    ws.on_wake_detected("hey_jarvis", 0.8)
+    await asyncio.sleep(0.2)  # several timeout periods elapse while still speaking
+    assert ws.active is True  # deferred, not slept
+    speaking["v"] = False     # user stops → next timeout sleeps normally
+    await asyncio.sleep(0.12)
+    assert ws.active is False
+
+
+@pytest.mark.asyncio
+async def test_speaking_probe_can_be_injected_after_construction():
+    # The AgentSession is built after WakeState, so the probe is wired via the
+    # setter; it must take effect for the silence timer just the same.
+    speaking = {"v": True}
+    ws = WakeState(enabled=True, followup=True, silence_timeout=0.05)
+    ws.set_user_speaking_source(lambda: speaking["v"])
+    ws.on_wake_detected("hey_jarvis", 0.8)
+    await asyncio.sleep(0.15)
+    assert ws.active is True
+    speaking["v"] = False
+    await asyncio.sleep(0.12)
+    assert ws.active is False
+
+
+@pytest.mark.asyncio
 async def test_strict_mode_has_no_persistent_timer():
     ws = WakeState(enabled=True, followup=False, silence_timeout=0.05)
     ws.on_wake_detected("hey_jarvis", 0.8)

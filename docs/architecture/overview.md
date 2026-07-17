@@ -2,7 +2,7 @@
 
 > **Project:** [prineycom/voice-agent](https://github.com/prineycom/voice-agent)  
 > **Branch:** `epic-4-agent-worker`  
-> **Last updated:** 2026-06-25
+> **Last updated:** 2026-07-16
 
 ---
 
@@ -51,9 +51,11 @@ The system splits across two machines:
 │  │  └────┬─────┘  └────┬─────┘  └────┬─────┘           │       │
 │  │       │             │             │                  │       │
 │  │  ┌────▼─────────────▼─────────────▼────────────┐    │       │
-│  │  │  HermesTaskManager (async background tasks)  │    │       │
+│  │  │  hermes_tasks.py (task manager, per-task)     │    │       │
 │  │  │  ┌─────────────────────────────────────────┐ │    │       │
-│  │  │  │  run_command(args) → hermes chat CLI    │ │    │       │
+│  │  │  │  delegate() → AcpClient → hermes acp    │ │    │       │
+│  │  │  │  (long-lived stdio process, supervised) │ │    │       │
+│  │  │  │  run_command(args) → literal shell only │ │    │       │
 │  │  │  └─────────────────────────────────────────┘ │    │       │
 │  │  └──────────────────────────────────────────────┘    │       │
 │  └──────────────────────┬──────────────────────────────┘       │
@@ -115,7 +117,7 @@ The core orchestrator. A Python process using the [LiveKit Agents](https://githu
 - Loads config → SOUL.md → Worker Skill → health gates → connects to room
 - Creates `AgentSession` with STT + LLM + TTS + local Silero VAD
 - Registers `GreetingAgent` (speaks on `on_enter`)
-- Wires `HermesTaskManager` into session userdata for background delegation
+- Spawns the long-lived `hermes acp --accept-hooks` process at startup (supervised: crash → respawn) and wires the task manager (`hermes_tasks.py`) into session userdata for hybrid delegation
 - Logs first-audio latency (LLM TTFT, TTS TTFB) via `metrics_collected` hook
 
 **Flow per room join:**
@@ -125,7 +127,7 @@ The core orchestrator. A Python process using the [LiveKit Agents](https://githu
 4. `check_stt_health()` + `check_tts_health()` — GET Desktop `/health`, abort if either is down
 5. `silero.VAD.load()` — local ONNX VAD on Pi (no cloud)
 6. `ctx.connect()` — join LiveKit room
-7. `make_hermes_manager()` — create background task manager
+7. Spawn/attach `AcpClient` (`hermes acp --accept-hooks`, ndjson JSON-RPC over stdio) and create the task manager
 8. `AgentSession.start(GreetingAgent(...))` — begin STT→LLM→TTS loop
 
 #### Config: `config.py` (119 lines)
@@ -156,27 +158,32 @@ The core orchestrator. A Python process using the [LiveKit Agents](https://githu
 - Requires HTTP 200 + `model_loaded: true`
 - `STTHealthError` / `TTSHealthError` with actionable messages
 
-#### Hermes Delegation: `hermes_tasks.py` (278 lines)
+#### ACP Transport: `acp_client.py`
 
-- `HermesTaskManager` — async background task queue
-- `delegate(request)` → spawns `hermes chat -q <request> -Q --yolo --source tool [--resume <sid>]`
-- Configurable: `max_concurrent` (3), `max_queued` (5), `task_timeout` (300s)
-- Progress nudges every 25s (max 3) — agent says "ещё работаю"
-- Results delivered proactively via `session.generate_reply(instructions=...)`
-- Session ID extracted from stderr, reused via `--resume` for context continuity
+- `AcpConnection` — ndjson JSON-RPC codec over the `hermes acp --accept-hooks` subprocess's stdio
+- `AcpClient` — supervisor for the single long-lived process: spawned at worker startup (cold `initialize` ~8s, so never on first delegation), health-checked, respawned on crash; Hermes being down degrades gracefully and never crashes the agent
+- `initialize {protocolVersion:1}` → `session/new {cwd, mcpServers}` → `session/prompt {sessionId, prompt}` per task; consumes `session/update` notifications (tool_call / tool_call_update) and answers `session/request_permission` defensively
+- One `session/new` per delegated task, up to `max_concurrent` (3) concurrent sessions on the one process
+
+#### Hermes Task Manager: `hermes_tasks.py`
+
+- Task manager: one live per-task state (running / last-tool / step-counter / done / failed), one ACP session per task
+- `delegate(request)` — hybrid **8s fast window**: races the ACP result against a timer; ≤8s → reply returned **synchronously as the tool result**; >8s → returns `task_id`, continues in the background
+- Milestone narration — ACP `tool_call`/`tool_call_update` events mapped through a template phrase map, spoken via `session.say` (ephemeral: never written to `chat_ctx`, never interrupts the user)
+- On completion: appends a **synthetic tool turn** to `chat_ctx` immediately — `assistant{tool_calls:[{name:"task_result",...}]}` + `tool{content:<answer>}` — so the result is a first-class, tool-linked context entry, not a floating system message
+- Delivery: waits for a conversational pause (≤15s) to speak the report via `session.generate_reply`; past that, a soft barge-in ("кстати, по той задаче…")
+- Failure/timeout (300s cap): same synthetic-tool-turn shape with an honest error report, task state `failed`, **no auto-retry**
+- Configurable via `config.yaml` `worker_tools`: `fast_window_s`, `max_concurrent`, `task_timeout_s`, `delivery_fallback_s`
 - `cancel(hint)` — cancel by substring or all
 - `shutdown()` — cancel everything on room disconnect
 
-#### Worker Tools: `worker_tools.py` (247 lines)
+#### Worker Tools: `worker_tools.py`
 
-- `run_command(args: str)` — single `@function_tool`, whitelist-gated
-- Parses args with `shlex`, checks `tokens[0]` against `config.yaml` whitelist
-- Runs via `asyncio.create_subprocess_exec` (async, non-blocking)
-- Timeout: 120s (configurable), kills child on timeout
-- Returns stdout string; folds `session_id:` from stderr into output
-- `delegate_to_hermes(request)` — thin wrapper → `HermesTaskManager.delegate()`
-- `cancel_hermes_tasks(hint)` — thin wrapper → `HermesTaskManager.cancel()`
-- `list_hermes_tasks()` — thin wrapper → `HermesTaskManager.list_tasks()`
+- `@function_tool` adapters exposed to the LLM:
+  - `delegate(request)` — any free-form intent/task → routed through `hermes_tasks.py`'s hybrid fast-window path
+  - `run_command(cmd: str)` — **literal shell command only** (`git log`, `df -h`); free-form requests ("найди…", "сделай…") are explicitly forbidden here (enforced in the docstring + `skills/hermes.md`), parsed with `shlex` and checked against the `config.yaml` whitelist, run via `asyncio.create_subprocess_exec`, 120s timeout (configurable), kills child on timeout
+  - `list_tasks()` — reads the single live per-task state from `hermes_tasks.py`
+  - `cancel(hint)` — thin wrapper → task manager's `cancel()`
 
 #### SOUL: `SOUL.md` (41 lines)
 
@@ -188,8 +195,8 @@ The core orchestrator. A Python process using the [LiveKit Agents](https://githu
 #### Worker Skill: `skills/hermes.md` (45 lines)
 
 - Appended to instructions alongside SOUL
-- Teaches LLM the async delegation pattern
-- Documents `delegate_to_hermes`, `cancel_hermes_tasks`, `list_hermes_tasks`
+- Teaches LLM the hybrid delegation pattern (fast-window `delegate` vs. literal-only `run_command`)
+- Documents `delegate`, `run_command`, `list_tasks`, `cancel`
 - Principle: "never do work yourself — always through Hermes"
 
 ### 2.3 LiteLLM Proxy (`infra/pi/litellm/config.yaml`)
@@ -300,7 +307,10 @@ Agent Worker publishes audio to LiveKit room
 Browser plays audio, shows transcript, animates avatar
 ```
 
-### Hands-and-Mouth Split (Tool Calling)
+### Hands-and-Mouth Split (Tool Calling): Hybrid Fast-Window Delegation
+
+Per ADR-0022. `delegate(request)` races the ACP result against an **8s fast
+window**; the two branches below diverge only after that timer.
 
 ```
 User: "Найди погоду в Москве"
@@ -309,25 +319,46 @@ User: "Найди погоду в Москве"
 Agent Worker LLM decides: needs tool
         │
         ▼
-Calls delegate_to_hermes("найди погоду в Москве")
-        │
-        ├── Returns immediately: "Запущено в фоне"
+Calls delegate("найди погоду в Москве")
         │
         ▼
-Agent says: "Сейчас гляну" (continues conversation)
+hermes_tasks.py opens session/new on the long-lived hermes acp process,
+sends session/prompt, races the result against 8s
         │
-        ▼
-HermesTaskManager spawns: hermes chat -q "найди погоду в Москве" -Q --yolo --source tool
+        ├── ≤8s: reply returned synchronously as the tool result
+        │        → Agent LLM re-voices it in SOUL style directly, no
+        │          further round trip
         │
-        ▼
-Hermes CLI: web search → reads result → returns answer + session_id
-        │
-        ▼
-HermesTaskManager._deliver() calls session.generate_reply(instructions=...)
-        │
-        ▼
-Agent LLM re-voices result in SOUL style: "В Москве сейчас +22, ясно"
+        └── >8s: tool returns task_id, drops to background
+                 │
+                 ▼
+            Agent says: "Сейчас гляну" (continues conversation)
+                 │
+                 ▼
+            ACP streams tool_call / tool_call_update events →
+            milestone narration via session.say (e.g. "смотрю
+            погоду…"), never written to chat_ctx, never interrupts
+            the user
+                 │
+                 ▼
+            Task completes → hermes_tasks.py immediately appends a
+            synthetic tool turn to chat_ctx:
+            assistant{tool_calls:[{name:"task_result",...}]} +
+            tool{content:<answer>}
+                 │
+                 ▼
+            Waits for a conversational pause (≤15s), then
+            session.generate_reply (or a soft barge-in past that
+            window)
+                 │
+                 ▼
+            Agent LLM reads the tool-linked result and re-voices it
+            in SOUL style: "В Москве сейчас +22, ясно"
 ```
+
+On failure or the 300s timeout cap, the same synthetic-tool-turn shape
+carries an honest error report (task state `failed`); there is no
+auto-retry.
 
 ---
 
@@ -341,7 +372,8 @@ Agent LLM re-voices result in SOUL style: "В Москве сейчас +22, я�
 | 0004 | LLM model: nemotron-3-super via LiteLLM | [ADR-0004](../adr/0004-llm-model.md) |
 | 0005 | Private network + Tailscale TLS (no public exposure) | [ADR-0005](../adr/0005-edge-tls-caddy.md) |
 | 0006 | Turn control: LiveKit owns endpointing + interruption | [ADR-0006](../adr/0006-agent-turn-control.md) |
-| 0007 | Hermes via CLI subprocess (not MCP) | [ADR-0007](../adr/0007-hermes-cli-delegation.md) |
+| 0007 | Hermes via CLI subprocess (not MCP) — superseded by 0022 | [ADR-0007](../adr/0007-hermes-cli-delegation.md) |
+| 0022 | Hermes delegation v2: long-lived ACP transport + hybrid fast-window delegation | [ADR-0022](../adr/0022-hermes-acp-hybrid-delegation.md) |
 
 ---
 
@@ -356,7 +388,7 @@ voice-agent/
 ├── README.md                          # Root README
 │
 ├── docs/
-│   ├── adr/                           # Architecture Decision Records (7 files)
+│   ├── adr/                           # Architecture Decision Records
 │   ├── plans/                         # Implementation plans
 │   ├── superpowers/plans/             # Superpowers planning docs
 │   └── superpowers/specs/             # Design specifications
@@ -383,10 +415,11 @@ voice-agent/
 │       ├── agent/                     # Agent Worker (core orchestrator)
 │       │   ├── agent.py               # Entrypoint, AgentSession wiring
 │       │   ├── config.py              # AgentConfig dataclass + .env loader
-│       │   ├── config.yaml            # Whitelist + Hermes task limits
+│       │   ├── config.yaml            # Whitelist + Hermes worker_tools limits (fast_window_s, max_concurrent, ...)
 │       │   ├── health.py              # STT/TTS startup health gates
-│       │   ├── hermes_tasks.py        # Async HermesTaskManager
-│       │   ├── worker_tools.py        # run_command + function_tool adapters
+│       │   ├── acp_client.py          # AcpConnection codec + AcpClient supervisor (hermes acp process)
+│       │   ├── hermes_tasks.py        # Task manager: per-task state, hybrid fast-window delegate
+│       │   ├── worker_tools.py        # delegate/run_command/list_tasks/cancel function_tool adapters
 │       │   ├── stt_plugin.py          # DesktopSTT plugin
 │       │   ├── tts_plugin.py          # DesktopTTS plugin
 │       │   ├── SOUL.md                # LLM personality (system prompt)
@@ -429,6 +462,8 @@ voice-agent/
 | STT latency | ≤300ms | ~300ms |
 | Concurrent Hermes tasks | 3 | 3 |
 | Hermes task timeout | 300s | 300s |
+| Hermes fast window (sync reply) | 8s | 8s |
+| Hermes delivery fallback (pause window) | 15s | 15s |
 | run_command timeout | 120s | 120s |
 
 ---
@@ -440,7 +475,7 @@ voice-agent/
 - **LiveKit keys** in `.env` (gitignored), readable by `docker inspect` (acceptable for single-purpose edge node)
 - **LiteLLM master key** in systemd `EnvironmentFile` (mode 600)
 - **Hermes whitelist** in `config.yaml` — only `hermes` command allowed by default
-- **No MCP bridge** — direct CLI subprocess, no network-accessible tool server
+- **No MCP bridge** — a long-lived `hermes acp` stdio process (Agent Client Protocol, JSON-RPC over stdin/stdout), not a network-accessible tool server
 - **STT/TTS health gates** — agent refuses to join room if Desktop services are down
 
 ---

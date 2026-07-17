@@ -1,9 +1,19 @@
-"""Worker tool — generic whitelisted CLI command runner.
+"""Worker tools — literal-shell escape hatch + async Hermes delegation.
 
-Exposes ONE `livekit.agents.function_tool`, `run_command(args)`, that lets the
-agent's LLM run any CLI command whose first token is on the whitelist defined in
+Hermes delegation runs over a long-lived `hermes acp` (Agent Client Protocol)
+streaming client — one persistent process spawned at worker startup, one ACP
+session per delegated task (see docs/adr/0022-hermes-acp-hybrid-delegation.md,
+which supersedes docs/adr/0007-hermes-cli-delegation.md). Free-form intent
+("найди мои задачи", "сделай X") goes through the `delegate` tool, which races
+the task against an 8s fast window and backgrounds it past that, later
+reintegrating the result as a synthetic tool turn.
+
+This module also exposes `run_command(args)`, a narrow, separate escape hatch:
+a `livekit.agents.function_tool` that lets the agent's LLM run a LITERAL shell
+command line whose first token is on the whitelist defined in
 `infra/pi/agent/config.yaml` (`worker_tools.allowed_commands`, default
-`["hermes"]`).
+`["hermes"]`). It is not a natural-language interface — free-form asks are
+explicitly out of scope for `run_command` and must go to `delegate` instead.
 
 Design (see CONTEXT.md → Hermes Tools / run_command):
 - The LLM composes the full CLI args string (taught by skills/hermes.md).
@@ -20,8 +30,9 @@ Design (see CONTEXT.md → Hermes Tools / run_command):
 - Graceful degradation: a non-whitelisted command, a missing binary, or a
   non-zero exit returns a clear error STRING (never raises) so the agent keeps
   talking instead of crashing the turn. Hermes being down is a recoverable
-  condition, not a startup-fatal one (unlike STT/TTS, which gate startup).
-- No MCP, no messaging bridge, no `hermes mcp serve`. Direct CLI subprocess only.
+  condition, not a startup-fatal one (unlike STT/TTS, which gate startup). The
+  long-lived ACP client backing `delegate` follows the same doctrine: a crash
+  is a respawn-and-report-honestly event, never a startup gate.
 
 Config (`infra/pi/agent/config.yaml`):
     worker_tools:
@@ -43,7 +54,10 @@ import yaml
 from livekit.agents import function_tool
 from livekit.agents.voice.events import RunContext
 
+from acp_client import AcpClient
 from hermes_tasks import (
+    DEFAULT_DELIVERY_FALLBACK_S,
+    DEFAULT_FAST_WINDOW_S,
     DEFAULT_MAX_CONCURRENT,
     DEFAULT_MAX_QUEUED,
     DEFAULT_OUTPUT_LIMIT,
@@ -108,17 +122,21 @@ def _invalidate_config_cache() -> None:
 
 @function_tool
 async def run_command(args: str) -> str:
-    """Run a whitelisted CLI command on the Pi and return its stdout.
+    """Run a LITERAL shell command line on the Pi and return its output.
 
-    Pass the full command line as a single string, e.g.
-    `run_command("hermes chat -q 'what is 2+2' -Q --yolo --source tool")`.
-    The first token must be a whitelisted command (default: `hermes`); anything
-    else is rejected. Quote arguments that contain spaces with single quotes.
+    This tool accepts ONLY a literal command line, e.g. `run_command("uname -a")`
+    or `run_command("hermes memory list")`. The first token must be a
+    whitelisted command (default: `hermes`); anything else is rejected. Quote
+    arguments that contain spaces with single quotes.
 
-    Returns the command's stdout (the final response, plus for Hermes a trailing
-    `session_id:` line you should reuse via `--resume <session_id>`). On
-    rejection, missing binary, timeout, or non-zero exit, returns a short error
-    string describing the failure — never raises.
+    FORBIDDEN: free-form natural-language intent or requests, e.g.
+    `run_command("найди мои задачи")` or `run_command("сделай X")`. Those must
+    go to the `delegate` tool, not here — `run_command` does not interpret
+    intent, it only execs the literal command line you give it.
+
+    Returns the command's stdout/stderr tail. On rejection, missing binary,
+    timeout, or non-zero exit, returns a short error string describing the
+    failure — never raises.
     """
     try:
         tokens = shlex.split(args)
@@ -167,29 +185,29 @@ async def run_command(args: str) -> str:
         log.warning("run_command %r exited %s; stderr: %s", command, proc.returncode, tail)
         return f"run_command: '{command}' exited {proc.returncode}: {tail}"
 
-    # Hermes emits the `session_id:` line on STDERR in -Q mode (not stdout).
-    # The LLM needs it to resume the same Hermes session via --resume, so fold
-    # any `session_id:` line from stderr into the returned output. Other stderr
-    # noise (spinner remnants, warnings) is ignored.
-    sid_lines = [ln for ln in stderr.splitlines() if ln.strip().startswith("session_id:")]
-    if not stdout and not sid_lines:
+    if not stdout:
         return "(no output)"
-    parts = []
-    if sid_lines:
-        parts.append(sid_lines[-1].strip())
-    if stdout:
-        parts.append(stdout)
-    return "\n".join(parts)
+    return stdout
 
 
 # --------------------------------------------------------------------------- #
 # Async Hermes delegation: background task manager + thin function_tool adapters
 # --------------------------------------------------------------------------- #
-def make_hermes_manager() -> HermesTaskManager:
-    """Construct a HermesTaskManager using worker_tools.* knobs from config.yaml.
+def make_hermes_manager(acp_client: AcpClient | None = None) -> HermesTaskManager:
+    """Construct a HermesTaskManager over an AcpClient using config.yaml knobs.
 
-    Missing keys fall back to the module defaults so the worker always boots.
-    Stored in AgentSession.userdata; the tool adapters reach it from there.
+    Reads the ACP hybrid-delegation knobs from ``worker_tools.*`` (ADR-0022);
+    missing keys fall back to the module defaults so the worker always boots.
+
+    ``acp_client`` lets the caller pass an AcpClient it created (and will
+    ``start()``) eagerly at worker startup — cold ``initialize`` is ~8.5s, so
+    production spawns it up front rather than paying that on the first delegation.
+    When omitted, a fresh AcpClient is constructed and spawned lazily on first use
+    (respawn-on-demand), which keeps tests and standalone use zero-config.
+
+    NOTE: eagerly calling ``start()`` on the client is the caller's job — this
+    factory only wires the manager; it never blocks startup itself. The manager is
+    stored in AgentSession.userdata and the tool adapters reach it from there.
     """
     try:
         raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
@@ -204,10 +222,13 @@ def make_hermes_manager() -> HermesTaskManager:
             return default
 
     return HermesTaskManager(
-        max_concurrent=_num("hermes_max_concurrent", DEFAULT_MAX_CONCURRENT, int),
-        max_queued=_num("hermes_max_queued", DEFAULT_MAX_QUEUED, int),
-        task_timeout=_num("hermes_task_timeout_seconds", DEFAULT_TASK_TIMEOUT, float),
-        output_limit=_num("hermes_output_limit_chars", DEFAULT_OUTPUT_LIMIT, int),
+        acp_client if acp_client is not None else AcpClient(),
+        fast_window_s=_num("fast_window_s", DEFAULT_FAST_WINDOW_S, float),
+        max_concurrent=_num("max_concurrent", DEFAULT_MAX_CONCURRENT, int),
+        task_timeout_s=_num("task_timeout_s", DEFAULT_TASK_TIMEOUT, float),
+        delivery_fallback_s=_num("delivery_fallback_s", DEFAULT_DELIVERY_FALLBACK_S, float),
+        max_queued=_num("max_queued", DEFAULT_MAX_QUEUED, int),
+        output_limit=_num("output_limit_chars", DEFAULT_OUTPUT_LIMIT, int),
     )
 
 
@@ -219,27 +240,45 @@ def _manager(context: RunContext) -> HermesTaskManager:
 
 
 @function_tool
-async def delegate_to_hermes(request: str, context: RunContext) -> str:
-    """Delegate a task to Hermes in the BACKGROUND and return immediately.
+async def delegate(context: RunContext, request: str) -> str:
+    """Delegate ANY free-form ask to Hermes — your hands for real work.
 
-    Use this for anything needing tools (web search, files, memory, terminal,
-    messaging, etc.). Pass a complete, specific natural-language `request`. The
-    call returns at once with a directive: give the user a brief acknowledgement
-    and keep talking — Hermes runs in the background and the result is spoken to
-    the user automatically when ready. Do NOT wait for the result in this turn.
+    Use this for anything needing tools: web search, files, terminal, memory,
+    YouTrack, messaging, multi-step work — pass a complete, specific
+    natural-language `request` ("найди…", "проверь…", "сделай…").
+
+    HYBRID timing — read the return value:
+    - FAST task (~8s): returns the ANSWER directly. Voice it to the user in THIS
+      same turn, like any tool result.
+    - SLOW task: returns a `task_id` and a "continues in the background" ack. Give
+      the user one short acknowledgement, keep talking, and do NOT wait or re-ask.
+      The result arrives on its own later as a `task_result` tool turn — report it
+      then. NEVER re-delegate the same request to check on it; use `list_tasks`
+      for status instead.
     """
-    return await _manager(context).delegate(request)
+    manager = _manager(context)
+    return await manager.delegate(request)
 
 
 @function_tool
-async def cancel_hermes_tasks(context: RunContext, hint: str = "") -> str:
-    """Cancel background Hermes tasks. Empty `hint` cancels all; a `hint` cancels
-    only tasks whose request contains it. Returns a directive to confirm to the user."""
-    return await _manager(context).cancel(hint)
+async def cancel(context: RunContext, hint: str = "") -> str:
+    """Cancel delegated Hermes tasks. Call when the user says stop / отмени / забей.
+
+    `hint` matches a task by its `task_id` or a case-insensitive substring of its
+    label; an empty `hint` cancels ALL active tasks. Returns a directive to
+    confirm the cancellation to the user.
+    """
+    manager = _manager(context)
+    return await manager.cancel(hint)
 
 
 @function_tool
-async def list_hermes_tasks(context: RunContext) -> str:
-    """List the background Hermes tasks currently running or queued, so you can
-    tell the user what you are working on."""
-    return _manager(context).list_tasks()
+async def list_tasks(context: RunContext) -> str:
+    """Live status of delegated Hermes tasks — call for "как там?", "чем занят?".
+
+    Reports what is running (current step/tool), what is queued, and recent
+    results, read straight from live task state. Use this to answer a status
+    question about an in-flight task — never re-delegate to check on one.
+    """
+    manager = _manager(context)
+    return manager.list_tasks()

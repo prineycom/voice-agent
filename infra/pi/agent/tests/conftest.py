@@ -18,9 +18,13 @@ Puts the service dir on sys.path (so `import tts_plugin`/`import health`/
 """
 
 import asyncio
+import contextlib
 import json
 import sys
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import pytest_asyncio
@@ -444,3 +448,422 @@ async def health_server():
     yield _Health()
 
     await runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Scripted fake `hermes acp` subprocess harness (real transport, scripted peer)
+#
+# `FakeAcpProc` looks like an ``asyncio.subprocess.Process`` to the code under
+# test (``AcpClient`` supervisor and the rewritten ``HermesTaskManager``) but is
+# driven entirely in-process: its ``stdin`` is a sink that parses the ndjson
+# JSON-RPC the client writes, and its ``stdout`` is a real
+# ``asyncio.StreamReader`` the fake feeds scripted response/notification lines
+# into. Behaviour is scripted per-method (``initialize`` / ``session/new``
+# defaults; ``session/prompt`` via :meth:`FakeAcpProc.script_prompt`), so tests
+# exercise the *real* ACP codec against a *scripted* peer while *recording* every
+# message the client sends. See docs/adr/0022-hermes-acp-hybrid-delegation.md.
+# ---------------------------------------------------------------------------
+
+
+def acp_tool_call(tool_id, title, *, kind="execute", status="pending"):
+    """Build ``session/update`` params for a tool-call START edge (ADR-0022).
+
+    Shape: ``{"update": {"sessionUpdate": "tool_call", "toolCallId": <id>,
+    "title": <"terminal: uname -a">, "kind": <"execute">, "status": <"pending">}}``.
+    The tool name lives in ``title`` (humanised by the manager's template map),
+    ``kind`` is the ACP tool category and ``status`` its lifecycle state. The
+    fake injects ``sessionId`` into the params when it emits the notification.
+    """
+    return {
+        "update": {
+            "sessionUpdate": "tool_call",
+            "toolCallId": tool_id,
+            "title": title,
+            "kind": kind,
+            "status": status,
+        }
+    }
+
+
+def acp_tool_call_update(tool_id, *, status="completed"):
+    """Build ``session/update`` params for a tool-call FINISH edge (ADR-0022).
+
+    Shape: ``{"update": {"sessionUpdate": "tool_call_update", "toolCallId":
+    <id>, "status": <"completed">}}`` — the closing edge correlated to the START
+    edge by ``toolCallId``.
+    """
+    return {
+        "update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_id,
+            "status": status,
+        }
+    }
+
+
+def acp_agent_message(text):
+    """Build ``session/update`` params for an assistant text chunk.
+
+    Shape: ``{"update": {"sessionUpdate": "agent_message_chunk", "content":
+    {"type": "text", "text": <text>}}}``.
+    """
+    return {
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        }
+    }
+
+
+@dataclass
+class _PromptScript:
+    """One scripted answer for a ``session/prompt`` request, consumed FIFO.
+
+    ``updates`` are ``session/update`` params dicts (see the ``acp_*`` builders)
+    emitted as notifications in order, optionally spaced by ``delay`` seconds.
+    ``server_request`` (``{"method", "params"}``, default
+    ``session/request_permission``) is emitted as a server→client request *before*
+    the updates and its response awaited/recorded. Then the prompt is answered:
+    ``error`` (a JSON-RPC error object) → error response; else ``result`` →
+    result response (defaults to ``{"stopReason": "end_turn"}``; script e.g.
+    ``result={"stopReason": "cancelled"}`` for a cancellation). ``die=True`` skips
+    the answer entirely and crashes the process mid-prompt (stdout EOF), so the
+    client's pending request fails — the crash-mid-task path.
+    """
+
+    updates: list = field(default_factory=list)
+    result: Optional[dict] = None
+    error: Optional[dict] = None
+    delay: float = 0.0
+    server_request: Optional[dict] = None
+    die: bool = False
+
+
+class _FakeStdin:
+    """An ``asyncio.StreamWriter``-like sink feeding the fake's request reader.
+
+    The client writes ndjson JSON-RPC here; every write is forwarded verbatim to
+    an internal ``StreamReader`` the servicing task reads line-by-line. Only the
+    surface the ACP codec / subprocess supervisor touches is implemented
+    (``write`` / ``drain`` / ``write_eof`` / ``close`` / ``is_closing`` /
+    ``wait_closed``). ``close`` feeds EOF so the servicer's ``readline`` returns
+    and the peer shuts down cleanly.
+    """
+
+    def __init__(self, target: asyncio.StreamReader) -> None:
+        self._target = target
+        self._closing = False
+
+    def write(self, data: bytes) -> None:
+        if self._closing:
+            return
+        self._target.feed_data(bytes(data))
+
+    async def drain(self) -> None:
+        return None
+
+    def write_eof(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        with contextlib.suppress(Exception):
+            self._target.feed_eof()
+
+    def is_closing(self) -> bool:
+        return self._closing
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class FakeAcpProc:
+    """A scripted, long-lived ndjson JSON-RPC peer that quacks like a Process.
+
+    Mirrors the spirit of ``FakeProc`` in ``test_hermes_tasks.py`` but for the
+    persistent ``hermes acp`` transport rather than a one-shot ``communicate()``.
+    It exposes the ``asyncio.subprocess.Process`` surface the code under test
+    uses — ``stdin`` (writer-like), ``stdout`` / ``stderr``
+    (``asyncio.StreamReader``), ``pid``, ``returncode``, and ``wait()`` /
+    ``terminate()`` / ``kill()`` — and runs an internal servicing task that
+    parses each inbound line as a JSON-RPC request and answers it.
+
+    Defaults: ``initialize`` → ``{"protocolVersion": 1}`` (overridable via
+    ``initialize_result``); ``session/new`` → ``{"sessionId": "sess-<n>"}``
+    (unique per call). ``session/prompt`` is answered from scripts registered
+    with :meth:`script_prompt`, matched per ``sessionId`` first then from a
+    session-agnostic FIFO fallback; an unscripted prompt gets a bare
+    ``{"stopReason": "end_turn"}``.
+
+    Recording: every inbound request/notification is appended to ``requests``;
+    every client response to a server→client request is appended to
+    ``client_responses``.
+
+    Crash modelling: ``kill()`` / ``terminate()`` (or a ``die`` script) set
+    ``returncode``, EOF ``stdout`` and unblock ``wait()`` — so a supervisor's
+    crash/respawn path can be exercised.
+    """
+
+    def __init__(self, *, initialize_result: Optional[dict] = None, pid: int = 4242) -> None:
+        self.pid = pid
+        self.returncode: Optional[int] = None
+        self.requests: list[dict] = []  # every inbound request/notification, in order
+        self.client_responses: list[dict] = []  # responses to server→client requests
+        self.terminated = False
+        self.killed = False
+        self.argv: Optional[list] = None  # set by the fake_acp_exec fixture on spawn
+
+        self._initialize_result = initialize_result or {"protocolVersion": 1}
+        self._session_seq = 0
+        self._srv_req_seq = 0
+        self._prompts_by_session: dict[str, deque] = defaultdict(deque)
+        self._default_prompts: deque = deque()
+        self._pending_srv: dict[int, asyncio.Future] = {}
+
+        # stdin: client → peer (parsed as requests). stdout/stderr: peer → client.
+        self._in_reader = asyncio.StreamReader()
+        self.stdin = _FakeStdin(self._in_reader)
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self._stdout_eof = False
+
+        self._exited = asyncio.Event()
+        self._tasks: set[asyncio.Task] = set()
+        self._servicer = asyncio.ensure_future(self._serve())
+
+    # -- Scripting ---------------------------------------------------------
+
+    def script_prompt(
+        self,
+        *,
+        updates=None,
+        result=None,
+        error=None,
+        delay=0.0,
+        server_request=None,
+        die=False,
+        session_id=None,
+    ) -> "FakeAcpProc":
+        """Queue one scripted answer for the next matching ``session/prompt``.
+
+        Scripts are consumed FIFO — per ``session_id`` when given, else from a
+        session-agnostic queue used in registration order. Returns ``self`` so
+        registrations can be chained. See :class:`_PromptScript` for the fields.
+        """
+        script = _PromptScript(
+            updates=list(updates or []),
+            result=result,
+            error=error,
+            delay=delay,
+            server_request=server_request,
+            die=die,
+        )
+        if session_id is None:
+            self._default_prompts.append(script)
+        else:
+            self._prompts_by_session[session_id].append(script)
+        return self
+
+    # -- Process surface ---------------------------------------------------
+
+    async def wait(self) -> Optional[int]:
+        """Block until the process exits (crash / kill / stdin EOF)."""
+        await self._exited.wait()
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self._crash(-15)
+
+    def kill(self) -> None:
+        self.killed = True
+        self._crash(-9)
+
+    # -- Servicing ---------------------------------------------------------
+
+    async def _serve(self) -> None:
+        """Read inbound ndjson line-by-line, recording and dispatching each."""
+        try:
+            while True:
+                line = await self._in_reader.readline()
+                if not line:
+                    break  # stdin EOF — the client closed the connection.
+                try:
+                    msg = json.loads(line)
+                except (ValueError, TypeError):
+                    continue  # tolerate garbage, like a real peer would
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("method") is None and msg.get("id") is not None:
+                    # A response to one of our server→client requests.
+                    self._resolve_server_response(msg)
+                    continue
+                self.requests.append(msg)
+                self._spawn(self._handle(msg))
+        except asyncio.CancelledError:
+            raise
+        finally:
+            # The peer is gone: settle the exit so wait() never hangs and no
+            # further response can be emitted onto a dead stdout.
+            if self.returncode is None:
+                self.returncode = 0
+            self._stdout_eof = True
+            with contextlib.suppress(Exception):
+                self.stdout.feed_eof()
+            with contextlib.suppress(Exception):
+                self.stderr.feed_eof()
+            self._exited.set()
+
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def _handle(self, msg: dict) -> None:
+        method = msg.get("method")
+        msg_id = msg.get("id")
+        params = msg.get("params") or {}
+        if method == "initialize":
+            self._respond(msg_id, dict(self._initialize_result))
+        elif method == "session/new":
+            self._session_seq += 1
+            self._respond(msg_id, {"sessionId": f"sess-{self._session_seq}"})
+        elif method == "session/prompt":
+            await self._handle_prompt(msg_id, params)
+        elif msg_id is not None:
+            # Unknown *request* — answer with method-not-found so nobody hangs.
+            self._respond_error(
+                msg_id, {"code": -32601, "message": f"method not found: {method}"}
+            )
+        # Unknown notifications (no id) are silently recorded-and-ignored.
+
+    async def _handle_prompt(self, msg_id, params: dict) -> None:
+        session_id = params.get("sessionId")
+        script = self._next_prompt(session_id)
+        if script is None:
+            self._respond(msg_id, {"stopReason": "end_turn"})
+            return
+        if script.server_request is not None:
+            await self._request_permission(session_id, script.server_request)
+        for update in script.updates:
+            self._emit_update(session_id, update)
+            if script.delay:
+                await asyncio.sleep(script.delay)
+        if script.die:
+            self._crash(-9)  # crash mid-prompt: no answer, stdout EOFs
+            return
+        if script.error is not None:
+            self._respond_error(msg_id, script.error)
+        else:
+            result = script.result if script.result is not None else {"stopReason": "end_turn"}
+            self._respond(msg_id, result)
+
+    def _next_prompt(self, session_id) -> Optional[_PromptScript]:
+        queue = self._prompts_by_session.get(session_id)
+        if queue:
+            return queue.popleft()
+        if self._default_prompts:
+            return self._default_prompts.popleft()
+        return None
+
+    async def _request_permission(self, session_id, spec: dict) -> dict:
+        """Emit a server→client request and await the client's response."""
+        self._srv_req_seq += 1
+        req_id = 100_000 + self._srv_req_seq  # keep clear of client-side ids
+        params = dict(spec.get("params") or {})
+        params.setdefault("sessionId", session_id)
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_srv[req_id] = fut
+        self._emit(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": spec.get("method", "session/request_permission"),
+                "params": params,
+            }
+        )
+        return await fut
+
+    def _resolve_server_response(self, msg: dict) -> None:
+        self.client_responses.append(msg)
+        fut = self._pending_srv.pop(msg.get("id"), None)
+        if fut is not None and not fut.done():
+            fut.set_result(msg)
+
+    # -- Emission ----------------------------------------------------------
+
+    def _emit_update(self, session_id, params: dict) -> None:
+        params = dict(params)
+        params.setdefault("sessionId", session_id)
+        self._emit({"jsonrpc": "2.0", "method": "session/update", "params": params})
+
+    def _respond(self, msg_id, result: dict) -> None:
+        if msg_id is None:
+            return
+        self._emit({"jsonrpc": "2.0", "id": msg_id, "result": result})
+
+    def _respond_error(self, msg_id, error: dict) -> None:
+        if msg_id is None:
+            return
+        self._emit({"jsonrpc": "2.0", "id": msg_id, "error": error})
+
+    def _emit(self, obj: dict) -> None:
+        """Feed one ndjson line onto stdout (dropped once the process has exited)."""
+        if self._stdout_eof:
+            return
+        self.stdout.feed_data((json.dumps(obj) + "\n").encode("utf-8"))
+
+    # -- Crash -------------------------------------------------------------
+
+    def _crash(self, returncode: int) -> None:
+        """Simulate process death: set returncode, EOF stdout, unblock wait()."""
+        if self.returncode is None:
+            self.returncode = returncode
+        self._stdout_eof = True
+        with contextlib.suppress(Exception):
+            self.stdout.feed_eof()
+        with contextlib.suppress(Exception):
+            self.stderr.feed_eof()
+        self._exited.set()
+        if not self._servicer.done():
+            self._servicer.cancel()
+
+
+@pytest.fixture
+def fake_acp_exec():
+    """Factory fixture for replacing ``asyncio.create_subprocess_exec``.
+
+    Call the yielded factory with the :class:`FakeAcpProc` instances to hand out,
+    in spawn order (or none, to auto-create a default proc per spawn)::
+
+        exec_fn, created = fake_acp_exec(proc)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_fn)
+
+    ``exec_fn`` only intercepts ``hermes acp …`` spawns — it asserts ``"acp"`` is
+    in the argv (and records it on ``proc.argv``) so any other subprocess use is
+    surfaced as a loud failure rather than silently hijacked. ``created`` is the
+    live list of handed-out procs, newest last; it is also exposed as
+    ``exec_fn.created`` to mirror ``fake_exec_factory`` in test_hermes_tasks.py.
+    """
+    created: list = []
+
+    def make(*procs):
+        queue = list(procs)
+
+        async def _exec(program, *args, **kwargs):
+            argv = [program, *args]
+            assert "acp" in argv, (
+                f"fake_acp_exec only handles `hermes acp` spawns, got argv={argv!r}"
+            )
+            proc = queue.pop(0) if queue else FakeAcpProc()
+            proc.argv = argv
+            created.append(proc)
+            return proc
+
+        _exec.created = created
+        return _exec, created
+
+    return make

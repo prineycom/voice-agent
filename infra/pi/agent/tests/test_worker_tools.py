@@ -74,14 +74,14 @@ async def test_whitelisted_hermes_runs_and_returns_stdout(fake_exec, tmp_path, m
     cfg = tmp_path / "config.yaml"
     cfg.write_text("worker_tools:\n  allowed_commands:\n    - hermes\n", encoding="utf-8")
     monkeypatch.setattr(worker_tools, "CONFIG_PATH", cfg)
-    fake_exec.set(stdout=b"the answer is 42\n", stderr=b"session_id: abc123\n", returncode=0)
+    fake_exec.set(stdout=b"the answer is 42\n", stderr=b"some warning noise\n", returncode=0)
 
-    out = await run_command("hermes chat -q 'meaning of life' -Q --yolo --source tool")
+    out = await run_command("hermes memory list --source tool")
 
-    assert fake_exec.calls == [["hermes", "chat", "-q", "meaning of life", "-Q", "--yolo", "--source", "tool"]]
-    # session_id line from stderr is folded in (Hermes emits it on stderr in -Q mode)
-    assert "session_id: abc123" in out
-    assert "the answer is 42" in out
+    assert fake_exec.calls == [["hermes", "memory", "list", "--source", "tool"]]
+    # run_command is literal-shell-only: it returns the stdout tail verbatim and
+    # ignores stderr on success (no session_id/-Q/--resume folding — retired by ADR-0022).
+    assert out == "the answer is 42"
 
 
 @pytest.mark.asyncio

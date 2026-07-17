@@ -36,6 +36,7 @@ See the README (Task 8) for the on-Pi smoke test.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Callable
@@ -54,6 +55,7 @@ from livekit.agents import metrics as agent_metrics
 from livekit.agents.voice.events import MetricsCollectedEvent
 from livekit.plugins import openai, silero
 
+from acp_client import AcpClient
 from config import _env_bool, load_config
 from health import (
     STTHealthError,
@@ -61,7 +63,7 @@ from health import (
     check_stt_health,
     check_tts_health,
 )
-from hermes_tasks import UI_TOPIC
+from hermes_tasks import UI_TOPIC, HermesTaskManager
 from motion_events import DEFAULT_EMOTION, EmotionTagStripper, motion_event_json
 from stt_plugin import DesktopSTT
 from tts_plugin import DesktopTTS
@@ -69,9 +71,9 @@ import voice_state
 from wake_detector import WakeWordDetector
 from wake_state import WakeState
 from worker_tools import (
-    cancel_hermes_tasks,
-    delegate_to_hermes,
-    list_hermes_tasks,
+    cancel,
+    delegate,
+    list_tasks,
     make_hermes_manager,
     run_command,
 )
@@ -227,6 +229,32 @@ def _load_soul(path: Path) -> str:
     return _load_text_file(path, what="SOUL", required=True) or ""
 
 
+async def _start_hermes() -> HermesTaskManager:
+    """Spawn the long-lived ``hermes acp`` ACP client eagerly and wire the manager.
+
+    Eager spawn (ADR-0022): the cold ``initialize`` handshake is ~8.5s, so it runs
+    once here at worker startup rather than being paid on the first delegation. This
+    is NEVER a startup gate (unlike STT/TTS): ``AcpClient.start()`` is documented to
+    never raise and returns False on any failure (missing binary, initialize
+    timeout, immediate crash). A False result just means delegation degrades
+    gracefully — the client respawns lazily on first use (``_ensure``). The manager
+    owns the client and ``aclose``s it on shutdown, so the caller only needs to
+    register ``manager.shutdown`` as a shutdown callback.
+    """
+    acp_client = AcpClient()
+    try:
+        hermes_ok = await acp_client.start()
+    except Exception:  # noqa: BLE001 — start() never raises, but Hermes must NEVER block startup
+        hermes_ok = False
+        log.exception("hermes acp startup failed unexpectedly")
+    if not hermes_ok:
+        log.warning(
+            "hermes acp unavailable at startup — delegation degrades gracefully "
+            "(lazy respawn on first use)"
+        )
+    return make_hermes_manager(acp_client)
+
+
 async def entrypoint(ctx: JobContext) -> None:
     """Health-gate, join the room, and run the STT → LLM → TTS pipeline."""
     cfg = load_config()
@@ -257,10 +285,14 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await ctx.connect()  # type: ignore[call-arg]
 
-    # Background Hermes delegation manager (async tool calls). Stored in the
-    # session userdata so the function_tool adapters reach it; cancelled on
-    # shutdown so a user disconnect never leaves orphan Hermes subprocesses.
-    hermes_manager = make_hermes_manager()
+    # Background Hermes delegation manager (async tool calls). The long-lived
+    # `hermes acp` ACP client is spawned + initialized EAGERLY here (~8.5s cold,
+    # ADR-0022) so the first delegation doesn't pay that cost; it is never a startup
+    # gate (unlike STT/TTS) — an unavailable Hermes just degrades delegation. Stored
+    # in the session userdata so the function_tool adapters reach it; its shutdown
+    # (which acloses the ACP client) is registered so a user disconnect never leaves
+    # an orphan `hermes acp` subprocess.
+    hermes_manager = await _start_hermes()
     ctx.add_shutdown_callback(hermes_manager.shutdown)
     # Stream tool/background-task events to the web UI as LiveKit data messages
     # (topic UI_TOPIC); the frontend renders the live operations panel + tool feed.
@@ -365,6 +397,24 @@ async def entrypoint(ctx: JobContext) -> None:
             if detector is not None:
                 asyncio.create_task(detector.aclose())
 
+        @ctx.room.on("data_received")
+        def _on_data_received(packet: rtc.DataPacket) -> None:  # noqa: ANN001
+            # Manual wake trigger from the web UI button: the spoken wake word can
+            # be hard to enunciate reliably, so the frontend offers a button that
+            # publishes {"type": "wake_request"} on the same UI_TOPIC. Treat it
+            # exactly like a classifier hit — on_wake_detected flips Dormant→Active
+            # and publishes the `active` event back, so the chime/badge/avatar
+            # feedback rides the SAME path as an audio wake word (no separate UI
+            # code). Ignored (harmless) if the message isn't ours.
+            if packet.topic != UI_TOPIC:
+                return
+            try:
+                msg = json.loads(bytes(packet.data).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return
+            if isinstance(msg, dict) and msg.get("type") == "wake_request":
+                wake_state.on_wake_detected("manual (UI button)", 1.0)
+
         # Catch tracks already subscribed before this handler was registered
         # (the participant may have joined before dispatch reached here).
         for participant in ctx.room.remote_participants.values():
@@ -432,6 +482,12 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=vad,
         turn_detection="vad",
         userdata=hermes_manager,
+        # Default is 3: after 3 tool calls in a turn the framework forces
+        # tool_choice="none" and DROPS any further tool call. A stray/failed
+        # tool call (e.g. the LLM reaching for a wrong command) would then wall
+        # off the real `delegate`/`list_tasks` call. Give delegation headroom so
+        # one bad step never swallows the correct one.
+        max_tool_steps=8,
     )
 
     # First-audio latency (req #6): log LLM time-to-first-token and TTS
@@ -462,6 +518,13 @@ async def entrypoint(ctx: JobContext) -> None:
         if wake_state is not None:
             wake_state.note_agent_activity()
 
+    # Keep the Active window open while the USER is still speaking: a long single
+    # utterance never hits a turn boundary, so without a live speech probe the
+    # silence timer could sleep the agent mid-sentence. session.user_state is the
+    # framework's VAD-driven "speaking"/"listening"/"away" (#59).
+    if wake_state is not None:
+        wake_state.set_user_speaking_source(lambda: session.user_state == "speaking")
+
     # --- Diagnostics for the "transcript stops on long output" bug (issue under
     # investigation). These are cheap, high-signal hooks: which conversation items
     # actually get committed (and their length), and a loud log if the session closes
@@ -488,7 +551,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # session; RoomIO routes the audio to the connected participant.
     agent = GreetingAgent(
         instructions=instructions,
-        tools=[delegate_to_hermes, cancel_hermes_tasks, list_hermes_tasks, run_command],
+        tools=[delegate, cancel, list_tasks, run_command],
         greeting=cfg.agent_greeting,
         publish_motion=publish_motion,
         wake_state=wake_state,
